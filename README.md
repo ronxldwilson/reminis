@@ -44,6 +44,7 @@ Every tensor is SHA256-hashed before and after the round-trip. These architectur
 
 | Architecture | Model | Tensors | Size | Convert | Export | Result |
 |---|---|---|---|---|---|---|
+| `llama` | Mistral-7B-Instruct-v0.3 Q4_K_M | 291 | 4170 MB | 18.5s | 4.4s | lossless |
 | `llama` | Llama-3.2-1B-Instruct F16 | 147 | 2365 MB | 19.2s | 1.7s | lossless |
 | `qwen2` | Qwen2.5-0.5B-Instruct FP16 | 291 | 1208 MB | 14.4s | 0.9s | lossless |
 | `granitemoe` | Granite-3.1-1B-A400M Q4_K_M | 242 | 784 MB | 6.5s | 0.5s | lossless |
@@ -56,15 +57,16 @@ Throughput is roughly linear with size — about 120 MB/s converting, over 1 GB/
 
 ### Diff and apply at scale
 
-On Llama-3.2-1B (2.4 GB), perturbing all 64 attention projections:
+Perturbing all 64 attention projections, then reconstructing from the pack:
 
-```
-copy 2.4GB database    0.57s
-diff                   9.36s   64 tensors changed, pack 278 MB of 2357 MB (11.8%)
-apply + verify         7.87s   result matches target hash exactly
-```
+| Model | Copy DB | Diff | Pack | Apply + verify | Result |
+|---|---|---|---|---|---|
+| Llama-3.2-1B, 2.4 GB, F16 | 0.57s | 9.4s | 278 MB (11.8%) | 7.9s | exact |
+| Mistral-7B, 4.2 GB, Q4_K_M | 1.78s | 14.5s | 15 MB (0.4%) | 12.2s | exact |
 
-Roughly half of each figure is SHA256 hashing the full model to guarantee a pack cannot be applied to the wrong base. SHA256 is hardware-accelerated here (957 MB/s) and measurably faster than blake2b, so that is already the cheapest safe option.
+The 7B row is quantized, so per-value deltas are not computable — but changes are still detected and encoded byte-exactly through the XOR path, which is why quantized models work at all.
+
+Roughly half of each timing is SHA256 hashing the full model, which is what guarantees a pack cannot be applied to the wrong base. SHA256 is hardware-accelerated here (957 MB/s) and measurably faster than blake2b, so that is already the cheapest safe option.
 
 ### Quantization coverage
 
