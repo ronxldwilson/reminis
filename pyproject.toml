@@ -1,6 +1,6 @@
 [project]
 name = "reminis"
-version = "0.1.0"
+version = "0.1.1"
 description = "Store LLM weights in a SQLite database. Query, diff, rollback, and merge — for free."
 readme = "README.md"
 requires-python = ">=3.10"
