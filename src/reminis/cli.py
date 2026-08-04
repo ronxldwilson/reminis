@@ -10,7 +10,8 @@ from reminis import __version__
 def main():
     parser = argparse.ArgumentParser(
         prog="reminis",
-        description="Store LLM weights in a SQLite database. Query, diff, rollback, and merge.",
+        description="Store LLM weights in a SQLite database. "
+                    "Convert GGUF losslessly, query, diff, and package changes as delta packs.",
     )
     parser.add_argument("--version", action="version", version=f"reminis {__version__}")
 
@@ -43,6 +44,16 @@ def main():
     p_diff.add_argument("base", help="Path to the base model database")
     p_diff.add_argument("target", help="Path to the target model database")
     p_diff.add_argument("-o", "--output", help="Write a delta pack that turns base into target")
+    p_diff.add_argument(
+        "--lossy",
+        nargs="?",
+        const=0.01,
+        type=float,
+        metavar="TOL",
+        help="Allow low-rank encoding with at most TOL relative error per tensor "
+             "(default 0.01 = 1%%). Much smaller packs when the delta is genuinely "
+             "low-rank, as a LoRA fine-tune's is. Off by default.",
+    )
     p_diff.add_argument("-q", "--quiet", action="store_true", help="Suppress progress output")
 
     # apply: apply a delta pack to a base model
@@ -79,7 +90,12 @@ def main():
 
     elif args.command == "diff":
         from reminis.diff import diff_models
-        diff_models(args.base, args.target, args.output, verbose=not args.quiet)
+        if args.lossy is not None and not args.output:
+            parser.error("--lossy only affects the written pack; pass -o/--output too")
+        diff_models(
+            args.base, args.target, args.output,
+            verbose=not args.quiet, lossy_tolerance=args.lossy,
+        )
 
     elif args.command == "apply":
         from reminis.diff import apply_delta

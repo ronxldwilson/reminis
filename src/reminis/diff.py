@@ -71,11 +71,172 @@ CREATE TABLE IF NOT EXISTS deltas (
     encoding      TEXT NOT NULL,
     raw_bytes     INTEGER NOT NULL,
     stored_bytes  INTEGER NOT NULL,
+    rank          INTEGER,
+    rel_error     REAL,
     data          BLOB NOT NULL
 );
 
 CREATE INDEX IF NOT EXISTS idx_deltas_name ON deltas(tensor_name);
 """
+
+# Low-rank factors are stored float16 by default. Measured against float32 on
+# LoRA-shaped deltas: half the size for indistinguishable error (1.15e-04 vs
+# 1.13e-04). Folding sqrt(S) into both factors keeps their dynamic range
+# balanced, and the reconstruction is rounded back to the tensor's own dtype
+# anyway, so the factor rounding disappears into that final step.
+#
+# float32 is still used when the factors would not survive float16 -- see
+# _pick_factor_dtype. The chosen dtype is recorded per tensor in the payload
+# header, so decoding never has to guess.
+LOWRANK_FACTOR_DTYPES = {"f16": np.float16, "f32": np.float32}
+_F16_MAX = float(np.finfo(np.float16).max)
+
+
+def _pick_factor_dtype(*factors: np.ndarray) -> str:
+    """Use float16 for the factors unless doing so would lose or break values.
+
+    Overflow to inf is the failure that matters: float16 tops out around
+    65504, and a factor above that would decode to garbage rather than to a
+    slightly wrong number.
+    """
+    for f in factors:
+        if not np.all(np.isfinite(f)):
+            raise ValueError("low-rank factors contain non-finite values")
+        if np.max(np.abs(f)) > _F16_MAX:
+            return "f32"
+    return "f16"
+
+
+def _randomized_svd(a: np.ndarray, rank: int, n_iter: int = 4, seed: int = 0):
+    """Truncated SVD via random projection.
+
+    A full np.linalg.svd is O(min(m,n)^2 * max(m,n)) and becomes the dominant
+    cost on large tensors, where we only ever want the leading handful of
+    components. The seed is fixed so packs are reproducible.
+    """
+    rng = np.random.default_rng(seed)
+    m, n = a.shape
+    p = min(rank + 10, min(m, n))
+    # numpy's SIMD matmul path raises spurious divide/overflow/invalid warnings
+    # on some builds even when every output is finite. Callers verify the
+    # result with np.isfinite rather than relying on these.
+    with np.errstate(all="ignore"):
+        y = a @ rng.standard_normal((n, p)).astype(np.float32)
+        for _ in range(n_iter):
+            y, _ = np.linalg.qr(y)
+            y = a @ (a.T @ y)
+        q, _ = np.linalg.qr(y)
+        ub, s, vt = np.linalg.svd(q.T @ a, full_matrices=False)
+        return (q @ ub)[:, :rank], s[:rank], vt[:rank]
+
+
+def _encode_lowrank(
+    a_blob: bytes,
+    b_blob: bytes,
+    dtype: str,
+    shape: list,
+    tolerance: float,
+    budget_bytes: int,
+):
+    """Try to express the delta as low-rank factors within an error tolerance.
+
+    Returns (payload, rank, rel_error) or None when low-rank is not applicable
+    or not worth it. `budget_bytes` is the size to beat -- normally whatever
+    the lossless encoding achieved, so we never grow a pack to make it lossy.
+
+    Only 2D float tensors qualify: SVD needs a matrix, and quantized bytes
+    cannot be decoded to values to decompose in the first place.
+    """
+    np_dtype = NUMERIC_DTYPES.get(dtype)
+    if np_dtype is None or len(shape) != 2:
+        return None
+
+    # GGUF stores shape reversed relative to the data layout.
+    m, n = shape[1], shape[0]
+    a = np.frombuffer(a_blob, dtype=np_dtype).astype(np.float32).reshape(m, n)
+    b = np.frombuffer(b_blob, dtype=np_dtype).astype(np.float32).reshape(m, n)
+    delta = b - a
+
+    delta_norm = float(np.linalg.norm(delta))
+    if delta_norm == 0:
+        return None
+
+    # Above this rank the factors cost more than the lossless payload, so
+    # there is no point decomposing further. Sized against float16 factors,
+    # the common case.
+    max_rank = budget_bytes // ((m + n) * 2)
+    max_rank = int(min(max_rank, min(m, n) - 1))
+    if max_rank < 1:
+        return None
+
+    u, s, vt = _randomized_svd(delta, max_rank)
+
+    # Smallest rank meeting the tolerance. Truncation error at rank r is the
+    # norm of the discarded singular values.
+    tail = np.sqrt(np.maximum(np.cumsum((s**2)[::-1])[::-1], 0.0))
+    rel = tail / delta_norm
+    within = np.nonzero(rel <= tolerance)[0]
+    if len(within) == 0:
+        return None
+    rank = int(within[0]) + 1
+
+    # Fold the singular values in so apply is a plain matmul.
+    sqrt_s = np.sqrt(s[:rank])
+    left_f32 = u[:, :rank] * sqrt_s
+    right_f32 = sqrt_s[:, None] * vt[:rank]
+
+    try:
+        factor_key = _pick_factor_dtype(left_f32, right_f32)
+    except ValueError:
+        return None  # degenerate decomposition; keep the lossless encoding
+
+    factor_dtype = LOWRANK_FACTOR_DTYPES[factor_key]
+    left = left_f32.astype(factor_dtype)
+    right = right_f32.astype(factor_dtype)
+
+    # Measure the error actually achieved, after factor rounding, rather than
+    # trusting the spectral estimate.
+    with np.errstate(all="ignore"):
+        rebuilt = (a + (left.astype(np.float32) @ right.astype(np.float32))).astype(np_dtype)
+    if not np.all(np.isfinite(rebuilt.astype(np.float32))):
+        return None
+    achieved = float(np.linalg.norm(rebuilt.astype(np.float32) - b) / np.linalg.norm(b))
+    if achieved > tolerance:
+        return None  # rounding pushed it out of budget
+
+    header = json.dumps({"rank": rank, "m": m, "n": n, "fdt": factor_key}).encode()
+    payload = _compress(
+        len(header).to_bytes(4, "little") + header + left.tobytes() + right.tobytes()
+    )
+    if len(payload) >= budget_bytes:
+        return None
+
+    return payload, rank, achieved
+
+
+def _decode_lowrank(raw: bytes, base_blob: bytes, dtype: str) -> bytes:
+    """Rebuild a tensor from base weights plus low-rank delta factors."""
+    np_dtype = NUMERIC_DTYPES[dtype]
+    header_len = int.from_bytes(raw[:4], "little")
+    meta = json.loads(raw[4 : 4 + header_len])
+    rank, m, n = meta["rank"], meta["m"], meta["n"]
+    factor_dtype = LOWRANK_FACTOR_DTYPES[meta.get("fdt", "f32")]
+
+    body = np.frombuffer(raw, dtype=factor_dtype, offset=4 + header_len)
+    left = body[: m * rank].reshape(m, rank).astype(np.float32)
+    right = body[m * rank : m * rank + rank * n].reshape(rank, n).astype(np.float32)
+
+    base = np.frombuffer(base_blob, dtype=np_dtype).astype(np.float32).reshape(m, n)
+    with np.errstate(all="ignore"):
+        rebuilt = base + (left @ right)
+
+    # A non-finite value here means the pack is corrupt. Failing loudly beats
+    # writing NaNs into a model that will only misbehave much later.
+    if not np.all(np.isfinite(rebuilt)):
+        raise ValueError(
+            "Low-rank reconstruction produced non-finite values; the delta pack is corrupt."
+        )
+    return rebuilt.astype(np_dtype).tobytes()
 
 
 def _model_fingerprint(conn: sqlite3.Connection) -> str:
@@ -172,11 +333,40 @@ def _encode_delta(a_blob: bytes, b_blob: bytes) -> tuple[str, bytes]:
     return "replace_zstd", replacement
 
 
+def _choose_encoding(
+    a_blob: bytes,
+    b_blob: bytes,
+    dtype: str,
+    shape: list,
+    lossy_tolerance: float | None,
+):
+    """Pick the smallest encoding for one tensor.
+
+    Lossless is computed first and always available; low-rank is only tried
+    when explicitly enabled, and only wins if it beats the lossless size while
+    staying inside the tolerance. A pack never grows in order to become lossy.
+
+    Returns (encoding, payload, rank, rel_error).
+    """
+    encoding, payload = _encode_delta(a_blob, b_blob)
+
+    if lossy_tolerance is None:
+        return encoding, payload, None, None
+
+    attempt = _encode_lowrank(a_blob, b_blob, dtype, shape, lossy_tolerance, len(payload))
+    if attempt is None:
+        return encoding, payload, None, None
+
+    lr_payload, rank, rel_error = attempt
+    return "lowrank_zstd", lr_payload, rank, rel_error
+
+
 def diff_models(
     db_a: str,
     db_b: str,
     output_path: str | None = None,
     verbose: bool = True,
+    lossy_tolerance: float | None = None,
 ) -> dict:
     """Compare two model databases, optionally writing a delta pack.
 
@@ -185,6 +375,11 @@ def diff_models(
         db_b: Path to the target model database.
         output_path: If given, write a delta pack that turns A into B.
         verbose: Print a progress report.
+        lossy_tolerance: Enable low-rank encoding, allowing at most this
+            relative reconstruction error per tensor (e.g. 0.01 for 1%).
+            None means lossless only. Low-rank helps when the delta is
+            genuinely low-rank, as a LoRA fine-tune's is; on a full fine-tune
+            it rarely wins and the lossless path is kept automatically.
 
     Returns:
         A summary dict describing what changed.
@@ -227,6 +422,8 @@ def diff_models(
     quantized_changed = 0
     total_raw_bytes = 0
     total_stored_bytes = 0
+    lowrank_count = 0
+    worst_rel_error = 0.0
 
     for name in shared:
         row_a = conn_a.execute(
@@ -256,20 +453,27 @@ def diff_models(
         changed.append(entry)
 
         if out_conn is not None:
-            encoding, payload = _encode_delta(blob_a, blob_b)
+            encoding, payload, rank, rel_error = _choose_encoding(
+                blob_a, blob_b, dtype_b, json.loads(shape_b), lossy_tolerance
+            )
             total_raw_bytes += len(blob_b)
             total_stored_bytes += len(payload)
+            if rank is not None:
+                lowrank_count += 1
+                worst_rel_error = max(worst_rel_error, rel_error)
+                entry["rank"] = rank
+                entry["rel_error"] = rel_error
 
             out_conn.execute(
                 "INSERT INTO deltas (tensor_name, shape, dtype, dtype_id, n_elements, "
                 "n_changed, pct_changed, l2_norm, max_abs_delta, mean_delta, "
-                "encoding, raw_bytes, stored_bytes, data) "
-                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                "encoding, raw_bytes, stored_bytes, rank, rel_error, data) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (
                     name, shape_b, dtype_b, dtype_id_b, n_elements_b,
                     stats.get("n_changed"), stats.get("pct_changed"),
                     stats.get("l2_norm"), stats.get("max_abs_delta"), stats.get("mean_delta"),
-                    encoding, len(blob_b), len(payload), payload,
+                    encoding, len(blob_b), len(payload), rank, rel_error, payload,
                 ),
             )
 
@@ -302,8 +506,24 @@ def diff_models(
             "tensors_changed": str(len(changed)),
             "tensors_identical": str(identical_count),
             "tensors_removed": json.dumps(only_in_a),
+            "lossy": "true" if lowrank_count else "false",
+            "lowrank_tensors": str(lowrank_count),
+            "max_rel_error": repr(worst_rel_error),
             "reminis_version": _version(),
         }
+        out_conn.commit()
+
+        # A lossy pack cannot reproduce the target byte for byte, but its
+        # reconstruction is deterministic -- so record the hash of what apply
+        # will actually produce. That keeps apply exactly verifiable; the
+        # divergence from the true target is carried separately as an error
+        # bound rather than being waved through.
+        meta["reconstructed_weights_hash"] = (
+            _reconstruction_hash(conn_a, out_conn, only_in_a)
+            if lowrank_count
+            else meta["target_weights_hash"]
+        )
+
         for k, v in meta.items():
             out_conn.execute("INSERT OR REPLACE INTO delta_meta (key, value) VALUES (?,?)", (k, v))
         out_conn.commit()
@@ -325,6 +545,9 @@ def diff_models(
         "target_total_bytes": total_b_bytes,
         "delta_raw_bytes": total_raw_bytes,
         "delta_stored_bytes": total_stored_bytes,
+        "lowrank_tensors": lowrank_count,
+        "max_rel_error": worst_rel_error,
+        "lossy": lowrank_count > 0,
         "elapsed": time.time() - t0,
     }
 
@@ -332,6 +555,75 @@ def diff_models(
         _print_diff_report(summary, output_path)
 
     return summary
+
+
+KNOWN_ENCODINGS = {
+    "xor_zstd", "replace_zstd", "lowrank_zstd",
+    "xor_zlib", "replace_zlib",  # written before 0.3.0
+}
+
+
+def _decode_tensor(encoding: str, payload: bytes, base_blob: bytes | None, dtype: str, name: str) -> bytes:
+    """Reconstruct one tensor's bytes from its delta payload.
+
+    Shared by apply and by the reconstruction-hash pass so the two can never
+    disagree about what a pack produces.
+    """
+    if encoding not in KNOWN_ENCODINGS:
+        raise ValueError(
+            f"Delta pack uses unknown encoding '{encoding}' for tensor '{name}'. "
+            "It was likely written by a newer version of reminis."
+        )
+
+    raw = _decompress(payload, encoding)
+
+    if encoding.startswith("replace_"):
+        return raw
+
+    if base_blob is None:
+        raise ValueError(f"Delta references tensor '{name}' missing from the base model")
+
+    if encoding == "lowrank_zstd":
+        return _decode_lowrank(raw, base_blob, dtype)
+
+    base_arr = np.frombuffer(base_blob, dtype=np.uint8)
+    delta_arr = np.frombuffer(raw, dtype=np.uint8)
+    if len(base_arr) != len(delta_arr):
+        raise ValueError(
+            f"Size mismatch applying delta to '{name}': "
+            f"base is {len(base_arr)} bytes, delta expects {len(delta_arr)}"
+        )
+    return np.bitwise_xor(base_arr, delta_arr).tobytes()
+
+
+def _reconstruction_hash(base_conn, pack_conn, removed: list) -> str:
+    """Hash the model that applying this pack to the base will produce.
+
+    Walks tensors in the same order as _weights_hash, substituting each
+    pack entry for its base counterpart, holding one tensor at a time.
+    """
+    entries = {
+        r[0]: (r[1], r[2], r[3])
+        for r in pack_conn.execute("SELECT tensor_name, encoding, dtype, data FROM deltas")
+    }
+    dropped = set(removed)
+
+    names = sorted(
+        {r[0] for r in base_conn.execute("SELECT name FROM tensors")} | set(entries)
+    )
+
+    h = hashlib.sha256()
+    for name in names:
+        if name in dropped:
+            continue
+        row = base_conn.execute("SELECT data FROM tensors WHERE name = ?", (name,)).fetchone()
+        base_blob = row[0] if row else None
+        if name in entries:
+            encoding, dtype, payload = entries[name]
+            h.update(_decode_tensor(encoding, payload, base_blob, dtype, name))
+        else:
+            h.update(base_blob)
+    return h.hexdigest()
 
 
 def _version() -> str:
@@ -381,6 +673,14 @@ def _print_diff_report(s: dict, output_path: str | None):
         print(f"    Delta pack:  {_fmt_bytes(stored)}")
         if full:
             print(f"    Ratio:       {stored / full * 100:.1f}% of full model size")
+        if s["lowrank_tensors"]:
+            print(
+                f"    Encoding:    {s['lowrank_tensors']} of {s['changed']} tensors "
+                f"low-rank (LOSSY), rest lossless"
+            )
+            print(f"    Worst error: {s['max_rel_error']:.2e} relative, per tensor")
+        else:
+            print("    Encoding:    lossless")
 
     print(f"\n  Took {s['elapsed']:.1f}s")
 
@@ -448,33 +748,11 @@ def apply_delta(
         "SELECT tensor_name, shape, dtype, dtype_id, n_elements, encoding, data FROM deltas"
     ).fetchall()
 
-    known_encodings = {"xor_zstd", "replace_zstd", "xor_zlib", "replace_zlib"}
-
     for name, shape, dtype, dtype_id, n_elements, encoding, payload in rows:
-        if encoding not in known_encodings:
-            raise ValueError(
-                f"Delta pack uses unknown encoding '{encoding}' for tensor '{name}'. "
-                "It was likely written by a newer version of reminis."
-            )
-
-        raw = _decompress(payload, encoding)
-
-        if encoding.startswith("xor_"):
-            existing = out_conn.execute(
-                "SELECT data FROM tensors WHERE name = ?", (name,)
-            ).fetchone()
-            if existing is None:
-                raise ValueError(f"Delta references tensor '{name}' missing from the base model")
-            base_arr = np.frombuffer(existing[0], dtype=np.uint8)
-            delta_arr = np.frombuffer(raw, dtype=np.uint8)
-            if len(base_arr) != len(delta_arr):
-                raise ValueError(
-                    f"Size mismatch applying delta to '{name}': "
-                    f"base is {len(base_arr)} bytes, delta expects {len(delta_arr)}"
-                )
-            new_blob = np.bitwise_xor(base_arr, delta_arr).tobytes()
-        else:
-            new_blob = raw
+        existing = out_conn.execute(
+            "SELECT data FROM tensors WHERE name = ?", (name,)
+        ).fetchone()
+        new_blob = _decode_tensor(encoding, payload, existing[0] if existing else None, dtype, name)
 
         out_conn.execute(
             "INSERT INTO tensors (name, shape, dtype, dtype_id, n_elements, n_bytes, data) "
@@ -489,24 +767,40 @@ def apply_delta(
     out_conn.commit()
     delta_conn.close()
 
+    is_lossy = meta.get("lossy") == "true"
+
     if verify:
-        expected = meta.get("target_weights_hash")
+        # For a lossless pack this is the target hash. For a lossy one it is
+        # the hash of what the pack deterministically reconstructs, so the
+        # apply step stays exactly verifiable either way.
+        expected = meta.get("reconstructed_weights_hash") or meta.get("target_weights_hash")
         if expected:
             actual = _weights_hash(out_conn)
             if actual != expected:
                 out_conn.close()
                 raise ValueError(
-                    "Result does not match the pack's recorded target hash.\n"
+                    "Result does not match the hash recorded in the pack.\n"
                     f"  expected: {expected[:16]}...\n"
                     f"  actual:   {actual[:16]}..."
                 )
             if verbose:
-                print("Result verified against target hash")
+                print(
+                    "Result verified against reconstruction hash"
+                    if is_lossy
+                    else "Result verified against target hash"
+                )
 
     out_conn.close()
 
     if verbose:
         print(f"Applied {applied} tensor updates -> {output_db}")
+        if is_lossy:
+            err = float(meta.get("max_rel_error", "0"))
+            print(
+                f"NOTE: this is a lossy pack ({meta.get('lowrank_tensors', '?')} tensors "
+                f"low-rank encoded). The result is not byte-identical to the original "
+                f"target; worst per-tensor relative error is {err:.2e}."
+            )
         print(f"Took {time.time() - t0:.1f}s")
 
     return output_db

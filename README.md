@@ -176,7 +176,36 @@ The delta is also only partly low-rank. Ranks needed to capture 90% of the delta
 | `blk.18.ffn_gate.weight` | [1536, 576] | 311 | 576 |
 | `blk.29.ffn_down.weight` | [576, 1536] | 291 | 576 |
 
-Attention deltas compress well under a low-rank factorization; FFN deltas do not. Lossy encodings that would change this — int8 deltas, adaptive-rank SVD, mantissa truncation — are tracked in [issue #2](https://github.com/ronxldwilson/reminis/issues/2) and are not implemented yet.
+Attention deltas compress well under a low-rank factorization; FFN deltas do not. That asymmetry is exactly what `--lossy` exploits.
+
+### Low-rank packs for LoRA fine-tunes
+
+A LoRA update is `W + BA` with `BA` rank-`r` by construction, so the delta is genuinely low-rank and needs only `r*(m+n)` numbers instead of `m*n`. Opt in with `--lossy`:
+
+```bash
+reminis diff base.db lora-merged.db -o change.delta.db --lossy 0.01
+```
+
+The tolerance is the maximum relative error allowed per tensor (default `0.01` = 1%). Measured on a rank-16 LoRA merge:
+
+| Model | Lossless pack | Low-rank pack | Shrink | Worst error |
+|---|---|---|---|---|
+| SmolLM-135M, 258 MB | 38.3 MB (14.9%) | **3.5 MB (1.4%)** | 11.0x | 1.2e-04 |
+| Llama-3.2-1B, 2.4 GB | 242.7 MB (10.3%) | **6.4 MB (0.3%)** | 37.9x | 1.1e-04 |
+
+Achieved error lands ~100x inside the 1% budget, because rank is chosen by error target rather than fixed.
+
+**It decides per tensor, and never makes a pack worse.** Low-rank is only used where it both beats the lossless size and stays inside tolerance; otherwise the lossless encoding is kept. On the full fine-tune above, only 1 of 272 tensors qualified and the pack stayed lossless — so `--lossy` degrades gracefully to "no change" rather than silently hurting quality.
+
+Cost is a slower diff (SVD): roughly 4x on the 1B model. Quantized and non-2D tensors are never low-rank encoded, since their bytes cannot be decomposed.
+
+**Lossy packs are still exactly verifiable.** The reconstruction is deterministic, so the pack records the hash of what `apply` will actually produce, and `apply` checks against it byte-for-byte. What it cannot promise is that this equals the *original* target — that divergence is carried as a recorded error bound and printed on apply:
+
+```
+Result verified against reconstruction hash
+NOTE: this is a lossy pack (120 tensors low-rank encoded). The result is not
+byte-identical to the original target; worst per-tensor relative error is 1.16e-04.
+```
 
 ## Python API
 
@@ -219,7 +248,9 @@ All GGUF tensor types are supported and verified, including:
 - [x] Interactive HTML viewer (`reminis view`)
 - [x] Weight diffing between model versions (`reminis diff`)
 - [x] Delta packs with verified apply (`reminis apply`)
-- [ ] Lossy delta encodings so full fine-tunes compress ([#2](https://github.com/ronxldwilson/reminis/issues/2))
+- [x] Validated to 7B across llama / qwen2 / granitemoe / clip
+- [x] Low-rank delta encoding for LoRA fine-tunes (`--lossy`)
+- [ ] Safetensors input, for the transformers/peft workflow
 - [ ] Fine-tune tracking with edit logs
 - [ ] Surgical rollback of bad training steps
 - [ ] Model merging via SQL operations
