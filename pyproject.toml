@@ -1,0 +1,32 @@
+[project]
+name = "reminis"
+version = "0.0.0"
+description = "Store LLM weights in a SQLite database. Query, diff, rollback, and merge — for free."
+readme = "README.md"
+requires-python = ">=3.9"
+license = "MIT"
+authors = [
+    { name = "Ronald Wilson", email = "ronaldwilson00000@gmail.com" },
+]
+keywords = ["llm", "sqlite", "gguf", "weights", "machine-learning", "fine-tuning"]
+classifiers = [
+    "Development Status :: 2 - Pre-Alpha",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Topic :: Database",
+]
+dependencies = []
+
+[project.urls]
+Homepage = "https://github.com/ronxldwilson/reminis"
+Repository = "https://github.com/ronxldwilson/reminis"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/reminis"]

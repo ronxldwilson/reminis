@@ -1,0 +1,28 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+wheels/
+*.whl
+
+# Virtual environments
+.venv/
+
+# SQLite databases (generated)
+*.db
+*.db-shm
+*.db-wal
+
+# GGUF models (large, user-provided)
+*.gguf
+
+# IDE
+.idea/
+.vscode/
+*.swp
+
+# OS
+.DS_Store
+Thumbs.db
