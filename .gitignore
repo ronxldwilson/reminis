@@ -18,6 +18,12 @@ wheels/
 # GGUF models (large, user-provided)
 *.gguf
 
+# Generated viewers
+*.html
+
+# Test model working directory
+models/
+
 # IDE
 .idea/
 .vscode/
