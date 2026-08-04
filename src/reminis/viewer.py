@@ -711,6 +711,11 @@ const TENSOR_EXPLANATIONS = {{
   "attn_k": "The <strong>key (K) matrix</strong> in attention. It represents 'what do I contain?' for each token. Other tokens compare their queries against these keys to decide what to attend to.",
   "attn_v": "The <strong>value (V) matrix</strong> in attention. Once attention scores decide which tokens are relevant, the values are what actually gets passed forward. It is the 'content' that gets read.",
   "attn_output": "The <strong>attention output projection</strong>. After attention combines the value vectors, this matrix projects the result back to the model's main dimension.",
+  "attn_out": "The <strong>attention output projection</strong>. After attention combines the value vectors, this matrix projects the result back to the model's main dimension. (Vision encoders spell this <code>attn_out</code> rather than <code>attn_output</code>.)",
+  "ffn_gate_exps": "The <strong>expert gate projections</strong> in a Mixture-of-Experts layer. This tensor stacks the gate matrices for every expert; a router picks which few experts each token actually uses, so most of these weights sit idle on any given token.",
+  "ffn_up_exps": "The <strong>expert up projections</strong> in a Mixture-of-Experts layer, stacked across all experts.",
+  "ffn_down_exps": "The <strong>expert down projections</strong> in a Mixture-of-Experts layer, stacked across all experts.",
+  "ffn_gate_inp": "The <strong>router</strong> of a Mixture-of-Experts layer. It scores each expert per token and selects the top few to run, which is what makes MoE cheap at inference despite the large total parameter count.",
   "attn_norm": "The <strong>attention layer norm</strong> normalizes values before they enter the attention mechanism. This keeps training stable and helps the model learn.",
   "ffn_gate": "The <strong>gate projection</strong> in the feed-forward network (FFN). In SwiGLU architectures, it controls how much signal passes through, acting like a learned filter.",
   "ffn_up": "The <strong>up projection</strong> expands the representation to a wider dimension inside the FFN. The model thinks in a bigger space here before compressing back down.",
@@ -718,16 +723,37 @@ const TENSOR_EXPLANATIONS = {{
   "ffn_norm": "The <strong>FFN layer norm</strong> normalizes values before the feed-forward network. Same purpose as attn_norm but for the FFN sub-layer.",
 }};
 
+// Longest match wins, so `ffn_gate_exps` is not shadowed by `ffn_gate` and
+// `attn_output` is not shadowed by `attn_out`. Relying on object insertion
+// order here would be fragile.
 function getTensorExplanation(name) {{
+  let best = null;
   for (const [key, explanation] of Object.entries(TENSOR_EXPLANATIONS)) {{
-    if (name.includes(key)) return explanation;
+    if (name.includes(key) && (best === null || key.length > best[0].length)) {{
+      best = [key, explanation];
+    }}
   }}
+  if (best) return best[1];
   return "A weight tensor in the model. Each tensor is a multi-dimensional array of numbers that the model learned during training.";
 }}
 
+// Which stack a tensor belongs to, and its index within it.
+//
+// The prefix matters: vision-tower tensors are named `v.blk.N.*`, so an
+// unanchored /blk\\.(\d+)/ matches the `blk.0` inside `v.blk.0` and folds
+// vision layers into the text-block numbering. Anchoring on the prefix keeps
+// the two stacks apart.
+function getBlockInfo(name) {{
+  let m = name.match(/^blk\\.(\d+)\\./);
+  if (m) return {{ stack: "text", idx: parseInt(m[1]) }};
+  m = name.match(/^v\\.blk\\.(\d+)\\./);
+  if (m) return {{ stack: "vision", idx: parseInt(m[1]) }};
+  return null;
+}}
+
 function getLayerFromName(name) {{
-  const m = name.match(/blk\\.(\d+)/);
-  return m ? parseInt(m[1]) : -1;
+  const info = getBlockInfo(name);
+  return info ? info.idx : -1;
 }}
 
 // Header
@@ -797,23 +823,53 @@ document.querySelectorAll(".tab").forEach(tab => {{
 // Architecture diagram
 function buildArchDiagram() {{
   const layers = {{}};
+  const visionLayers = {{}};
   DATA.tensors.forEach(t => {{
-    const layerIdx = getLayerFromName(t.name);
-    if (layerIdx >= 0) {{
-      if (!layers[layerIdx]) layers[layerIdx] = [];
-      layers[layerIdx].push(t);
-    }}
+    const info = getBlockInfo(t.name);
+    if (!info) return;
+    const target = info.stack === "vision" ? visionLayers : layers;
+    if (!target[info.idx]) target[info.idx] = [];
+    target[info.idx].push(t);
   }});
   const numLayers = Object.keys(layers).length;
+  const numVision = Object.keys(visionLayers).length;
   const embeds = DATA.tensors.filter(t => t.name.includes("token_embd"));
   const norms = DATA.tensors.filter(t => t.name.includes("output_norm"));
   const outputs = DATA.tensors.filter(t => t.name === "output.weight");
 
   let html = `<div style="max-width:700px;margin:0 auto;">`;
+
+  const intro = numLayers > 0
+    ? "This shows how the model's layers are stacked. Text flows from top (input) to bottom (output), passing through each transformer block."
+    : "This file's components are shown below.";
   html += `<p style="color:var(--text2);font-size:13px;margin-bottom:16px;">
-    This shows how the model's layers are stacked. Text flows from top (input) to bottom (output), passing through each transformer block.
+    ${{intro}}
     <span class="info-btn" onclick="showInfo(this,'How an LLM works','A large language model processes text by converting words into numbers (embeddings), then passing them through a stack of <strong>transformer blocks</strong>. Each block has two parts: <strong>self-attention</strong> (which lets every word look at every other word to understand context) and a <strong>feed-forward network</strong> (which transforms the representation). After all blocks, the output layer converts the final numbers back into a probability for each possible next word.')">i</span>
   </p>`;
+
+  // A vision tower is a separate stack. Rendering it inline with the text
+  // blocks would imply text flows through it, which it does not.
+  if (numVision > 0) {{
+    const visTensors = Object.values(visionLayers).flat();
+    const visBytes = visTensors.reduce((a, t) => a + t.n_bytes, 0);
+    html += `<div style="border:1px solid var(--border);border-radius:8px;padding:16px;margin-bottom:20px;background:var(--bg2);">
+      <div style="display:flex;justify-content:space-between;align-items:center;">
+        <span style="font-weight:600;">Vision encoder
+          <span class="info-btn" onclick="showInfo(this,'Vision Encoder','This model carries a <strong>vision tower</strong> (tensors named <code>v.blk.N.*</code>) that encodes images into the same representation space the language model uses. It is a separate stack: images go through it, text does not. A projector then maps its output into the text model dimension.')">i</span>
+        </span>
+        <span style="font-size:12px;color:var(--text2);font-family:var(--mono);">${{numVision}} blocks &middot; ${{visTensors.length}} tensors &middot; ${{fmtBytes(visBytes)}}</span>
+      </div>
+    </div>`;
+  }}
+
+  if (numLayers === 0) {{
+    html += `<p style="color:var(--text2);font-size:13px;">
+      This file has no text transformer blocks &mdash; it holds only the components shown above.
+      Projector and vision-only files (such as <code>mmproj-*.gguf</code>) are packaged separately from the language model.
+    </p></div>`;
+    document.getElementById("archDiagram").innerHTML = html;
+    return;
+  }}
 
   // Embedding
   const embSize = embeds.length > 0 ? fmtBytes(embeds.reduce((a,t) => a+t.n_bytes, 0)) : "";
