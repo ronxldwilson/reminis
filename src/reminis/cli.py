@@ -2,6 +2,7 @@
 
 import argparse
 import sys
+from pathlib import Path
 
 from reminis import __version__
 
@@ -31,6 +32,12 @@ def main():
     p_info = sub.add_parser("info", help="Show summary info about a reminis database")
     p_info.add_argument("input", help="Path to the SQLite database")
 
+    # view: generate and open interactive HTML viewer
+    p_view = sub.add_parser("view", help="Open an interactive viewer for a reminis database")
+    p_view.add_argument("input", help="Path to the SQLite database")
+    p_view.add_argument("-o", "--output", help="Output HTML path (default: same name with .html)")
+    p_view.add_argument("--no-open", action="store_true", help="Don't open in browser")
+
     args = parser.parse_args()
 
     if args.command is None:
@@ -47,6 +54,13 @@ def main():
 
     elif args.command == "info":
         _show_info(args.input)
+
+    elif args.command == "view":
+        import webbrowser
+        from reminis.viewer import generate_viewer
+        html_path = generate_viewer(args.input, args.output)
+        if not args.no_open:
+            webbrowser.open("file://" + str(Path(html_path).resolve()))
 
 
 def _show_info(db_path: str):
