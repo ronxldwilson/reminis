@@ -95,12 +95,40 @@ def test_model(gguf_path: Path) -> dict:
     }
 
 
+def is_readable_gguf(path: Path) -> bool:
+    """Cheap check that a file is a complete, parseable GGUF.
+
+    The models directory is a working scratch area, so it can contain
+    partially-downloaded files. Those should be skipped with a clear note
+    rather than crashing the run or being reported as a real failure.
+    """
+    try:
+        GGUFReader(str(path), mode="r")
+        return True
+    except Exception:
+        return False
+
+
 def main():
     TMP_DIR.mkdir(parents=True, exist_ok=True)
 
-    models = sorted(MODELS_DIR.glob("*.gguf"))
-    if not models:
+    all_files = sorted(MODELS_DIR.glob("*.gguf"))
+    if not all_files:
         print(f"No GGUF files found in {MODELS_DIR}")
+        return
+
+    models, skipped = [], []
+    for p in all_files:
+        (models if is_readable_gguf(p) else skipped).append(p)
+
+    for p in skipped:
+        mb = p.stat().st_size / (1024 * 1024)
+        print(f"SKIP {p.name} ({mb:.0f} MB) -- not a complete GGUF, likely still downloading")
+    if skipped:
+        print()
+
+    if not models:
+        print("No complete GGUF files to test.")
         return
 
     print(f"Testing {len(models)} models with SHA256 verification\n")
