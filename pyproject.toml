@@ -1,16 +1,16 @@
 [project]
 name = "reminis"
-version = "0.0.0"
+version = "0.1.0"
 description = "Store LLM weights in a SQLite database. Query, diff, rollback, and merge — for free."
 readme = "README.md"
-requires-python = ">=3.9"
+requires-python = ">=3.10"
 license = "MIT"
 authors = [
     { name = "Ronald Wilson", email = "ronaldwilson00000@gmail.com" },
 ]
 keywords = ["llm", "sqlite", "gguf", "weights", "machine-learning", "fine-tuning"]
 classifiers = [
-    "Development Status :: 2 - Pre-Alpha",
+    "Development Status :: 3 - Alpha",
     "Intended Audience :: Developers",
     "Intended Audience :: Science/Research",
     "License :: OSI Approved :: MIT License",
@@ -18,7 +18,13 @@ classifiers = [
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
     "Topic :: Database",
 ]
-dependencies = []
+dependencies = [
+    "gguf>=0.16.0",
+    "numpy>=1.24.0",
+]
+
+[project.scripts]
+reminis = "reminis.cli:main"
 
 [project.urls]
 Homepage = "https://github.com/ronxldwilson/reminis"
