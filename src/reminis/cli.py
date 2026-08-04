@@ -38,6 +38,21 @@ def main():
     p_view.add_argument("-o", "--output", help="Output HTML path (default: same name with .html)")
     p_view.add_argument("--no-open", action="store_true", help="Don't open in browser")
 
+    # diff: compare two model databases
+    p_diff = sub.add_parser("diff", help="Compare two model databases tensor by tensor")
+    p_diff.add_argument("base", help="Path to the base model database")
+    p_diff.add_argument("target", help="Path to the target model database")
+    p_diff.add_argument("-o", "--output", help="Write a delta pack that turns base into target")
+    p_diff.add_argument("-q", "--quiet", action="store_true", help="Suppress progress output")
+
+    # apply: apply a delta pack to a base model
+    p_apply = sub.add_parser("apply", help="Apply a delta pack to a base model")
+    p_apply.add_argument("base", help="Path to the base model database")
+    p_apply.add_argument("delta", help="Path to the delta pack")
+    p_apply.add_argument("-o", "--output", required=True, help="Output database path")
+    p_apply.add_argument("--no-verify", action="store_true", help="Skip hash verification")
+    p_apply.add_argument("-q", "--quiet", action="store_true", help="Suppress progress output")
+
     args = parser.parse_args()
 
     if args.command is None:
@@ -61,6 +76,17 @@ def main():
         html_path = generate_viewer(args.input, args.output)
         if not args.no_open:
             webbrowser.open("file://" + str(Path(html_path).resolve()))
+
+    elif args.command == "diff":
+        from reminis.diff import diff_models
+        diff_models(args.base, args.target, args.output, verbose=not args.quiet)
+
+    elif args.command == "apply":
+        from reminis.diff import apply_delta
+        apply_delta(
+            args.base, args.delta, args.output,
+            verify=not args.no_verify, verbose=not args.quiet,
+        )
 
 
 def _show_info(db_path: str):
