@@ -21,6 +21,7 @@ classifiers = [
 dependencies = [
     "gguf>=0.16.0",
     "numpy>=1.24.0",
+    "zstandard>=0.22.0",
 ]
 
 [project.scripts]
