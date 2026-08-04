@@ -1,7 +1,7 @@
 """Convert between GGUF files and SQLite databases."""
 
+import json
 import sqlite3
-import struct
 import time
 from pathlib import Path
 
@@ -132,17 +132,17 @@ def gguf_to_sqlite(gguf_path: str, db_path: str | None = None, verbose: bool = T
     total_bytes = 0
     for i, tensor in enumerate(reader.tensors):
         name = tensor.name
-        shape = list(tensor.shape)
+        shape = [int(x) for x in tensor.shape]
         dtype_enum = tensor.tensor_type
         dtype_name = dtype_enum.name
         n_elements = int(tensor.n_elements)
         n_bytes = int(tensor.n_bytes)
-        raw_data = bytes(tensor.data)
+        raw_data = tensor.data.tobytes()
 
         conn.execute(
             "INSERT OR REPLACE INTO tensors (name, shape, dtype, dtype_id, n_elements, n_bytes, data) "
             "VALUES (?, ?, ?, ?, ?, ?, ?)",
-            (name, str(shape), dtype_name, dtype_enum.value, n_elements, n_bytes, raw_data),
+            (name, json.dumps(shape), dtype_name, dtype_enum.value, n_elements, n_bytes, raw_data),
         )
         total_bytes += n_bytes
 
@@ -216,13 +216,23 @@ def sqlite_to_gguf(db_path: str, gguf_path: str | None = None, verbose: bool = T
         "SELECT name, shape, dtype, dtype_id, n_elements, n_bytes, data FROM tensors ORDER BY id"
     ).fetchall()
 
+    NATIVE_DTYPES = {
+        GGMLQuantizationType.F32: np.float32,
+        GGMLQuantizationType.F16: np.float16,
+    }
+
     total_bytes = 0
     for i, (name, shape_str, dtype_name, dtype_id, n_elements, n_bytes, data) in enumerate(tensor_rows):
-        shape = eval(shape_str)
+        shape = json.loads(shape_str)
         quant_type = GGMLQuantizationType(dtype_id)
 
-        raw_data = np.frombuffer(data, dtype=np.uint8)
-        writer.add_tensor(name, raw_data, raw_shape=shape, raw_dtype=quant_type)
+        np_dtype = NATIVE_DTYPES.get(quant_type)
+        if np_dtype is not None:
+            tensor_data = np.frombuffer(data, dtype=np_dtype).reshape(shape[::-1])
+            writer.add_tensor(name, tensor_data)
+        else:
+            raw_data = np.frombuffer(data, dtype=np.uint8)
+            writer.add_tensor(name, raw_data, raw_shape=shape, raw_dtype=quant_type)
         total_bytes += n_bytes
 
         if verbose:
