@@ -38,7 +38,37 @@ reminis export model.db -o model_restored.gguf
 
 ## Verified Results
 
-SHA256-verified lossless round-trip across 9 model variants covering 13 quantization types:
+### Architectures
+
+Every tensor is SHA256-hashed before and after the round-trip. These architectures are confirmed lossless:
+
+| Architecture | Model | Tensors | Size | Convert | Export | Result |
+|---|---|---|---|---|---|---|
+| `llama` | Llama-3.2-1B-Instruct F16 | 147 | 2365 MB | 19.2s | 1.7s | lossless |
+| `qwen2` | Qwen2.5-0.5B-Instruct FP16 | 291 | 1208 MB | 14.4s | 0.9s | lossless |
+| `granitemoe` | Granite-3.1-1B-A400M Q4_K_M | 242 | 784 MB | 6.5s | 0.5s | lossless |
+| `clip` (vision) | SmolVLM-256M projector F16 | 198 | 181 MB | 1.0s | 0.1s | lossless |
+| `llama` | SmolLM-135M, 9 quantizations | 272 | 84–258 MB | ~2s | ~0.1s | lossless |
+
+The MoE model is the interesting one: 72 of its tensors are **3-dimensional** expert stacks (e.g. `[512, 1024, 32]` in Q6_K), a shape the quantized export path had never seen. It generalizes correctly.
+
+Throughput is roughly linear with size — about 120 MB/s converting, over 1 GB/s exporting.
+
+### Diff and apply at scale
+
+On Llama-3.2-1B (2.4 GB), perturbing all 64 attention projections:
+
+```
+copy 2.4GB database    0.57s
+diff                   9.36s   64 tensors changed, pack 278 MB of 2357 MB (11.8%)
+apply + verify         7.87s   result matches target hash exactly
+```
+
+Roughly half of each figure is SHA256 hashing the full model to guarantee a pack cannot be applied to the wrong base. SHA256 is hardware-accelerated here (957 MB/s) and measurably faster than blake2b, so that is already the cheapest safe option.
+
+### Quantization coverage
+
+SHA256-verified lossless round-trip across 9 SmolLM-135M variants covering 13 quantization types:
 
 ```
 Model                               Dtypes                Tensors  GGUF MB    DB MB    RT MB  Conv(s)   Exp(s)   Result
