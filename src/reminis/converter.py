@@ -232,7 +232,12 @@ def sqlite_to_gguf(db_path: str, gguf_path: str | None = None, verbose: bool = T
             writer.add_tensor(name, tensor_data)
         else:
             raw_data = np.frombuffer(data, dtype=np.uint8)
-            writer.add_tensor(name, raw_data, raw_shape=shape, raw_dtype=quant_type)
+            if len(shape) >= 2:
+                block_size, type_size = GGML_QUANT_SIZES[quant_type]
+                byte_last = (shape[0] // block_size) * type_size
+                byte_shape = shape[1:] + [byte_last]
+                raw_data = raw_data.reshape(byte_shape)
+            writer.add_tensor(name, raw_data, raw_dtype=quant_type)
         total_bytes += n_bytes
 
         if verbose:
