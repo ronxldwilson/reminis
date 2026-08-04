@@ -23,6 +23,15 @@ reminis convert model.gguf
 # Inspect what's inside
 reminis info model.db
 
+# Browse it in your browser
+reminis view model.db
+
+# Compare two models, and package the difference
+reminis diff base.db finetuned.db -o change.delta.db
+
+# Reconstruct the fine-tune from the base plus the pack
+reminis apply base.db change.delta.db -o rebuilt.db
+
 # Convert back to GGUF
 reminis export model.db -o model_restored.gguf
 ```
@@ -103,6 +112,40 @@ SELECT key, value FROM model_meta
 WHERE key LIKE '%context_length%' OR key LIKE '%block_count%';
 ```
 
+## Diffing and Delta Packs
+
+`reminis diff` compares two models tensor by tensor and can emit a **delta pack** — a small database that reconstructs the target from the base:
+
+```bash
+reminis diff base.db instruct.db -o change.delta.db
+reminis apply base.db change.delta.db -o rebuilt.db
+```
+
+Packs record the weight hashes of both sides. `apply` refuses a base that does not match, rather than silently producing a corrupt model, and verifies the result against the recorded target hash.
+
+Encoding is **XOR**, not arithmetic subtraction. An arithmetic float delta is not exactly reversible — `b - a` generally is not representable in the tensor's own dtype, so `a + delta` lands a rounding step away from `b`. XOR is exact for every dtype, and also works on quantized tensors, whose bytes cannot be subtracted meaningfully at all. Per tensor, whichever of the compressed XOR delta or a compressed full replacement is smaller wins.
+
+### How small are packs, really?
+
+It depends entirely on how much of the model the fine-tune touched.
+
+| Scenario | Tensors changed | Pack size |
+|---|---|---|
+| Targeted change (5 of 272 tensors) | 5 | **1.4%** of full model |
+| Full fine-tune (SmolLM-135M to its Instruct variant) | 272 of 272 | **58.8%** of full model |
+
+The second row is the honest one for full fine-tuning. Every tensor changed, with ~97% of individual values differing in each, so lossless compression has little to exploit — the differing float16 mantissa bits are close to incompressible.
+
+The delta is also only partly low-rank. Ranks needed to capture 90% of the delta's energy:
+
+| Tensor | Shape | Rank for 90% | Full rank |
+|---|---|---|---|
+| `blk.0.attn_q.weight` | [576, 576] | 31 | 576 |
+| `blk.18.ffn_gate.weight` | [1536, 576] | 311 | 576 |
+| `blk.29.ffn_down.weight` | [576, 1536] | 291 | 576 |
+
+Attention deltas compress well under a low-rank factorization; FFN deltas do not. Lossy encodings that would change this — int8 deltas, adaptive-rank SVD, mantissa truncation — are tracked in [issue #2](https://github.com/ronxldwilson/reminis/issues/2) and are not implemented yet.
+
 ## Python API
 
 ```python
@@ -141,10 +184,12 @@ All GGUF tensor types are supported and verified, including:
 - [x] GGUF to SQLite converter (lossless, verified across 13 quant types)
 - [x] SQLite to GGUF back-converter (lossless, byte-perfect)
 - [x] SHA256 verification test suite
+- [x] Interactive HTML viewer (`reminis view`)
+- [x] Weight diffing between model versions (`reminis diff`)
+- [x] Delta packs with verified apply (`reminis apply`)
+- [ ] Lossy delta encodings so full fine-tunes compress ([#2](https://github.com/ronxldwilson/reminis/issues/2))
 - [ ] Fine-tune tracking with edit logs
 - [ ] Surgical rollback of bad training steps
-- [ ] Weight diffing between model versions
-- [ ] Delta-based model distribution (weight migrations)
 - [ ] Model merging via SQL operations
 - [ ] Inference from database-stored weights
 - [ ] Unsloth integration
