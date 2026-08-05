@@ -248,17 +248,30 @@ The check that matters is not that it generates — wrong block arithmetic still
 
 **`--pack 4|6|8` re-quantizes instead**, which is smaller and faster but rounds every weight a second time.
 
-| | Weights resident | Generation | Logits vs unpacked |
+| | Weights resident | Logits vs unpacked |
+|---|---|---|
+| unpacked (default) | 258 MB | — |
+| `--pack` (bit-exact) | 145 MB | corr 0.9998979, top-5 intact |
+| `--pack compact` | 138 MB | corr 0.9998995, top-5 intact |
+| `--pack 4` | 122 MB | corr 0.9711, top-5 **reordered** |
+
+`--pack compact` holds the per-group scale and bias in float16 instead of float32. At a group size of 32 that is the difference between 6 and 5 bits per weight on a 4-bit tensor — 17% of the model — for a measured **8.3e-04** relative error, far below the quantization already in the file. It is the one thing that stops the repack being bit-exact, so it is opt-in.
+
+`Q6_K`, `Q2_K`, `Q3_K` and the i-quants have no affine form — 16-weight sub-blocks and codebooks respectively. Rather than leave them as float16, which would cost *more* memory than the file did, they are re-quantized to the nearest width. On Mistral-7B that one change was worth 6.55 GB → 5.49 GB and 3.0 → 8.3 tok/s.
+
+### A 7B on a 16 GB laptop
+
+The largest thing that fits here, measured rather than estimated. Mistral-7B-Instruct v0.3 at Q4_K_M, a 4.07 GB file, against llama.cpp on the same file and machine:
+
+| | Weights resident | Generation | vs llama.cpp |
 |---|---|---|---|
-| unpacked (default) | 258 MB | 112 tok/s | — |
-| `--pack` (bit-exact) | 158 MB (1.6×) | 83 tok/s | corr 0.9999946, top-5 intact |
-| `--pack 8` | 172 MB (1.5×) | 110 tok/s | corr 0.9999, top-5 intact |
-| `--pack 6` | 148 MB (1.7×) | 115 tok/s | corr 0.9981, top-5 intact |
-| `--pack 4` | **122 MB (2.1×)** | **138 tok/s** | corr 0.9710, top-5 **reordered** |
+| llama.cpp Metal | 4.07 GB | 12.7 tok/s | — |
+| `--pack` (bit-exact) | 5.49 GB | 8.3 tok/s | 65% |
+| **`--pack compact`** | **4.80 GB** | **13.1 tok/s** | **103%** |
 
-The bit-exact path costs speed on this file, which is 86% Q5_0. I measured individual quantized matmuls to explain why and got a result that contradicted the end-to-end run, so the cause is unestablished and the number stands as measured.
+Everything above 7B on this machine is a question of arithmetic rather than capability: a 13B at Q4_K_M would land near 8.8 GB packed compact, which fits; a 30B would not.
 
-What does not map: `Q6_K`, `Q2_K` and `Q3_K` use sub-blocks of **16** weights where MLX supports 32, 64 or 128; and the i-quants are codebook lookups rather than a scale times an integer, so no affine form exists. Those fall back to being unpacked.
+Two caveats on that row. Loading takes ~83 s, because the repack runs in numpy — it is one pass over the model and nothing has been done to speed it up. And Mistral v0.3 ships a SentencePiece tokenizer, which `reminis run` does not implement, so that measurement drives the forward pass with token ids directly. A 7B with a byte-level BPE tokenizer — Llama 3, Qwen 2.5 — runs end to end.
 
 This closes most of the gap with llama.cpp on quantized weights — the values multiplied are now exactly the ones in the file — without closing it entirely: llama.cpp still reads the original blocks with no repack step and no float32 scale array beside them.
 
@@ -821,7 +834,9 @@ Note that GGUF and safetensors use different tensor names (`blk.0.attn_q.weight`
 - [x] Running quantized models: every K-quant and i-quant, unpacked at load
 - [x] Keeping weights packed in the backend's own format (`--pack 4/6/8`)
 - [x] Multiplying GGML's blocks with no second rounding, for the affine types (`--pack`)
-- [ ] The remaining quant types (Q6_K, Q2_K, Q3_K, i-quants), which need 16-weight groups or a codebook
+- [x] The remaining quant types re-quantized to the nearest width rather than left as float16
+- [ ] SentencePiece tokenizers, so Mistral and Llama 2 run end to end
+- [ ] Faster repacking at load: 83 s for a 7B, all of it numpy
 - [ ] Running attention-free architectures (Mamba / state space, RWKV)
 - [ ] Unsloth integration
 

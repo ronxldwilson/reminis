@@ -56,7 +56,7 @@ from reminis.dtypes import (
     is_float_dtype,
     is_quantized_dtype,
 )
-from reminis.ggml_affine import AFFINE_GROUP, can_repack
+from reminis.ggml_affine import AFFINE_GROUP, can_repack, nearest_bits
 from reminis.ggml_affine import repack as ggml_repack
 
 # Architectures whose block structure this file actually implements. The
@@ -102,7 +102,8 @@ class WeightStore:
         self.path = db_path
         self.stream = stream
         self.backend = backend or select_backend("inference")
-        self.pack_bits = pack_bits
+        self.pack_bits = "native" if pack_bits == "compact" else pack_bits
+        self.pack_compact = pack_bits == "compact"
         self.pack_group = pack_group
         self.packed = 0
         self.packed_native = 0
@@ -153,7 +154,8 @@ class WeightStore:
             self.bytes_read += len(blob)
             self.reads += 1
             self.packed += 1
-            self.packed_native += 1
+            if can_repack(dtype):
+                self.packed_native += 1
             if not self.stream:
                 self._cache[name] = native
             return native
@@ -212,15 +214,29 @@ class WeightStore:
         """
         if self.pack_bits != "native" or not self.backend.can_pack():
             return None
-        if not self._packable(name) or not can_repack(dtype):
+        if not self._packable(name) or not is_quantized_dtype(dtype):
             return None
+
+        if not can_repack(dtype):
+            # No exact affine form -- Q6_K and friends use 16-weight
+            # sub-blocks, the i-quants use codebooks. Leaving them as float16
+            # would cost more memory than the file did, so they are
+            # re-quantized to the nearest width instead. That rounds a second
+            # time, which is why it is counted apart from the exact path.
+            bits = nearest_bits(dtype)
+            if bits is None:
+                return None
+            arr = self.backend.from_numpy(
+                dequantize_to_float32(blob, dtype).reshape(dims)
+            )
+            return self.backend.pack(arr, bits, AFFINE_GROUP, self.pack_compact)
 
         packed = ggml_repack(blob, dtype, dims)
         if packed is None:
             return None
         words, scales, biases, bits = packed
         return self.backend.adopt_packed(words, scales, biases, bits,
-                                         AFFINE_GROUP, dims)
+                                         AFFINE_GROUP, dims, self.pack_compact)
 
     def get_numpy(self, name: str) -> np.ndarray:
         """A tensor as plain float32 numpy, whatever the backend is.

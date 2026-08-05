@@ -50,6 +50,23 @@ _LAYOUT = {
 
 AFFINE_GROUP = 32
 
+# For quantizations with no exact affine form, the width to re-quantize to.
+# Chosen at or just above the source's own precision, so the second rounding
+# adds as little as it can while still being far smaller than float16. This
+# path is lossy, unlike `repack`, and the two are counted separately so a run
+# can say how much of it was exact.
+NEAREST_BITS = {
+    "Q2_K": 3, "Q3_K": 4, "Q3_K_S": 4, "Q3_K_M": 4, "Q3_K_L": 4,
+    "Q6_K": 6,
+    "IQ1_S": 2, "IQ1_M": 2, "IQ2_XXS": 2, "IQ2_XS": 3, "IQ2_S": 3,
+    "IQ3_XXS": 4, "IQ3_S": 4, "IQ3_M": 4, "IQ4_NL": 4, "IQ4_XS": 4,
+}
+
+
+def nearest_bits(dtype: str):
+    """The width to re-quantize a non-affine type to, or None to leave it."""
+    return NEAREST_BITS.get(dtype)
+
 
 def can_repack(dtype: str) -> bool:
     """Whether this quantization has an exact affine form at group size 32."""
