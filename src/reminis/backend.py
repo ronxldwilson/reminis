@@ -156,6 +156,21 @@ class Backend:
         """x @ w.T, whether w is a plain matrix or a packed one."""
         return x @ w.T
 
+    def gather_matmul(self, x, w, indices, k):
+        """Multiply each token by the experts chosen for it.
+
+        `x` is (tokens, features), `indices` is (tokens, k) naming a row of
+        the stacked expert tensor, and the result is (tokens, k, out). The
+        fallback gathers the chosen experts into one batch and does a single
+        batched multiply, so nothing loops over experts in Python.
+        """
+        xp = self.xp
+        n_tokens = x.shape[0]
+        gathered = xp.take(w, indices.reshape(-1), axis=0)
+        rows = xp.repeat(x, k, axis=0)[:, None, :]
+        out = rows @ xp.swapaxes(gathered, -1, -2)
+        return out.reshape(n_tokens, k, -1)
+
     # -- the pieces of a forward pass -------------------------------------
 
     def rms_norm(self, x, weight, eps: float):
@@ -166,6 +181,15 @@ class Backend:
 
     def silu(self, x):
         raise NotImplementedError
+
+    def to_compute32(self, x):
+        """Widen to float32, for a reduction half precision would spoil.
+
+        Routing is the case that matters: a softmax over experts decides
+        which ones run at all, so a rounding there changes the computation
+        rather than nudging it.
+        """
+        return x
 
     def rope(self, x, dims, traditional, base, offset, freqs=None):
         """Rotary embedding on (batch, heads, tokens, dim).
@@ -435,6 +459,21 @@ class MLXBackend(Backend):
             x, w.q, w.scales, w.biases, transpose=True,
             group_size=w.group_size, bits=w.bits,
         )
+
+    def to_compute32(self, x):
+        return x.astype(self.mx.float32)
+
+    def gather_matmul(self, x, w, indices, k):
+        if not isinstance(w, QuantizedWeight):
+            return Backend.gather_matmul(self, x, w, indices, k)
+        mx = self.mx
+        n_tokens, features = x.shape
+        out = mx.gather_qmm(
+            x.reshape(n_tokens, 1, 1, features), w.q, w.scales, w.biases,
+            rhs_indices=indices.astype(mx.uint32), transpose=True,
+            group_size=w.group_size, bits=w.bits,
+        )
+        return out.reshape(n_tokens, k, -1)
 
     def rms_norm(self, x, weight, eps: float):
         return self.mx.fast.rms_norm(x, weight, eps)

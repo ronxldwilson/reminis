@@ -68,6 +68,8 @@ from reminis.ggml_affine import repack as ggml_repack
 SUPPORTED_ARCHS = {
     "llama": "norm",
     "mistral": "norm",
+    "granite": "norm",
+    "granitemoe": "norm",
     "qwen2": "neox",
     "qwen2moe": "neox",
 }
@@ -95,6 +97,9 @@ class WeightStore:
     _PACKABLE = (
         "attn_q.weight", "attn_k.weight", "attn_v.weight", "attn_output.weight",
         "ffn_gate.weight", "ffn_up.weight", "ffn_down.weight",
+        # Mixture-of-experts weights are stacked 3-D tensors and are most of
+        # such a model's bytes, so they matter more here than anything else.
+        "ffn_gate_exps.weight", "ffn_up_exps.weight", "ffn_down_exps.weight",
     )
 
     def __init__(self, db_path: str, stream: bool = False, backend=None,
@@ -318,6 +323,24 @@ class Config:
             self.rope_freqs = 1.0 / (base_freqs / self.rope_factors[:half])
         else:
             self.rope_freqs = None
+
+        # Mixture of experts: a router picks a few of many feed-forward
+        # networks per token, and the experts are stored stacked into one
+        # 3-D tensor per projection rather than as separate matrices.
+        self.n_experts = int(num("expert_count", 0))
+        self.n_experts_used = int(num("expert_used_count", 0))
+        self.is_moe = self.n_experts > 0 and store.has("blk.0.ffn_gate_exps.weight")
+
+        # Granite scales four things the rest of the llama family leaves at
+        # 1, and silently ignoring any of them produces fluent nonsense.
+        # attention.scale replaces 1/sqrt(head_dim) outright -- for this
+        # model it is 1/64 where the usual formula gives 1/8.
+        self.attn_scale = float(num("attention.scale", 0.0)) or (
+            1.0 / math.sqrt(self.head_dim)
+        )
+        self.embedding_scale = float(num("embedding_scale", 1.0))
+        self.residual_scale = float(num("residual_scale", 1.0))
+        self.logit_scale = float(num("logit_scale", 1.0))
 
         # Tied embeddings: many small models have no separate output matrix.
         self.tied_output = not store.has("output.weight")
@@ -751,19 +774,62 @@ class Model:
         if n_tokens > 1:
             mask = self._causal_mask(n_tokens, offset, k_all.shape[-2])
 
-        out = b.attention(q, k_all, v_all, 1.0 / math.sqrt(cfg.head_dim), mask)
+        out = b.attention(q, k_all, v_all, cfg.attn_scale, mask)
         out = out[0].transpose(1, 0, 2).reshape(n_tokens, cfg.n_heads * cfg.head_dim)
-        x = x + self._linear(out, p + "attn_output.weight", p + "attn_output.bias")
+        attn_out = self._linear(out, p + "attn_output.weight", p + "attn_output.bias")
+        x = x + cfg.residual_scale * attn_out
+
+        if cfg.is_moe:
+            h = b.rms_norm(x, ffn_norm, cfg.rms_eps)
+            return x + cfg.residual_scale * self._moe_ffn(h, p)
 
         if self.store.stream or self.store.pack_bits is not None:
             h = b.rms_norm(x, ffn_norm, cfg.rms_eps)
             gate, up = self._gate_up(h, layer, p)
-            return x + self._linear(b.silu(gate) * up, p + "ffn_down.weight")
+            branch = self._linear(b.silu(gate) * up, p + "ffn_down.weight")
+            return x + cfg.residual_scale * branch
 
         gate_up, _ = self._fused_cache.get((layer, "gate_up")) or self._fused(
             layer, "gate_up", ["ffn_gate.weight", "ffn_up.weight"])
+        if cfg.residual_scale != 1.0:
+            h = b.rms_norm(x, ffn_norm, cfg.rms_eps)
+            gate, up = self._gate_up(h, layer, p)
+            branch = self._linear(b.silu(gate) * up, p + "ffn_down.weight")
+            return x + cfg.residual_scale * branch
         return b.fused_ffn(x, ffn_norm, gate_up,
                            self.store.get(p + "ffn_down.weight"), cfg.rms_eps)
+
+    def _moe_ffn(self, h, p: str):
+        """A router picks a few experts per token; their outputs are summed.
+
+        The experts are stored stacked -- one 3-D tensor per projection with
+        the expert as its first axis -- so selecting them is a gather rather
+        than a lookup of separate matrices. Every selected (token, expert)
+        pair becomes a row of one batched matrix multiply, which is why this
+        does not loop over experts in Python.
+        """
+        b = self.backend
+        xp = b.xp
+        cfg = self.cfg
+        k = cfg.n_experts_used
+        n_tokens = h.shape[0]
+
+        router = self.store.get(p + "ffn_gate_inp.weight")
+        probs = b.softmax(b.to_compute32(h @ router.T))
+
+        # The k largest, then renormalised so the chosen weights sum to one.
+        idx = xp.argpartition(-probs, k - 1, axis=-1)[:, :k]
+        weight = xp.take_along_axis(probs, idx, axis=-1)
+        weight = weight / xp.sum(weight, axis=-1, keepdims=True)
+
+        gate = b.gather_matmul(h, self.store.get(p + "ffn_gate_exps.weight"), idx, k)
+        up = b.gather_matmul(h, self.store.get(p + "ffn_up_exps.weight"), idx, k)
+        hidden = (b.silu(gate) * up).reshape(n_tokens * k, -1)
+        out = b.gather_matmul(
+            hidden, self.store.get(p + "ffn_down_exps.weight"),
+            idx.reshape(-1)[:, None], 1,
+        ).reshape(n_tokens, k, -1)
+        return xp.sum(out * weight.astype(out.dtype)[..., None], axis=1)
 
     def _causal_mask(self, n_tokens: int, offset: int, total: int):
         """True where a query at an absolute position may see a key.
@@ -795,6 +861,8 @@ class Model:
         with b.errstate():
             embed = self.store.get("token_embd.weight")
             x = embed[b.xp.array(np.asarray(tokens, dtype=np.int32))]
+            if self.cfg.embedding_scale != 1.0:
+                x = x * self.cfg.embedding_scale
 
             for layer in range(self.cfg.n_layers):
                 x = self._block(x, layer, cache, offset)
@@ -806,6 +874,8 @@ class Model:
             logits = self.backend.matmul_weight(
                 last, self.store.get(out_name)
             ).reshape(-1)
+            if self.cfg.logit_scale != 1.0:
+                logits = logits / self.cfg.logit_scale
             b.eval(logits)
 
         # Sampling happens in numpy whatever the backend: the vocabulary-sized

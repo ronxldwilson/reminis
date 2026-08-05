@@ -259,6 +259,18 @@ The check that matters is not that it generates — wrong block arithmetic still
 
 `Q6_K`, `Q2_K`, `Q3_K` and the i-quants have no affine form — 16-weight sub-blocks and codebooks respectively. Rather than leave them as float16, which would cost *more* memory than the file did, they are re-quantized to the nearest width. On Mistral-7B that one change was worth 6.55 GB → 5.49 GB and 3.0 → 8.3 tok/s.
 
+### Mixture-of-experts models
+
+The experts are stored stacked — one 3-D tensor per projection with the expert as its first axis — so a router's top-k choice becomes a gather, and on MLX a single `gather_qmm` call selects the experts and multiplies by them in one kernel. They pack like any other weight, which matters more here than anywhere else: on Granite-3.1-1b-a400m the experts are 1.2B of the 1.33B parameters.
+
+| | Weights resident | Generation |
+|---|---|---|
+| unpacked | 2.50 GB | 38.7 tok/s |
+| **`--pack compact`** | **0.90 GB** | **121.9 tok/s** |
+| llama.cpp Metal | 0.78 GB | 139.7 tok/s |
+
+Packing the experts is worth **3.2×**, and lands at 87% of llama.cpp from a file of 0.78 GB. Both backends produce identical text, which is the check that matters — routing to the wrong experts, weighting them wrong, or dropping one of Granite's four scaling multipliers all produce fluent nonsense rather than an error.
+
 ### A 7B on a 16 GB laptop
 
 The largest thing that fits here, measured rather than estimated. Mistral-7B-Instruct v0.3 at Q4_K_M, a 4.07 GB file, against llama.cpp on the same file and machine:
@@ -663,7 +675,8 @@ reminis run soup.db "Name three colours." --chat --temp 0
 
 Implemented, and enforced rather than assumed:
 
-- **llama-family and qwen2 architectures** — RMSNorm, SwiGLU, grouped-query attention, rotary embeddings. That covers llama, llama 3 (including its per-dimension rotary scaling, which is stored as a tensor rather than as metadata), mistral, qwen2 (which uses the other rotary layout and has QKV biases), and smollm.
+- **llama-family, qwen2 and Granite architectures** — RMSNorm, SwiGLU, grouped-query attention, rotary embeddings. That covers llama, llama 3 (including its per-dimension rotary scaling, which is stored as a tensor rather than as metadata), mistral, qwen2 (which uses the other rotary layout and has QKV biases), smollm, and Granite (which scales embeddings, residuals, logits and attention by its own constants — `attention.scale` is 1/head_dim where everyone else uses 1/sqrt(head_dim)).
+- **Mixture of experts** — a router picks the top-k of many stacked feed-forward networks per token. The experts are one 3-D tensor per projection, so selecting them is a gather rather than a Python loop, and they pack like any other weight.
 - **Float weights** — F32, F16, BF16.
 - **Byte-level BPE**, rebuilt from the vocabulary and merge list in the database, matching `transformers` exactly across three tokenizer families.
 
@@ -835,6 +848,7 @@ Note that GGUF and safetensors use different tensor names (`blk.0.attn_q.weight`
 - [x] Keeping weights packed in the backend's own format (`--pack 4/6/8`)
 - [x] Multiplying GGML's blocks with no second rounding, for the affine types (`--pack`)
 - [x] The remaining quant types re-quantized to the nearest width rather than left as float16
+- [x] Mixture-of-experts models: router, stacked experts, packed and gathered
 - [ ] SentencePiece tokenizers, so Mistral and Llama 2 run end to end
 - [ ] Faster repacking at load: 83 s for a 7B, all of it numpy
 - [ ] Running attention-free architectures (Mamba / state space, RWKV)

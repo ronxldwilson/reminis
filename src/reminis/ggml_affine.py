@@ -198,13 +198,17 @@ def _pack_words(q: np.ndarray, bits: int) -> np.ndarray:
     of which GGML uses) straddle word boundaries, so this cannot be done a
     word at a time.
     """
-    rows, cols = q.shape
-    flat = np.ascontiguousarray(q, dtype=np.uint8).reshape(rows, cols, 1)
+    # Expert weights arrive as one 3-D tensor per projection, so the
+    # leading axes are flattened and restored rather than assumed away.
+    original = q.shape
+    flat = np.ascontiguousarray(q, dtype=np.uint8).reshape(-1, original[-1], 1)
     # Little-endian bit order means bit 0 of each value comes first, so
     # taking the low `bits` bits of each byte gives the stream directly.
     stream = np.unpackbits(flat, axis=-1, bitorder="little")[:, :, :bits]
-    packed = np.packbits(stream.reshape(rows, -1), axis=-1, bitorder="little")
-    return np.ascontiguousarray(packed).view(np.uint32)
+    packed = np.packbits(stream.reshape(stream.shape[0], -1), axis=-1,
+                         bitorder="little")
+    words = np.ascontiguousarray(packed).view(np.uint32)
+    return words.reshape(*original[:-1], -1)
 
 
 def repack(blob: bytes, dtype: str, shape: tuple):

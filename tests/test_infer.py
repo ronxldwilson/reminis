@@ -19,6 +19,7 @@ from pathlib import Path
 
 import numpy as np
 
+from reminis.backend import available_backends
 from reminis.backend import select as select_backend
 from reminis.infer import (
     KVCache,
@@ -290,12 +291,6 @@ def test_refusals():
     else:
         print("  skip  mamba-130m.db not present")
 
-    if QUANTIZED.exists():
-        expect_error("a state-space or MoE architecture is named in the refusal",
-                     "granitemoe",
-                     lambda: generate(str(QUANTIZED), "hello", max_tokens=1,
-                                      verbose=False, on_token=lambda _: None))
-
     # Quantized tensors are now unpacked rather than refused, so the thing
     # that must still fail loudly is a dtype reminis cannot decode at all.
     # One tensor of a working model is relabelled to produce that.
@@ -448,6 +443,71 @@ def _resident_mb(backend):
         return resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024 ** 2
 
 
+def test_mixture_of_experts():
+    """A router picking experts per token, against the dense path's rules.
+
+    An MoE forward pass has three ways to be quietly wrong: routing to the
+    wrong experts, weighting them wrong, and -- for Granite specifically --
+    ignoring the four scaling multipliers it carries, any one of which
+    produces fluent nonsense. Both backends computing the same text is the
+    check, since they share no code below the array operations.
+    """
+    print("\nMixture of experts")
+    if not QUANTIZED.exists():
+        print("  skip  the granite MoE database is not present")
+        return
+
+    model = Model(str(QUANTIZED))
+    try:
+        check("the model is recognised as MoE", model.cfg.is_moe)
+        check("the expert counts were read",
+              model.cfg.n_experts == 32 and model.cfg.n_experts_used == 8,
+              f"{model.cfg.n_experts} experts, {model.cfg.n_experts_used} used")
+        # Granite scales attention by 1/head_dim rather than 1/sqrt(head_dim).
+        check("granite's own attention scale is used, not 1/sqrt(d)",
+              abs(model.cfg.attn_scale - 0.015625) < 1e-9,
+              str(model.cfg.attn_scale))
+        check("the embedding, residual and logit scales were read",
+              model.cfg.embedding_scale == 12.0 and model.cfg.logit_scale == 6.0
+              and abs(model.cfg.residual_scale - 0.22) < 1e-6)
+    finally:
+        model.close()
+
+    texts = {}
+    for name in ["numpy"] + [n for n in available_backends() if n != "numpy"]:
+        result = generate(str(QUANTIZED), "The capital of France is",
+                          max_tokens=10, temperature=0.0, verbose=False,
+                          on_token=lambda _: None, backend=name)
+        texts[name] = result["completion"]
+    check("an MoE model generates coherent text",
+          "paris" in texts["numpy"].lower(), f"got {texts['numpy']!r}")
+    print(f"        (it said: {texts['numpy']!r})")
+    for name, text in texts.items():
+        if name != "numpy":
+            check(f"{name} routes to the same experts as numpy",
+                  text == texts["numpy"], f"got {text!r}")
+
+    # Packing the experts is what makes an MoE model worth running: they are
+    # most of its bytes, and they are 3-D, which the packing had to learn.
+    backend = select_backend("inference")
+    if backend.can_pack():
+        packed = Model(str(QUANTIZED), pack_bits="compact")
+        try:
+            for name in packed.store._shapes:
+                packed.store.get(name)
+            check("the stacked expert tensors were packed",
+                  packed.store.packed >= 3 * packed.cfg.n_layers,
+                  f"{packed.store.packed} packed over {packed.cfg.n_layers} layers")
+        finally:
+            packed.close()
+        result = generate(str(QUANTIZED), "The capital of France is",
+                          max_tokens=10, temperature=0.0, verbose=False,
+                          on_token=lambda _: None, pack_bits="compact")
+        check("a packed MoE model says the same thing",
+              result["completion"] == texts["numpy"],
+              f"got {result['completion']!r}")
+
+
 def test_merged_model_runs():
     """The payoff: a model that was assembled by SQL still speaks."""
     print("\nA merged model")
@@ -491,6 +551,7 @@ def main():
     test_refusals()
     test_quantized_models()
     test_packed_weights()
+    test_mixture_of_experts()
     test_merged_model_runs()
 
     print("\n" + "=" * 70)
