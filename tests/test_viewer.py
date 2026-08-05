@@ -183,10 +183,12 @@ def rwkv_db(path: Path) -> None:
 
 
 def hybrid_db(path: Path) -> None:
-    """Attention in the even blocks, a state-space scan in the odd ones."""
+    """A Granite-4.0-H shape: a state-space stack with attention every fifth
+    block. Long enough that the diagram has to collapse it, which is where a
+    fixed first-two/last-two window would hide every attention block."""
     tensors = [("token_embd.weight", (64, 100))]
-    for layer in range(4):
-        if layer % 2 == 0:
+    for layer in range(16):
+        if layer % 5 == 4:
             for part in ("attn_q", "attn_k", "attn_v", "attn_output"):
                 tensors.append((f"blk.{layer}.{part}.weight", (64, 64)))
         else:
@@ -197,6 +199,21 @@ def hybrid_db(path: Path) -> None:
         tensors.append((f"blk.{layer}.attn_norm.weight", (64,)))
     tensors.append(("output_norm.weight", (64,)))
     build_db(path, {"general.architecture": "jamba", "general.name": "toy-hybrid"}, tensors)
+
+
+def vision_db(path: Path) -> None:
+    """A projector file: a vision tower and nothing else."""
+    tensors = [("v.patch_embd.weight", (16, 768)), ("v.position_embd.weight", (64, 768))]
+    for layer in range(3):
+        for part in ("attn_q", "attn_k", "attn_v", "attn_out"):
+            tensors.append((f"v.blk.{layer}.{part}.weight", (64, 64)))
+        for part in ("ffn_up", "ffn_down"):
+            tensors.append((f"v.blk.{layer}.{part}.weight", (64, 128)))
+        tensors.append((f"v.blk.{layer}.ln1.weight", (64,)))
+        tensors.append((f"v.blk.{layer}.ln2.weight", (64,)))
+    tensors.append(("v.post_ln.weight", (64,)))
+    tensors.append(("mm.model.fc.weight", (64, 256)))
+    build_db(path, {"general.architecture": "clip", "general.name": "toy-projector"}, tensors)
 
 
 def unknown_db(path: Path) -> None:
@@ -283,13 +300,29 @@ def main() -> None:
 
     hybrid_db(TMP / "hybrid.db")
     d = render(TMP / "hybrid.db", harness)
-    check("Hybrid", d, present=["hybrid block", "Self-Attention", "State Space (SSM)", "Feed-Forward"],
-          absent=["transformer block"])
+    check("Hybrid", d, present=[
+        "hybrid block", "Self-Attention", "State Space (SSM)", "Feed-Forward",
+        # The attention blocks are at 4, 9 and 14, all of them inside what a
+        # first-two/last-two collapse would drop.
+        "Block 4", "Block 9", "Block 14",
+        "identical blocks, through block",
+    ], absent=["transformer block", "same structure"])
 
     unknown_db(TMP / "unknown.db")
     d = render(TMP / "unknown.db", harness)
     check("Unknown architecture", d, present=["Block weights", "mystery_a.weight"],
           absent=["Self-Attention", "Feed-Forward", "transformer block"])
+
+    vision_db(TMP / "vision.db")
+    d = render(TMP / "vision.db", harness)
+    # Everything in the file is accounted for, including the projector, which
+    # is the only reason a projector file exists.
+    check("Vision tower", d, present=[
+        "Vision encoder", "Patch embedding", "Position embedding",
+        "3 vision blocks", "Self-Attention", "Feed-Forward",
+        "Output normalization", "Projector",
+        "no text transformer blocks",
+    ], absent=[])
 
     dense_db(TMP / "dense.db")
     d = render(TMP / "dense.db", harness)
@@ -308,6 +341,10 @@ def main() -> None:
         ("mamba-130m.db", ["state-space block", "State Space (SSM)"]),
         ("rwkv7-1.5b.db", ["RWKV block", "Time Mixing", "Channel Mixing"]),
         ("SmolLM-135M.f16.db", ["transformer block", "Self-Attention", "Feed-Forward"]),
+        ("smolvlm-mmproj.db", ["Vision encoder", "Patch embedding", "12 vision blocks", "Projector"]),
+        # 36 state-space blocks with attention at 5, 15, 25 and 35.
+        ("granite4-h-micro.db", ["hybrid block", "State Space (SSM)", "Self-Attention",
+                                 "Block 5", "Block 15", "Block 25", "Block 35"]),
     ]
     for filename, expected in real:
         db = models / filename

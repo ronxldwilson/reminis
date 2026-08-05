@@ -868,7 +868,8 @@ const BLOCK_ROLES = [
 // few kilobytes next to megabytes, and a box for them would read as a stage of
 // computation rather than the stabiliser it is.
 function isNormTensor(name) {{
-  return /norm|layernorm|ln_\d|ln_f/.test(name);
+  // Vision towers spell their norms `ln1`/`ln2`/`post_ln` rather than `*_norm`.
+  return /norm|layernorm|(^|[._])ln\d*([._]|$)/.test(name);
 }}
 
 function classifyBlockTensor(name) {{
@@ -1076,13 +1077,46 @@ function buildArchDiagram() {{
   if (numVision > 0) {{
     const visTensors = Object.values(visionLayers).flat();
     const visBytes = visTensors.reduce((a, t) => a + t.n_bytes, 0);
+
+    // The blocks are only part of the tower. A projector file's whole reason to
+    // exist is the projector, and the image has to be cut into patches before
+    // any block sees it — summarising the blocks alone leaves those out of a
+    // diagram that claims to show the file's components.
+    const patch = DATA.tensors.filter(t => /patch_emb/.test(t.name));
+    const posEmbed = DATA.tensors.filter(t => /position_emb/.test(t.name));
+    const projector = DATA.tensors.filter(t => /^mm\\.|multi_modal_projector|mm_projector/.test(t.name));
+    const bytesOf = ts => ts.reduce((a, t) => a + t.n_bytes, 0);
+
+    // Every block is the same shape, so one line describing a block says more
+    // than twelve identical boxes would.
+    const perBlock = BLOCK_ROLES
+      .map(role => ({{ role: role, bytes: bytesOf(visTensors.filter(t => classifyBlockTensor(t.name) === role.key)) }}))
+      .filter(g => g.bytes > 0)
+      .sort((a, b) => a.role.order - b.role.order)
+      .map(g => `<span style="color:rgb(${{g.role.rgb}});">${{g.role.label}}</span> ${{fmtBytes(g.bytes / numVision)}}`)
+      .join(" &middot; ");
+
+    const stage = (title, note, ts) => ts.length === 0 ? "" : `
+      <div style="display:flex;justify-content:space-between;align-items:baseline;gap:12px;padding:8px 0;border-top:1px solid var(--border);">
+        <span style="font-size:13px;">${{title}}<span style="color:var(--text2);"> &mdash; ${{note}}</span></span>
+        <span style="font-size:12px;color:var(--text2);font-family:var(--mono);white-space:nowrap;">${{fmtBytes(bytesOf(ts))}}</span>
+      </div>`;
+
     html += `<div style="border:1px solid var(--border);border-radius:8px;padding:16px;margin-bottom:20px;background:var(--bg2);">
-      <div style="display:flex;justify-content:space-between;align-items:center;">
+      <div style="display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap;margin-bottom:8px;">
         <span style="font-weight:600;">Vision encoder
-          <span class="info-btn" onclick="showInfo(this,'Vision Encoder','This model carries a <strong>vision tower</strong> (tensors named <code>v.blk.N.*</code>) that encodes images into the same representation space the language model uses. It is a separate stack: images go through it, text does not. A projector then maps its output into the text model dimension.')">i</span>
+          <span class="info-btn" onclick="showInfo(this,'Vision Encoder','This model carries a <strong>vision tower</strong> (tensors named <code>v.blk.N.*</code>) that encodes images into the same representation space the language model uses. It is a separate stack: images go through it, text does not. The image is first cut into fixed-size <strong>patches</strong>, each patch is embedded much like a token, and a <strong>position embedding</strong> records where in the picture it came from. The blocks then run over those patches exactly as a text transformer runs over tokens. A <strong>projector</strong> at the end maps the result into the language model&#39;s dimension, which is what lets the two stacks meet.')">i</span>
         </span>
         <span style="font-size:12px;color:var(--text2);font-family:var(--mono);">${{numVision}} blocks &middot; ${{visTensors.length}} tensors &middot; ${{fmtBytes(visBytes)}}</span>
       </div>
+      ${{stage("Patch embedding", "cuts the image into patches", patch)}}
+      ${{stage("Position embedding", "records where each patch came from", posEmbed)}}
+      <div style="display:flex;justify-content:space-between;align-items:baseline;gap:12px;padding:8px 0;border-top:1px solid var(--border);">
+        <span style="font-size:13px;">${{numVision}} vision blocks<span style="color:var(--text2);"> &mdash; each ${{perBlock}}</span></span>
+        <span style="font-size:12px;color:var(--text2);font-family:var(--mono);white-space:nowrap;">${{fmtBytes(visBytes)}}</span>
+      </div>
+      ${{stage("Output normalization", "stabilizes the tower's output before it is projected", DATA.tensors.filter(t => /^v\\..*(post_ln|post_layernorm)/.test(t.name)))}}
+      ${{stage("Projector", "maps the tower's output into the language model's dimension", projector)}}
     </div>`;
   }}
 
@@ -1107,22 +1141,53 @@ function buildArchDiagram() {{
   const showDetailed = numLayers <= 6;
   const layerKeys = Object.keys(layers).map(Number).sort((a,b) => a-b);
 
+  // What roles a block is made of. Two blocks with the same signature really
+  // are interchangeable in the diagram; two with different signatures are not.
+  const signature = idx => [...new Set(
+    layers[idx].map(t => classifyBlockTensor(t.name)).filter(k => k !== "norm" && k !== "other")
+  )].sort().join("+");
+
+  // Consecutive blocks that share a signature, as runs.
+  const runs = [];
+  layerKeys.forEach(idx => {{
+    const sig = signature(idx);
+    const last = runs[runs.length - 1];
+    if (last && last.sig === sig) last.keys.push(idx);
+    else runs.push({{ sig: sig, keys: [idx] }});
+  }});
+
+  const collapsed = (n, note) => `<div style="border:1px dashed var(--border);border-radius:8px;padding:16px;text-align:center;color:var(--text2);margin-bottom:2px;font-size:13px;">
+      &#8942; ${{n}} more ${{note}} &#8942;
+    </div><div style="text-align:center;color:var(--text2);font-size:18px;line-height:1;">&#8595;</div>`;
+
   if (showDetailed) {{
     layerKeys.forEach(idx => {{
       html += buildLayerBlock(idx, layers[idx], moe);
     }});
-  }} else {{
-    // Show first 2, collapsed middle, last 2
+  }} else if (runs.length === 1) {{
+    // Every block is the same: show the first two and the last two.
     layerKeys.slice(0, 2).forEach(idx => {{
       html += buildLayerBlock(idx, layers[idx], moe);
     }});
-    const middle = numLayers - 4;
-    html += `<div style="border:1px dashed var(--border);border-radius:8px;padding:16px;text-align:center;color:var(--text2);margin-bottom:2px;font-size:13px;">
-      &#8942; ${{middle}} more ${{blockNoun}}s (same structure) &#8942;
-    </div>`;
-    html += `<div style="text-align:center;color:var(--text2);font-size:18px;line-height:1;">&#8595;</div>`;
+    html += collapsed(numLayers - 4, `${{blockNoun}}s (same structure)`);
     layerKeys.slice(-2).forEach(idx => {{
       html += buildLayerBlock(idx, layers[idx], moe);
+    }});
+  }} else {{
+    // A hybrid stack. Collapsing the middle here would hide the blocks that
+    // differ -- in Granite 4.0-H the four attention blocks sit at 5, 15, 25
+    // and 35, entirely inside what a fixed first-two/last-two window drops,
+    // and the summary would have claimed "same structure" about them.
+    // Each run of identical blocks is collapsed on its own instead, so every
+    // structural change in the stack stays visible.
+    runs.forEach(run => {{
+      html += buildLayerBlock(run.keys[0], layers[run.keys[0]], moe);
+      if (run.keys.length === 2) {{
+        html += buildLayerBlock(run.keys[1], layers[run.keys[1]], moe);
+      }} else if (run.keys.length > 2) {{
+        const last = run.keys[run.keys.length - 1];
+        html += collapsed(run.keys.length - 1, `identical blocks, through block ${{last}}`);
+      }}
     }});
   }}
 

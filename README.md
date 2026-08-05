@@ -69,11 +69,12 @@ Every tensor is SHA256-hashed before and after the round-trip. These architectur
 | `clip` (vision) | SmolVLM-256M projector F16 | 198 | 181 MB | 1.0s | 0.1s | lossless |
 | `mamba` | Mamba-130M Q4_K_M | 242 | 86 MB | 1.7s | 0.04s | lossless |
 | `rwkv7` | RWKV7-G1h-1.5B Q2_K | 678 | 644 MB | 3.5s | 0.4s | lossless |
+| `granitehybrid` | Granite-4.0-H-Micro Q2_K | 506 | 1169 MB | 7.3s | 0.6s | lossless |
 | `llama` | SmolLM-135M, 9 quantizations | 272 | 84–258 MB | ~2s | ~0.1s | lossless |
 
 The MoE model is the interesting one: 72 of its tensors are **3-dimensional** expert stacks (e.g. `[512, 1024, 32]` in Q6_K), a shape the quantized export path had never seen. It generalizes correctly.
 
-Mamba and RWKV7 are there because they are not transformers at all — no attention, no feed-forward network — and the RWKV7 file mixes BF16 tensors into a GGUF alongside Q2_K and Q6_K. Both round-trip byte-for-byte.
+Mamba and RWKV7 are there because they are not transformers at all — no attention, no feed-forward network — and the RWKV7 file mixes BF16 tensors into a GGUF alongside Q2_K and Q6_K. Granite 4.0-H is a hybrid: 36 state-space blocks with attention at blocks 5, 15, 25 and 35. All round-trip byte-for-byte.
 
 Throughput is roughly linear with size — about 120 MB/s converting, over 1 GB/s exporting.
 
@@ -88,7 +89,10 @@ Throughput is roughly linear with size — about 120 MB/s converting, over 1 GB/
 | Mamba / state space | State Space (SSM) — no attention, because there is none |
 | RWKV | Time Mixing, then Channel Mixing |
 | Hybrid (attention in some blocks, a scan in others) | whichever of those that block holds |
+| Vision tower | patch embedding, position embedding, the blocks, and the projector |
 | Anything unrecognised | the block's tensors and their size, with no invented labels |
+
+Long stacks are collapsed, but by runs of identical blocks rather than a fixed first-two/last-two window. That distinction is load-bearing for a hybrid: Granite 4.0-H Micro puts its only four attention blocks at 5, 15, 25 and 35, all of which a fixed window drops — and the collapsed summary would then have claimed "same structure" about the blocks that were the exception.
 
 For a MoE model the diagram also answers the question the file size cannot. Granite-3.1-1B-A400M reads **428.7M of 1.33B parameters run for any one token (32%)** — the router picks 8 of 32 experts, so the remaining 906M sit idle on every forward pass. That 428.7M is a good check on the arithmetic: it is the "A400M" in the model's own name.
 
