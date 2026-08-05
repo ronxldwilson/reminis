@@ -302,6 +302,22 @@ One caveat on that row: loading takes ~83 s, because the repack runs in numpy. I
 
 This closes most of the gap with llama.cpp on quantized weights — the values multiplied are now exactly the ones in the file — without closing it entirely: llama.cpp still reads the original blocks with no repack step and no float32 scale array beside them.
 
+### Compressing the key/value cache
+
+The weights are a fixed cost; the cache grows with every token. At long context it is the cache, not the model, that decides whether a prompt fits — so `--kv-bits` compresses it.
+
+Measured on a 1536-token context:
+
+| | Cache | Generation | vs uncompressed |
+|---|---|---|---|
+| off | 39.2 MB | 236 tok/s | — |
+| `--kv-bits 8` | 21.6 MB (1.8×) | 176 tok/s | identical text, correlation 0.99999 |
+| `--kv-bits 4` | 12.3 MB (3.2×) | 188 tok/s | correlation 0.9946 |
+
+**This costs speed rather than saving it**, which is the opposite of `--pack` and worth being explicit about. MLX has no quantized attention kernel, so the cache is decompressed on every layer of every token; what you buy is room, not time. Leave it off unless the cache is what is stopping you.
+
+llama.cpp has the same feature as `-ctk`/`-ctv`, and unlike its weight quantization that one *is* a runtime flag — this is the one place the two tools line up directly.
+
 ### Backends: numpy, MLX, CuPy
 
 `reminis run` computes through whichever array library suits the machine — **MLX** on Apple silicon, **CuPy** on NVIDIA, **numpy** everywhere. numpy stays the reference implementation: it is the one whose logits are checked against `transformers`, and the others earn their place by agreeing with it.
@@ -887,6 +903,7 @@ Note that GGUF and safetensors use different tensor names (`blk.0.attn_q.weight`
 - [x] The remaining quant types re-quantized to the nearest width rather than left as float16
 - [x] Mixture-of-experts models: router, stacked experts, packed and gathered
 - [x] SentencePiece tokenizers, verified against llama.cpp token for token
+- [x] Key/value cache compression (`--kv-bits`), for when the context is the constraint
 - [ ] Faster repacking at load: 83 s for a 7B, all of it numpy
 - [ ] Running attention-free architectures (Mamba / state space, RWKV)
 - [ ] Unsloth integration

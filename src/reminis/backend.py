@@ -156,6 +156,13 @@ class Backend:
         """x @ w.T, whether w is a plain matrix or a packed one."""
         return x @ w.T
 
+    def quantize_kv(self, x, bits, group_size):
+        """Compress cached keys or values. None when unsupported."""
+        return None
+
+    def dequantize_kv(self, packed):
+        raise NotImplementedError
+
     def take_rows(self, w, indices):
         """Rows of a weight matrix, unpacking only the ones asked for.
 
@@ -488,6 +495,16 @@ class MLXBackend(Backend):
 
     def to_compute32(self, x):
         return x.astype(self.mx.float32)
+
+    def quantize_kv(self, x, bits, group_size):
+        mx = self.mx
+        q, scales, biases = mx.quantize(x, group_size=group_size, bits=bits)
+        return q, scales.astype(mx.float16), biases.astype(mx.float16)
+
+    def dequantize_kv(self, packed):
+        q, scales, biases, bits, group_size = packed
+        return self.mx.dequantize(q, scales, biases, group_size=group_size,
+                                  bits=bits).astype(self.compute_dtype)
 
     def take_rows(self, w, indices):
         if not isinstance(w, QuantizedWeight):

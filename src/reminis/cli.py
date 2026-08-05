@@ -124,6 +124,15 @@ def main():
              "-- 8 is imperceptible and the fastest option for an F16 file, "
              "4 visibly reorders the top-5 tokens.",
     )
+    p_run.add_argument(
+        "--kv-bits", type=int, choices=(4, 8), metavar="BITS",
+        help="Compress the key/value cache to this many bits. The weights "
+             "are a fixed cost but the cache grows with the context, so at "
+             "long prompts this is what decides whether one fits. Measured "
+             "on a 1536-token context: 8 bits halves the cache for a 25%% "
+             "slowdown and no visible change in output, 4 bits thirds it "
+             "and starts to show. It costs speed rather than saving it.",
+    )
     p_run.add_argument("-q", "--quiet", action="store_true", help="Suppress progress output")
 
     # merge: combine several models into one

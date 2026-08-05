@@ -584,6 +584,82 @@ def test_mixture_of_experts():
               f"got {result['completion']!r}")
 
 
+def test_kv_cache_quantization():
+    """A compressed cache must hold the same conversation, more cheaply.
+
+    The cache is what grows with the context, so compressing it is what
+    decides whether a long prompt fits. It costs speed rather than saving
+    it -- there is no quantized attention kernel, so the cache is
+    decompressed to attend -- which makes "does it change the output" the
+    question worth asking.
+    """
+    print("\nKV cache compression")
+    if not SMOL.exists():
+        print("  skip  SmolLM-135M.f16.db not present")
+        return
+    backend = select_backend("inference")
+    if backend.quantize_kv(backend.from_numpy(np.zeros((1, 1, 2, 64),
+                                                       dtype=np.float32)),
+                           8, 64) is None:
+        print(f"  skip  the {backend.name} backend cannot compress a cache")
+        return
+
+    model = Model(str(SMOL))
+    try:
+        ids = model.tokenizer.encode(
+            "The capital of France is Paris, and the capital of Germany is",
+            add_special=False,
+        )
+        reference, ref_logits, sizes = None, None, {}
+        for bits in (None, 8, 4):
+            cache = KVCache(model.cfg.n_layers, capacity=128,
+                            backend=model.backend, quantize_bits=bits)
+            first = model.forward(ids, cache, 0)
+            logits, generated = first, []
+            for _ in range(8):
+                token = int(np.argmax(logits))
+                generated.append(token)
+                logits = model.forward([token], cache, cache.length)
+            text = model.tokenizer.decode(generated)
+            sizes[bits] = _cache_bytes(cache)
+
+            if reference is None:
+                reference, ref_logits = text, first
+                continue
+            # Against the uncompressed run's logits, not against its own --
+            # a self-comparison would pass however wrong the cache was.
+            corr = float(np.corrcoef(first, ref_logits)[0, 1])
+            check(f"{bits}-bit cache tracks the uncompressed one",
+                  corr > 0.99, f"correlation {corr:.6f}")
+            print(f"        ({bits}-bit correlation {corr:.6f})")
+            if bits == 8:
+                check("8-bit cache produces the same text as none",
+                      text == reference, f"got {text!r}")
+
+        check("8 bits roughly halves the cache",
+              1.5 < sizes[None] / sizes[8] < 2.5,
+              f"{sizes[None]} -> {sizes[8]} bytes")
+        check("4 bits shrinks it further",
+              sizes[4] < sizes[8], f"{sizes[8]} -> {sizes[4]} bytes")
+        print(f"        (cache bytes: none {sizes[None]:,}, "
+              f"8-bit {sizes[8]:,}, 4-bit {sizes[4]:,})")
+    finally:
+        model.close()
+
+
+def _cache_bytes(cache) -> int:
+    """How much the cache is actually holding, compressed or not."""
+    total = 0
+    for buffers in (cache.k, cache.v, cache._packed_k, cache._packed_v):
+        for entry in buffers:
+            if entry is None:
+                continue
+            parts = entry if isinstance(entry, tuple) else (entry,)
+            for part in parts:
+                total += part.size * part.dtype.size
+    return total
+
+
 def test_merged_model_runs():
     """The payoff: a model that was assembled by SQL still speaks."""
     print("\nA merged model")
@@ -629,6 +705,7 @@ def main():
     test_packed_weights()
     test_sentencepiece_tokenizer()
     test_mixture_of_experts()
+    test_kv_cache_quantization()
     test_merged_model_runs()
 
     print("\n" + "=" * 70)
