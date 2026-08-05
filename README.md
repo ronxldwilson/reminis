@@ -480,6 +480,33 @@ Three ideas that seemed obvious and lost, all measured:
 
 The remaining ceiling is DRAM bandwidth on F32 weights, and numpy has no way to read fewer bytes. One database-shaped answer is left on the table: the F16→F32 conversion costs 213 ms of a 274 ms load, so storing the F32 form alongside the F16 — a materialized view of the weights — cuts load time and makes `--stream` about 1.7× faster, for double the disk. That is on the roadmap rather than in the code.
 
+### Writing quantized models
+
+reminis could unpack every GGML quantization and never produce one, so a float model stayed a float model. `reminis quantize` writes the two simplest GGML formats:
+
+```bash
+reminis quantize models/SmolLM-135M.f16.db -o small.db --bits 4
+```
+
+```
+Quantized to Q4_0: 211 tensors, 61 copied through unchanged
+  269.1 MB -> 75.8 MB (28.2% of the original)
+  0.4s
+```
+
+| `--bits` | Format | Size | top-1 agreement with float16 |
+|---|---|---|---|
+| 8 | Q8_0 | 53.1% | 90.5% |
+| 4 | Q4_0 | 28.2% | 60.3% |
+
+Q8_0 and Q4_0 were chosen because they are exactly specified, cheap to compute, and real GGUF types — the result is an ordinary model that `run`, `info` and `export` all handle. Norms, biases and anything 1-D are copied through untouched, which is what GGUF does too: they are a rounding error of the file and the first thing to damage a model.
+
+Both are round-to-nearest against a per-block scale taken from the block's largest magnitude, which is what llama.cpp's own quantizer does. Neither uses an importance matrix, so this is not competing with `llama-quantize` on quality — it is the fast obvious thing that works. For a 6-bit option or a k-quant, quantize with llama.cpp and convert the result in.
+
+The block layouts are verified against the `gguf` package's own dequantizer rather than against reminis's, since agreeing with yourself proves nothing. Q8_0 lands inside half a step of its grid; Q4_0 inside a whole step, because its codes span −8..+7 and a weight opposite in sign to its block's extreme clips at 7/8 — that asymmetry is the format, not the quantizer.
+
+Note that `reminis export` currently drops array-valued metadata, so an exported GGUF loses its tokenizer and llama.cpp will not load it ([#12](https://github.com/ronxldwilson/reminis/issues/12)). That affects every export, not only quantized ones.
+
 ### Quantization coverage
 
 SHA256-verified lossless round-trip across 9 SmolLM-135M variants covering 13 quantization types:
@@ -1003,7 +1030,7 @@ Note that GGUF and safetensors use different tensor names (`blk.0.attn_q.weight`
 
 ## Tests
 
-Fifteen suites, 363 explicit checks, run with `uv run python tests/<name>.py`. They need no framework and skip rather than fail when a model or an optional dependency is absent.
+Sixteen suites, 415 explicit checks, run with `uv run python tests/<name>.py`. They need no framework and skip rather than fail when a model or an optional dependency is absent.
 
 The references they check against — transformers for logits, peft for LoRA adapters, torch, and MLX on Apple silicon — are declared as a dev dependency group, so `uv sync` installs them and does not remove them. That is worth stating because getting it wrong is quiet: when those packages went missing, the three suites that compare reminis against a reference implementation degraded to skips and went on reporting PASS.
 
@@ -1013,6 +1040,7 @@ The references they check against — transformers for logits, peft for LoRA ada
 | `test_diff`, `test_lowrank` | Delta packs, hash-verified apply, low-rank encoding |
 | `test_bitplane` | Bit-plane delta encoding: reversibility, refusals, older packs still read |
 | `test_sweep` | Precision sweeps: agreement maths, resident-size prediction, reference choice |
+| `test_quantize` | Q8_0 and Q4_0 block layouts, checked against the gguf package's dequantizer |
 | `test_safetensors`, `test_lora_adapter` | Safetensors both directions, peft agreement |
 | `test_track`, `test_registry` | Training logs, rollback, many models in one file |
 | `test_viewer` | The architecture diagram, by running the page's own JS under node |
@@ -1035,6 +1063,7 @@ The checks are written to fail for the right reason. Where a property could pass
 - [x] Delta packs with verified apply (`reminis apply`)
 - [x] Validated to 7B across llama / qwen2 / granitemoe / clip / mamba / rwkv7
 - [x] Low-rank delta encoding for LoRA fine-tunes (`--lossy`)
+- [x] Write quantized models, not only read them (`reminis quantize`, Q8_0 and Q4_0)
 - [x] Safetensors input and output, sharded and BF16 (`reminis convert ./model/`)
 - [x] peft LoRA adapters as exact delta packs (`reminis lora`)
 - [x] Fine-tune tracking with edit logs (`reminis log`)

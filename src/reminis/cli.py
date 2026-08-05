@@ -274,6 +274,20 @@ def main():
     p_prepare.add_argument("--drop", action="store_true",
                            help="Delete the index and reclaim its space")
 
+    # quantize: write a quantized copy of a model
+    p_quant = sub.add_parser(
+        "quantize",
+        help="Write a quantized copy of a model database (Q8_0 or Q4_0)",
+    )
+    p_quant.add_argument("database", help="Path to the model database")
+    p_quant.add_argument("-o", "--output", required=True, help="Output database path")
+    p_quant.add_argument(
+        "--bits", type=int, default=4, choices=(4, 8),
+        help="4 writes Q4_0 (about 28%% of float16), 8 writes Q8_0 (about "
+             "53%%). Default 4. Both are real GGUF types, so the result "
+             "exports back to GGUF and llama.cpp reads it.",
+    )
+
     # sweep: run one model at several precisions and compare
     p_sweep = sub.add_parser(
         "sweep",
@@ -412,6 +426,10 @@ def main():
 
     elif args.command == "prepare":
         _prepare(args, parser)
+
+    elif args.command == "quantize":
+        from reminis.quantize import quantize_model
+        quantize_model(args.database, args.output, bits=args.bits)
 
     elif args.command == "sweep":
         from reminis.sweep import sweep
