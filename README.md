@@ -873,6 +873,25 @@ Note that GGUF and safetensors use different tensor names (`blk.0.attn_q.weight`
 - Exporting a GGUF-sourced database as safetensors works when every dtype has an equivalent (F32/F16/BF16 and the integer types). Quantized GGML types have none, and are refused.
 - Diffing a GGUF base against a safetensors fine-tune is not supported; the fingerprint check catches it and fails clearly.
 
+## Tests
+
+Twelve suites, 221 explicit checks, run with `python tests/<name>.py`. They need no framework and skip rather than fail when a model or an optional dependency is absent.
+
+| Suite | Covers |
+|---|---|
+| `test_roundtrip` | SHA256-verified GGUF round-trip across 20 models and 13 quantization types |
+| `test_diff`, `test_lowrank` | Delta packs, hash-verified apply, low-rank encoding |
+| `test_safetensors`, `test_lora_adapter` | Safetensors both directions, peft agreement |
+| `test_track`, `test_registry` | Training logs, rollback, many models in one file |
+| `test_viewer` | The architecture diagram, by running the page's own JS under node |
+| `test_merge` | Four merge methods, chunking against whole-tensor results, refusals |
+| `test_infer` | Tokenizers against `transformers` and llama.cpp, logits against torch, KV cache, MoE, quantization |
+| `test_backend` | numpy/MLX/CuPy agreement on primitives, attention, sinks, windows |
+| `test_ggml_affine` | Bit-exactness of every repackable quantization |
+| `test_features` | Feature combinations and the command line |
+
+The checks are written to fail for the right reason. Where a property could pass vacuously — two backends agreeing because both ignore a feature, a cache "matching" itself — the test compares against an independent reference instead: `transformers` for logits, `llama-tokenize` for token ids, `gguf` for dequantization, `peft` for LoRA merges. Several were verified by deliberately breaking the code and confirming they caught it.
+
 ## Roadmap
 
 - [x] Publish to PyPI
