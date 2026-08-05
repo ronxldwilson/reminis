@@ -13,6 +13,7 @@ sentences" proves nothing. These checks are chosen to fail loudly instead:
   * architectures that are not implemented must raise, not improvise
 """
 
+import sqlite3
 import sys
 from pathlib import Path
 
@@ -295,10 +296,9 @@ def test_refusals():
                      lambda: generate(str(QUANTIZED), "hello", max_tokens=1,
                                       verbose=False, on_token=lambda _: None))
 
-    # A quantized *llama* is the case that matters, since it gets past the
-    # architecture check and would otherwise be decoded as though its Q4_K
-    # blocks were floats. Rather than keep a second quantized model around,
-    # one tensor of a working model is relabelled.
+    # Quantized tensors are now unpacked rather than refused, so the thing
+    # that must still fail loudly is a dtype reminis cannot decode at all.
+    # One tensor of a working model is relabelled to produce that.
     import shutil
     tmp = Path(__file__).parent / "tmp_infer_quant"
     tmp.mkdir(exist_ok=True)
@@ -307,11 +307,11 @@ def test_refusals():
         shutil.copyfile(SMOL, fake)
         import sqlite3
         conn = sqlite3.connect(str(fake))
-        conn.execute("UPDATE tensors SET dtype = 'Q4_K' WHERE name = 'blk.0.attn_q.weight'")
+        conn.execute("UPDATE tensors SET dtype = 'NOT_A_DTYPE' WHERE name = 'blk.0.attn_q.weight'")
         conn.commit()
         conn.close()
-        expect_error("a quantized tensor is refused before it produces noise",
-                     "quantized",
+        expect_error("an unrecognised dtype is refused rather than guessed at",
+                     "neither a float type",
                      lambda: generate(str(fake), "hello", max_tokens=1,
                                       verbose=False, on_token=lambda _: None))
     finally:
@@ -323,6 +323,61 @@ def test_refusals():
     if SMOL.exists():
         expect_error("an empty prompt is refused", "zero tokens",
                      lambda: generate(str(SMOL), "", max_tokens=1, verbose=False))
+
+
+def test_quantized_models():
+    """Quantized weights must unpack to something close to the original.
+
+    Dequantizing is the one place a silent error would be invisible: wrong
+    block arithmetic still produces numbers, and a model built from them
+    still emits fluent text. So the check is not "does it generate" but
+    "does it match the float weights it was quantized from" -- the same
+    model exists here in F16, which makes that a direct comparison.
+    """
+    print("\nQuantized models")
+    quant_db = MODELS_DIR / "smollm-q4km.db"
+    if not (quant_db.exists() and SMOL.exists()):
+        print("  skip  needs SmolLM-135M in both Q4_K_M and F16")
+        return
+
+    from reminis.dtypes import to_float32_any
+
+    conn_q = sqlite3.connect(str(quant_db))
+    conn_f = sqlite3.connect(str(SMOL))
+    worst_corr, compared, kinds = 1.0, 0, set()
+    for name, dtype, blob in conn_q.execute("SELECT name, dtype, data FROM tensors"):
+        row = conn_f.execute(
+            "SELECT dtype, data FROM tensors WHERE name = ?", (name,)
+        ).fetchone()
+        if row is None:
+            continue
+        got = to_float32_any(blob, dtype)
+        want = to_float32_any(row[1], row[0])
+        if got.shape != want.shape:
+            continue
+        kinds.add(dtype)
+        worst_corr = min(worst_corr, float(np.corrcoef(got, want)[0, 1]))
+        compared += 1
+    conn_q.close()
+    conn_f.close()
+
+    check(f"all {compared} quantized tensors track their F16 originals",
+          worst_corr > 0.99, f"lowest correlation {worst_corr:.6f}")
+    print(f"        (lowest correlation {worst_corr:.6f}, "
+          f"types present: {', '.join(sorted(kinds))})")
+
+    result = generate(str(quant_db), "The capital of France is", max_tokens=10,
+                      temperature=0.0, verbose=False, on_token=lambda _: None)
+    check("a quantized model generates coherent text",
+          "paris" in result["completion"].lower(), f"got {result['completion']!r}")
+
+    conn = sqlite3.connect(str(quant_db))
+    n_quant = conn.execute(
+        "SELECT COUNT(*) FROM tensors WHERE dtype NOT IN ('F32','F16','BF16')"
+    ).fetchone()[0]
+    conn.close()
+    check("the quantized tensors were actually unpacked, not skipped",
+          n_quant > 0, f"{n_quant} quantized tensors in the file")
 
 
 def test_merged_model_runs():
@@ -366,6 +421,7 @@ def main():
     test_sampling()
     test_architectures()
     test_refusals()
+    test_quantized_models()
     test_merged_model_runs()
 
     print("\n" + "=" * 70)

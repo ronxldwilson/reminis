@@ -16,8 +16,7 @@ Speed, measured rather than assumed, turns out to be less embarrassing than
 expected -- 0.86-0.89x llama.cpp's CPU token generation across three model
 sizes, and faster than it at prompt processing, since both end up in the
 platform BLAS for the large matrix multiplies. Against llama.cpp on the GPU
-it is 2.6-2.8x slower, and against a quantized model it does not compete at
-all, because it cannot run one.
+it is 2.6-2.8x slower.
 
 ``--stream`` takes that further. In streaming mode no weight is ever cached:
 every matrix multiplication in every layer re-reads its operand from SQLite
@@ -30,7 +29,11 @@ Scope, deliberately narrow and loudly enforced:
 
   * llama-family and qwen2 architectures from GGUF (rotary, RMSNorm, SwiGLU,
     grouped-query attention), which covers llama, qwen2, smollm, mistral
-  * float weights -- F32, F16, BF16. Quantized blocks are not decoded here
+  * float weights -- F32, F16, BF16
+  * quantized weights, unpacked at load through the ``gguf`` package: every
+    K-quant and i-quant llama.cpp writes. Note what this is not -- the blocks
+    become float16 in memory, so a quantized model becomes *runnable*, not
+    *small*. Quantization saves the file and the download here, not the RAM.
   * a byte-level BPE tokenizer stored in the database
 
 Anything else raises rather than approximates, because a forward pass that
@@ -48,7 +51,11 @@ from pathlib import Path
 import numpy as np
 
 from reminis.backend import select as select_backend
-from reminis.dtypes import is_float_dtype
+from reminis.dtypes import (
+    dequantize_to_float32,
+    is_float_dtype,
+    is_quantized_dtype,
+)
 
 # Architectures whose block structure this file actually implements. The
 # value is the rotary layout llama.cpp uses for that architecture, and it is
@@ -94,6 +101,7 @@ class WeightStore:
         self._cache: dict[str, np.ndarray] = {}
         self.bytes_read = 0
         self.reads = 0
+        self.dequantized = 0
         self._shapes = {
             name: (shape, dtype)
             for name, shape, dtype in self.conn.execute(
@@ -122,16 +130,30 @@ class WeightStore:
         if row is None:
             raise UnsupportedModel(f"This model has no tensor named '{name}'")
         shape, dtype, blob = row
-        if not is_float_dtype(dtype):
-            raise UnsupportedModel(
-                f"'{name}' is stored as {dtype}, a quantized type. Running a "
-                f"model needs float weights -- convert an F16/F32 GGUF or a "
-                f"safetensors checkpoint instead."
-            )
+        dims = tuple(ast.literal_eval(shape))[::-1]
 
-        arr = self.backend.from_bytes(
-            blob, dtype, tuple(ast.literal_eval(shape))[::-1]
-        )
+        if is_float_dtype(dtype):
+            arr = self.backend.from_bytes(blob, dtype, dims)
+        elif is_quantized_dtype(dtype):
+            # Quantized blocks are unpacked to float32 and then handed to the
+            # backend, which narrows them to its compute dtype. This costs
+            # more memory than the file did -- the whole point of quantizing
+            # is undone -- and it is what makes a quantized model runnable at
+            # all rather than a hard refusal.
+            self.dequantized += 1
+            arr = self.backend.from_numpy(
+                dequantize_to_float32(blob, dtype).reshape(dims)
+            )
+            # Unpacking produces float32, and the backend narrows it to its
+            # own compute dtype. On a lazy backend both would stay alive
+            # until something forced the issue, so the float32 copy of every
+            # weight in the model would accumulate. Force it here.
+            self.backend.eval(arr)
+        else:
+            raise UnsupportedModel(
+                f"'{name}' is stored as {dtype}, which is neither a float type "
+                f"nor a quantization reminis can unpack."
+            )
         self.bytes_read += len(blob)
         self.reads += 1
         if not self.stream:
@@ -145,14 +167,14 @@ class WeightStore:
         hot path -- rotary scaling factors, say -- and are used to build
         tables in full precision.
         """
-        from reminis.dtypes import to_float32
-
         row = self.conn.execute(
             "SELECT dtype, data FROM tensors WHERE name = ?", (name,)
         ).fetchone()
         if row is None:
             raise UnsupportedModel(f"This model has no tensor named '{name}'")
-        return to_float32(row[1], row[0])
+        from reminis.dtypes import to_float32_any
+
+        return to_float32_any(row[1], row[0])
 
     def drop(self, name: str):
         """Forget a cached tensor, once something else stands in for it."""

@@ -64,6 +64,55 @@ def is_float_dtype(dtype: str) -> bool:
     return dtype in _DIRECT_FLOATS or dtype == "BF16"
 
 
+def is_quantized_dtype(dtype: str) -> bool:
+    """True for a GGML quantization type -- Q4_K, Q6_K, IQ3_M and the rest.
+
+    These are block formats: a group of weights shares a scale (and often a
+    minimum), and the individual values are a few bits each. Their bytes mean
+    nothing until the block structure is undone, which is why every numeric
+    path has to ask this before touching them.
+    """
+    from gguf.constants import GGMLQuantizationType
+
+    return (
+        not is_float_dtype(dtype)
+        and hasattr(GGMLQuantizationType, dtype)
+        and dtype not in ("I8", "I16", "I32", "I64")
+    )
+
+
+def dequantize_to_float32(blob: bytes, dtype: str) -> np.ndarray:
+    """Unpack a quantized tensor's blocks into a flat float32 array.
+
+    The unpacking itself belongs to the ``gguf`` package, which reminis
+    already depends on for reading the format, and which implements every
+    quantization type llama.cpp writes. Doing it here by hand would mean
+    re-deriving a dozen block layouts and getting one of them subtly wrong.
+
+    This is dequantization, not quantized arithmetic: the result is full
+    float32, so it takes far more memory than the file did. What it buys is
+    that a quantized model can be run at all.
+    """
+    from gguf.constants import GGMLQuantizationType
+    from gguf.quants import dequantize
+
+    qtype = getattr(GGMLQuantizationType, dtype, None)
+    if qtype is None:
+        raise ValueError(f"Unknown quantization type '{dtype}'")
+    return dequantize(np.frombuffer(blob, dtype=np.uint8), qtype).astype(
+        np.float32, copy=False
+    )
+
+
+def to_float32_any(blob: bytes, dtype: str) -> np.ndarray:
+    """Decode any tensor reminis can read -- float or quantized -- to float32."""
+    if is_float_dtype(dtype):
+        return to_float32(blob, dtype)
+    if is_quantized_dtype(dtype):
+        return dequantize_to_float32(blob, dtype)
+    raise ValueError(f"Cannot decode dtype '{dtype}' to floats")
+
+
 def to_float32(blob: bytes, dtype: str) -> np.ndarray:
     """Decode raw tensor bytes to a float32 array.
 
