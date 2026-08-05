@@ -18,6 +18,50 @@ Not all of it, and reminis tries to be specific about which. Rollback, in partic
 
 The database is also still a *model*, not an archive of one: `reminis run` generates text straight from the rows, and its logits match `transformers` to 4e-05.
 
+## What this is, and what it is not
+
+**reminis is a storage and version-control layer for model weights.** It is where models live between training runs: queried, diffed, merged, versioned, packaged as deltas, and exported when you need to actually use one.
+
+**It is not a runtime, and `reminis run` is not a way to serve a model.** It exists so a database can be checked by asking it to speak — after a merge, a rollback, or a delta apply, a hash tells you the bytes changed but cannot tell you the result is still a working model. That is a testing tool, and a genuinely useful one. It is not an inference engine, and three things stop it from becoming one:
+
+- It cannot run quantized weights at all, and quantization is the answer to running large models on small machines.
+- It decodes weights to F32, so it needs **twice** the memory of the F16 file, where llama.cpp memory-maps the file as-is.
+- `--stream` costs about 1.2 seconds per gigabyte of model, per token, because every token re-reads and re-converts everything. Measured: 0.26 s/token for a 0.25 GB model, 2.74 s/token for a 2.31 GB one. A 70B would be around three minutes per token.
+
+So `--stream` is a demonstration that the weights really are data paged in on demand — not a way to run a model you could not otherwise run. **It will not make a large model fit on a small device.** llama.cpp already memory-maps its files, so it runs models larger than RAM today, and the OS page cache does that better than anything here.
+
+Where the small-machine story is real is *upstream* of inference: a 70B model can be merged, diffed, and packaged on a laptop that could never run it — then exported to GGUF and served by llama.cpp.
+
+## What you can use it for
+
+| You want to | Command | What you get |
+|---|---|---|
+| Ship a fine-tune without shipping a model | `reminis diff` → `reminis apply` | A delta pack that rebuilds the fine-tune from the base, hash-verified. Often 0.4–12% of the model. |
+| Distribute a LoRA to people who don't use peft | `reminis lora` | The adapter as an exact delta pack, byte-identical to peft's own merge. |
+| Keep a base and everything derived from it | `reminis registry` | One file. Bases stored outright, derived models as deltas. |
+| Know what a fine-tune actually changed | `reminis diff` | Per-tensor change counts, L2 norms, max deltas — a report, not a hash mismatch. |
+| Find the step where training went wrong | `reminis log`, `reminis rollback` | Loss spikes and per-parameter gradient norms as SQL, then a hash-verified rewind to a snapshot. |
+| Combine two fine-tunes | `reminis merge` | Linear, slerp, task arithmetic, or TIES, with provenance recorded in the result. |
+| Subtract a capability | `reminis merge --scale -1` | The base with a fine-tune's task vector removed. |
+| Understand a model you were handed | `reminis view`, `reminis info` | Architecture diagram, MoE routing, per-tensor statistics, in a browser. |
+| Ask questions about weights | any SQL client | The tensors are rows. Sort by magnitude, group by layer, join across models. |
+| Check a model still works after surgery | `reminis run` | It generates text, or it does not. |
+| Move between GGUF and safetensors | `reminis convert`, `reminis export` | Lossless in both directions, verified by SHA256. |
+
+## How it compares
+
+reminis overlaps with several tools and replaces none of them. Being specific about that is more useful than a feature table.
+
+**llama.cpp / GGUF** — a runtime, and the one you should serve with. There is no competition here: reminis reads GGUF, gives you things to do with it, and writes it back out. `reminis run` exists to verify a database, not to replace a runtime, and loses badly to llama.cpp on the GPU and on anything quantized.
+
+**safetensors** — a storage format, and a good one: memory-mapped, safe to load, fast. It stores *a* model. reminis stores models *and their relationships* — which one came from which, what changed, what it costs to store the difference. reminis reads and writes safetensors, including BF16 and sharded checkpoints.
+
+**Hugging Face Hub and git-lfs** — how models are versioned today, and where reminis has its clearest advantage. git-lfs stores each version as a whole blob, so a base plus twenty fine-tunes is twenty-one full copies. reminis stores derived models as verified deltas, and a fine-tune's delta is typically a small fraction of the model. This is the "40 years of database engineering" claim actually cashing out: the file format understands that two models are related.
+
+**mergekit** — the mature model-merging tool, with far more methods than the four here, and it already does out-of-core merging with lazy tensor loading, so reminis holds no memory advantage over it. Merge in reminis is not a better merger; it is merging that falls out of the storage model, aligned by a SQL join, with provenance written into the result and GGUF as a first-class input.
+
+**What is genuinely unlike the alternatives:** weights as queryable rows; diffs and delta packs with hash-verified apply; many related models in one file stored as deltas; training runs recorded as an edit log you can query; and being able to ask a stored model to generate text as a correctness check. The last one is a small feature that makes the rest trustworthy.
+
 ## Quick Start
 
 ```bash
@@ -180,13 +224,14 @@ Two caveats point the other way, and neither is fixable by tuning:
 - reminis decodes every weight to F32 and keeps it there, so it holds **twice the F16 file** in memory where llama.cpp memory-maps the file as-is. Token generation is bandwidth-bound, so that accounts for much of the remaining gap by itself.
 - The comparison is confined to F16 because reminis cannot run quantized weights at all. The same SmolLM at Q4_K_M does 178 tg on Metal out of a 99 MB file — a model reminis can store, diff, merge and export losslessly, but not yet run.
 
-Then there is the mode nothing else has:
+Then there is `--stream`, which is a demonstration rather than a capability:
 
-| | Database | Generation |
+| Model | Database | `--stream` |
 |---|---|---|
-| SmolLM-135M f16, `--stream` | 258 MB | 2.8 tok/s |
+| SmolLM-135M f16 | 0.25 GB | 0.26 s/token |
+| Llama-3.2-1B f16 | 2.31 GB | 2.74 s/token |
 
-With `--stream` nothing is cached, so eight tokens re-read **2,796 MB across 2,457 queries** out of a 258 MB file. Peak memory is one layer instead of one model, and ~30× slower is what that costs.
+Nothing is cached, so every token re-reads and re-converts the entire model — eight tokens of SmolLM read **2,796 MB across 2,457 queries** out of a 258 MB file. Peak memory is one layer instead of one model, which sounds like it should let a large model run on a small machine. It does not. The cost is flatly linear in model size, about 1.2 seconds per gigabyte per token, so a 7B lands near 17 s/token and a 70B near three minutes. `--stream` shows that the weights are genuinely data paged in on demand; it is not a way to run a model that would not otherwise fit, and llama.cpp already memory-maps its files for exactly that case.
 
 ### What made it faster, and what didn't
 
@@ -485,6 +530,8 @@ Merging a 2.31 GB Llama-3.2-1B, whose embedding matrix alone is 501 MB:
 
 Python 3.11 added incremental blob I/O, which reads a byte range out of a BLOB without materialising the rest, and writes one back the same way. On 3.11+ nothing model-sized is ever resident, so the peak is flat in model size: merging a 70B checkpoint costs the same 185 MB as merging this 1B one. On 3.10 the blob is fetched whole and sliced, which still avoids decoding it to float32 but keeps the stored bytes around.
 
+To be clear about what this is and is not worth: [mergekit](https://github.com/arcee-ai/mergekit) already merges out-of-core with lazy tensor loading and runs on a laptop too, so this is not an advantage over it. What it does mean is that merging in reminis costs no more memory than the storage layer already did, and that a model far too large to run can still be merged, diffed and packaged on the machine in front of you.
+
 (SQLite's own `substr` looks like a third option and is not: it materialises the entire blob to answer each call, so reading a 501 MB tensor in blocks would read it once per block.)
 
 Two of the four methods need a quantity measured over the whole tensor before any block can be combined, and both get their own pass:
@@ -511,9 +558,9 @@ reminis run model.db "Name three colours." --chat
 reminis run model.db "The capital of France is" --stream
 ```
 
-`--stream` is the mode that makes the claim literal. Nothing is held in memory between uses, so peak memory is one layer rather than one model, and a 258 MB database serves 2,796 MB of reads across 2,457 queries to generate eight tokens. It is ~30× slower, and it is the whole thesis in one flag: the model is data, paged in on demand.
+`--stream` holds nothing in memory between uses, so peak memory is one layer rather than one model, and a 258 MB database serves 2,796 MB of reads across 2,457 queries to generate eight tokens. It is the thesis in one flag — the model is data, paged in on demand — and it is a demonstration, not a deployment mode. It costs about 1.2 seconds per gigabyte of model per token, so it does not let a large model run on a small machine, and [it is not trying to](#what-this-is-and-what-it-is-not).
 
-This also closes the loop on everything else here. A merged, rolled-back, or delta-applied database can be checked by asking it to speak:
+**What `reminis run` is for** is the loop it closes. A merged, rolled-back, or delta-applied database can be checked by asking it to speak, which no hash can do for you:
 
 ```bash
 reminis merge base.db instruct.db -o soup.db
