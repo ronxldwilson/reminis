@@ -1,6 +1,6 @@
 """reminis - Your model's weights are just data. Store them in a database."""
 
-__version__ = "0.18.0"
+__version__ = "0.18.1"
 
 from reminis.converter import gguf_to_sqlite, sqlite_to_gguf
 from reminis.diff import apply_delta, diff_models

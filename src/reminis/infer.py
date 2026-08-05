@@ -1290,12 +1290,28 @@ def generate(
             print(f"{len(tokens)} prompt tokens\n")
             print(text, end="", flush=True)
 
+        if pack_bits is not None and not chosen.can_pack():
+            print(f"Note: the {chosen.name} backend cannot multiply packed "
+                  f"weights, so --pack was ignored.")
+
         cache = KVCache(model.cfg.n_layers, capacity=len(tokens) + max_tokens,
                         backend=chosen)
 
         t0 = time.time()
         logits = model.forward(tokens, cache, offset=0)
         prefill_seconds = time.time() - t0
+
+        if (pack_bits is not None and chosen.can_pack()
+                and model.store.packed == 0):
+            # Bit-exact packing rearranges quantization blocks, and a float
+            # model has none to rearrange. Saying so beats leaving someone to
+            # wonder why a flag they passed changed nothing.
+            print(
+                f"Note: --pack {pack_bits} had nothing to pack. This model's "
+                f"weights are stored as floats, and bit-exact packing only "
+                f"rearranges existing quantization blocks.\n"
+                f"      Use --pack 8 to quantize them instead."
+            )
 
         produced = []
         t1 = time.time()

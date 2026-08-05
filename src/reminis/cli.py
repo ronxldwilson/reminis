@@ -111,14 +111,18 @@ def main():
     )
     p_run.add_argument(
         "--pack", nargs="?", const="native", metavar="BITS",
-        help="Keep the per-layer matrices packed rather than unpacking them "
-             "to float16. Needs a backend that can multiply packed weights "
-             "(mlx). With no value, GGML's own blocks are moved into the "
-             "backend's layout bit-exactly, so no weight is rounded twice. "
-             "'compact' does the same with half-precision scales: 17%% "
-             "smaller for a measured 8e-04 relative error. Give 4, 6 or 8 to "
-             "re-quantize instead: smaller again, but 4 bits visibly "
-             "reorders the top-5 tokens.",
+        help="Keep weights compressed in memory instead of expanding them to "
+             "float16. Needs a backend that can multiply packed weights "
+             "(mlx). "
+             "No value: move GGML's own blocks into the backend's layout, "
+             "bit-exactly, so no weight is rounded twice -- this only "
+             "rearranges existing quantization, so it does nothing for a "
+             "model stored as floats. "
+             "'compact': the same with half-precision scales, 17%% smaller "
+             "for a measured 8e-04 relative error. "
+             "4, 6 or 8: re-quantize to that width, which works on any model "
+             "-- 8 is imperceptible and the fastest option for an F16 file, "
+             "4 visibly reorders the top-5 tokens.",
     )
     p_run.add_argument("-q", "--quiet", action="store_true", help="Suppress progress output")
 

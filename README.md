@@ -242,7 +242,15 @@ The check that matters is not that it generates — wrong block arithmetic still
 
 **Be clear what this is not.** Unpacked blocks become float16 in memory, so the Q4_K_M model holds 772 MB against the F16 model's 784 MB — near-identical, from a file that is 101 MB rather than 258 MB. **Quantization saves disk and download here, not RAM.**
 
-`--pack` keeps them packed instead, and there are two ways to do it.
+`--pack` keeps them packed instead. Which mode you want depends on how the model is stored:
+
+| Mode | What it does | Works on |
+|---|---|---|
+| `--pack` | Moves GGML's own blocks into the backend's layout, **bit-exactly** | quantized models only |
+| `--pack compact` | The same with float16 scales — 17% smaller, 8e-04 error | quantized models only |
+| `--pack 4/6/8` | Re-quantizes to that width | any model, float or quantized |
+
+The first two only *rearrange* existing quantization, so they have nothing to do on a model stored as floats — `reminis run` says so rather than leaving you to wonder why the flag changed nothing. For an F16 file, `--pack 8` is the one that helps, and it is imperceptible: correlation 0.9996–0.9999 against the unpacked model.
 
 **`--pack` with no value moves GGML's own blocks into the backend's layout, bit-exactly.** This is the interesting one. Several GGML quantizations turn out to be *already affine* within each group of 32 weights — `Q4_K` is `(d·sc)·q − (dmin·m)`, `Q5_0` is `d·(q−16)`, `Q8_0` is `d·q` — which is precisely the `scale·q + bias` form MLX's quantized matmul expects. So they can be rewritten into its layout by shuffling bits, with **no arithmetic on any weight and no second rounding**. Verified against the `gguf` package's own dequantization: Q4_0, Q4_1, Q5_0, Q5_1, Q5_K, Q4_K and Q8_0 all come back **bit-identical**, zero difference.
 
