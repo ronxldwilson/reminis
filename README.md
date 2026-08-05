@@ -314,15 +314,19 @@ An f16 model can be packed as it loads, with no separate quantization step and n
 
 | Model | reminis f16 | reminis `--pack 8` | llama.cpp f16 | packed vs llama.cpp |
 |---|---|---|---|---|
-| SmolLM-135M | 272 | 333 | 334 | **100%** |
-| Qwen2.5-0.5B | 107 | 164 | 124 | **133%** |
-| Llama-3.2-1B | 48 | 80 | 51 | **156%** |
+| SmolLM-135M | 270 | 343 | 337 | **102%** |
+| Qwen2.5-0.5B | 108 | 173 | 123 | **140%** |
+| Llama-3.2-1B | 48 | 87 | 52 | **168%** |
 
-`--pack 8` correlates with the unpacked model at **0.9999** and produces identical greedy text, so this is not a quality trade in any sense that shows up in output — it is the same model reading half the bytes.
+`--pack 8` correlates with the unpacked model at **0.9996–0.9999** and produces identical greedy text, so this is not a quality trade in any sense that shows up in output — it is the same model reading half the bytes.
 
-Two things make it work. Packing is applied to the **embedding table** as well, which is normally excluded because it is indexed rather than multiplied: a packed table can still be indexed, and on a tied-weights model it is also the output projection, where it is the single largest read of every token. And the per-group scales are held in float16, which is what `compact` does.
+Three things make it work:
 
-Be clear about the boundary. Precision-matched, llama.cpp is still ahead: its **Q8_0** kernels beat this at 402 against 333 on SmolLM, and f16 against f16 it wins everywhere by 6–19%. The claim is narrower and still useful — *given an f16 file and no willingness to convert it*, reminis will run it faster than llama.cpp will.
+- **The embedding table is packed too.** It is normally excluded because it is indexed rather than multiplied — but a packed table can still be indexed, since the rows are contiguous, and on a tied-weights model it is also the output projection, where it is the single largest read of every token.
+- **The per-group scales are held in float16** rather than float32, which is what `compact` does: 5 bits per weight instead of 6 on a 4-bit tensor.
+- **The group size is chosen per tensor**, largest that divides the row. A bigger group carries fewer scales, so it is smaller *and* faster: on Qwen at 8 bits, a group of 128 gives 174 tok/s and 625 MB against 165 and 682 for a group of 32, for a correlation that falls only from 0.99989 to 0.99972. It has to divide the row length, which is why it is per tensor rather than global — 896 takes 128, 576 does not and takes 64. That one change was worth 74 → 87 tok/s on Llama-1B.
+
+Be clear about the boundary. Precision-matched, llama.cpp is still ahead: its **Q8_0** kernels beat this at 389 against 343 on SmolLM, and f16 against f16 it wins everywhere by 7–20%. The claim is narrower and still useful — *given an f16 file and no willingness to convert it*, reminis will run it faster than llama.cpp will.
 
 ### Against llama.cpp, generating tokens
 
