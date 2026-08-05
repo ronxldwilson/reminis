@@ -167,6 +167,73 @@ class Backend:
     def silu(self, x):
         raise NotImplementedError
 
+    def rope(self, x, dims, traditional, base, offset, freqs=None):
+        """Rotary embedding on (batch, heads, tokens, dim).
+
+        Backends with a fused kernel for this override it; the fallback
+        builds the cos/sin tables and does the rotation as array ops.
+        """
+        xp = self.xp
+        half = dims // 2
+        # `freqs`, when given, is the *period* of each rotary dimension --
+        # base ** (2i/d) -- which is the convention mlx's kernel uses, so the
+        # angle divides by it rather than multiplying.
+        if freqs is None:
+            periods = base ** (np.arange(half, dtype=np.float32) * 2.0 / dims)
+        else:
+            periods = np.asarray(freqs, dtype=np.float32)
+        pos = np.arange(offset, offset + x.shape[-2], dtype=np.float32)
+        angles = pos[:, None] / periods[None, :]
+        cos = self.from_numpy(np.cos(angles))[None, None]
+        sin = self.from_numpy(np.sin(angles))[None, None]
+
+        rot, rest = x[..., :dims], x[..., dims:]
+        if traditional:
+            even, odd = rot[..., 0::2], rot[..., 1::2]
+            out = xp.stack([even * cos - odd * sin, even * sin + odd * cos],
+                           axis=-1).reshape(rot.shape)
+        else:
+            first, second = rot[..., :half], rot[..., half:]
+            out = xp.concatenate(
+                [first * cos - second * sin, first * sin + second * cos], axis=-1
+            )
+        return out if rest.shape[-1] == 0 else xp.concatenate([out, rest], axis=-1)
+
+    def fused_ffn(self, x, norm, gate_up, down, eps):
+        """norm, gated feed-forward, and the residual add, as one step.
+
+        Written as a single call so that a backend able to fuse it can,
+        rather than seeing seven unrelated operations arrive one at a time.
+        """
+        h = self.rms_norm(x, norm, eps)
+        out = self.matmul_weight(h, gate_up)
+        half = out.shape[-1] // 2
+        return x + self.matmul_weight(
+            self.silu(out[..., :half]) * out[..., half:], down
+        )
+
+    def attention(self, q, k, v, scale, mask=None):
+        """Scaled dot-product attention on (batch, heads, tokens, dim).
+
+        Grouped-query attention is expressed by k and v having fewer heads
+        than q. The fallback below spells that out with a broadcast axis
+        rather than repeating the cache, which would copy it every layer.
+        """
+        xp = self.xp
+        n_heads, n_kv = q.shape[1], k.shape[1]
+        repeat = n_heads // n_kv
+        b, _, t, d = q.shape
+
+        qh = q.reshape(b, n_kv, repeat, t, d)
+        kh = k[:, :, None]
+        vh = v[:, :, None]
+
+        scores = (qh @ xp.swapaxes(kh, -1, -2)) * scale
+        if mask is not None:
+            scores = xp.where(mask, scores, float("-inf"))
+        attn = self.softmax(scores)
+        return (attn @ vh).reshape(b, n_heads, t, d)
+
 
 class NumpyBackend(Backend):
     """The reference implementation. Always available, always correct."""
@@ -251,6 +318,7 @@ class MLXBackend(Backend):
 
         self.mx = mx
         self.compute_dtype = compute_dtype or mx.float16
+        self._compiled_ffn = None
 
     @classmethod
     def available(cls) -> bool:
@@ -357,6 +425,50 @@ class MLXBackend(Backend):
 
     def rms_norm(self, x, weight, eps: float):
         return self.mx.fast.rms_norm(x, weight, eps)
+
+    def rope(self, x, dims, traditional, base, offset, freqs=None):
+        # A fused kernel, which matters because the array-op version below
+        # builds half a dozen intermediates per layer per token.
+        return self.mx.fast.rope(
+            x, dims, traditional=traditional,
+            base=None if freqs is not None else base,
+            scale=1.0, offset=offset,
+            freqs=None if freqs is None else self.mx.array(np.asarray(freqs, np.float32)),
+        )
+
+    def fused_ffn(self, x, norm, gate_up, down, eps):
+        """The feed-forward half of a block, compiled into one graph.
+
+        Every layer of a model has the same shapes here, so one compiled
+        function serves all of them -- the weights are traced arguments
+        rather than constants. Compiling removes the per-operation dispatch
+        that a small model spends a quarter of its time in.
+
+        Packed weights are not traceable arguments, so those fall back to
+        the uncompiled path.
+        """
+        if isinstance(gate_up, QuantizedWeight) or isinstance(down, QuantizedWeight):
+            return Backend.fused_ffn(self, x, norm, gate_up, down, eps)
+
+        mx = self.mx
+        if self._compiled_ffn is None:
+            def ffn(x, norm, gate_up, down):
+                h = mx.fast.rms_norm(x, norm, eps)
+                out = x
+                proj = h @ gate_up.T
+                half = proj.shape[-1] // 2
+                gate, up = proj[..., :half], proj[..., half:]
+                return out + (gate * mx.sigmoid(gate) * up) @ down.T
+
+            self._compiled_ffn = mx.compile(ffn)
+        return self._compiled_ffn(x, norm, gate_up, down)
+
+    def attention(self, q, k, v, scale, mask=None):
+        # Fused attention: the scores matrix is never materialised, and
+        # grouped-query attention is handled inside the kernel.
+        return self.mx.fast.scaled_dot_product_attention(
+            q, k, v, scale=scale, mask=mask
+        )
 
     def softmax(self, x, axis=-1):
         # precise=True accumulates in float32 even when the input is half,

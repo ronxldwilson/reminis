@@ -268,13 +268,36 @@ This closes most of the gap with llama.cpp on quantized weights — the values m
 
 Same models, same machine, `--backend numpy` against `--backend mlx`:
 
-| Model | numpy | MLX | Speedup | llama.cpp Metal |
-|---|---|---|---|---|
-| SmolLM-135M f16 | 975 pp / 86 tg | **20,518 pp / 116 tg** | 21× pp / 1.3× tg | 18,126 pp / 176 tg |
-| Qwen2.5-0.5B f16 | 522 pp / 27 tg | **7,962 pp / 59 tg** | 15× pp / 2.2× tg | 5,272 pp / 69 tg |
-| Llama-3.2-1B f16 | 274 pp / 11 tg | **1,866 pp / 25 tg** | 7× pp / 2.3× tg | 1,652 pp / 30 tg |
+| Model | numpy | MLX | Speedup |
+|---|---|---|---|
+| SmolLM-135M f16 | 975 pp / 86 tg | **26,359 pp / 194 tg** | 27× pp / 2.3× tg |
+| Qwen2.5-0.5B f16 | 522 pp / 27 tg | **8,775 pp / 70 tg** | 17× pp / 2.6× tg |
+| Llama-3.2-1B f16 | 274 pp / 11 tg | **1,962 pp / 32 tg** | 11× pp / 2.9× tg |
 
-On prompt processing this now **beats llama.cpp's Metal backend** on all three models, and token generation reaches 66–87% of it. The gain comes less from the GPU than from float16 being a native compute type there: MLX never pays the widening that costs numpy 213 ms of a 274 ms load, and it holds half the memory as a result.
+The gain comes less from the GPU than from float16 being a native compute type there: MLX never pays the widening that costs numpy 213 ms of a 274 ms load, and it holds half the memory as a result.
+
+### Against llama.cpp, generating tokens
+
+Token generation was the one axis llama.cpp clearly won. These are run **interleaved** — one round of each, alternating, best of seven — because the machine is not idle and alternating makes shared load cancel:
+
+| Model | reminis (MLX) | llama.cpp Metal | Ratio |
+|---|---|---|---|
+| SmolLM-135M | 194 tg | 261 tg | 74% |
+| Qwen2.5-0.5B | 70 tg | 78 tg | 90% |
+| **Llama-3.2-1B** | **32 tg** | **32 tg** | **101%** |
+
+**At 1B the numpy-and-MLX forward pass matches llama.cpp**, and the ratio improves monotonically with model size — because what remains is a fixed per-token cost that larger matrices amortise. Prompt processing was already ahead and is now 26,359 against 18,126 on SmolLM.
+
+Four things got it there, in order of size:
+
+- **`mx.fast.scaled_dot_product_attention`.** The hand-rolled version materialised a scores matrix and expressed grouped-query attention with a broadcast axis. The fused kernel does neither and handles GQA internally.
+- **`mx.fast.rope`.** Rotary embedding was six array operations per projection per layer; it is now one.
+- **Weight lookups hoisted out of the loop.** Each layer rebuilt eight weight-name strings and hashed eight dictionary keys, every token — 360 string operations per token on a 30-layer model, which is real time when a token takes under six milliseconds.
+- **`mx.compile` on the feed-forward half.** Every layer has identical shapes there, so one compiled graph serves all thirty; the weights are traced arguments rather than baked constants.
+
+What is left is dispatch overhead. Profiling puts it at 26% of a token for SmolLM and 18% for Qwen, and removing it entirely would give 238 tok/s and 84 tok/s respectively — ahead of llama.cpp in both cases. That is the remaining work, and it is Python overhead rather than anything about the database.
+
+**On which database ideas helped: none of them, and that is the honest finding.** Memory-mapping the file was worth a real 4.1 → 6.7 GB/s on reads, clustered ordering and prefetching would help `--stream`, and materialising a pre-converted form would cut load time. But once the weights are resident, SQLite is not in the critical path at all — a forward pass touches no rows. Database techniques can improve how fast a model is *loaded* and how cheaply it is *stored*; they cannot make a matrix multiply faster.
 
 Backends are picked per *workload*, not per machine, because a GPU is not a blanket improvement:
 

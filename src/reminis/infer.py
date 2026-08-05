@@ -291,6 +291,17 @@ class Config:
             store.get_numpy("rope_freqs.weight").ravel()
             if store.has("rope_freqs.weight") else None
         )
+        # Llama 3 divides each rotary frequency by a stored factor. Folding
+        # that in once here means the kernels take plain frequencies and
+        # neither backend needs to know the model does anything unusual.
+        half = self.rope_dim // 2
+        if self.rope_factors is not None:
+            base_freqs = 1.0 / (
+                self.rope_base ** (np.arange(half, dtype=np.float32) * 2.0 / self.rope_dim)
+            )
+            self.rope_freqs = 1.0 / (base_freqs / self.rope_factors[:half])
+        else:
+            self.rope_freqs = None
 
         # Tied embeddings: many small models have no separate output matrix.
         self.tied_output = not store.has("output.weight")
@@ -521,6 +532,7 @@ class Model:
         self.meta = meta
         self.cfg = Config(meta, self.store)
         self.tokenizer = Tokenizer(meta)
+        self._layer_cache: dict[int, tuple] = {}
         self._rope_cache: tuple | None = None
         self._mask_cache: tuple | None = None
         self._fused_cache: dict[tuple[int, str], tuple] = {}
@@ -643,7 +655,7 @@ class Model:
                     self._linear(h, prefix + "attn_k.weight", prefix + "attn_k.bias"),
                     self._linear(h, prefix + "attn_v.weight", prefix + "attn_v.bias"))
 
-        weight, bias = self._fused(
+        weight, bias = self._fused_cache.get((layer, "qkv")) or self._fused(
             layer, "qkv",
             ["attn_q.weight", "attn_k.weight", "attn_v.weight"],
         )
@@ -659,59 +671,83 @@ class Model:
             return (self._linear(h, prefix + "ffn_gate.weight"),
                     self._linear(h, prefix + "ffn_up.weight"))
 
-        weight, _ = self._fused(layer, "gate_up", ["ffn_gate.weight", "ffn_up.weight"])
+        weight, _ = self._fused_cache.get((layer, "gate_up")) or self._fused(
+            layer, "gate_up", ["ffn_gate.weight", "ffn_up.weight"])
         out = h @ weight.T
         half = out.shape[1] // 2
         return out[:, :half], out[:, half:]
+
+    def _layer_weights(self, layer: int):
+        """Every weight a layer needs, resolved once.
+
+        Looking these up by name inside the loop meant building eight
+        strings and hashing eight dictionary keys per layer per token --
+        360 string operations a token on a 30-layer model, which is real
+        time when a whole token is under six milliseconds. Streaming mode
+        skips the table, since its entire point is to hold nothing.
+        """
+        cached = self._layer_cache.get(layer)
+        if cached is not None:
+            return cached
+
+        p = f"blk.{layer}."
+        entry = (
+            self.store.get(p + "attn_norm.weight").reshape(-1),
+            self.store.get(p + "ffn_norm.weight").reshape(-1),
+            p,
+        )
+        if not self.store.stream:
+            self._layer_cache[layer] = entry
+        return entry
 
     def _block(self, x, layer: int, cache: "KVCache", offset: int):
         cfg = self.cfg
         b = self.backend
         xp = b.xp
-        p = f"blk.{layer}."
+        attn_norm, ffn_norm, p = self._layer_weights(layer)
         n_tokens = x.shape[0]
 
-        h = b.rms_norm(x, self.store.get(p + "attn_norm.weight").reshape(-1), cfg.rms_eps)
+        h = b.rms_norm(x, attn_norm, cfg.rms_eps)
 
         q, k, v = self._qkv(h, layer, p)
         q = q.reshape(n_tokens, cfg.n_heads, cfg.head_dim)
         k = k.reshape(n_tokens, cfg.n_kv_heads, cfg.head_dim)
         v = v.reshape(n_tokens, cfg.n_kv_heads, cfg.head_dim)
 
-        cos, sin = self._rope_tables(n_tokens, offset)
-        q = self._apply_rope(q, cos, sin)
-        k = self._apply_rope(k, cos, sin)
+        # (batch, heads, tokens, dim) is the layout both backends' rotary
+        # and attention kernels expect, so the transposes happen once here
+        # rather than being undone and redone between the two.
+        q = q.transpose(1, 0, 2)[None]
+        k = k.transpose(1, 0, 2)[None]
+        v = v.transpose(1, 0, 2)[None]
+
+        q = b.rope(q, cfg.rope_dim, cfg.rope_style == "norm", cfg.rope_base,
+                   offset, cfg.rope_freqs)
+        k = b.rope(k, cfg.rope_dim, cfg.rope_style == "norm", cfg.rope_base,
+                   offset, cfg.rope_freqs)
 
         k_all, v_all = cache.append(layer, k, v)
-        total = k_all.shape[0]
 
-        # Grouped-query attention. Each key/value head serves `repeat` query
-        # heads, and the obvious way to write that is np.repeat on the cache
-        # -- which copies the whole cache, every layer, every token. Adding a
-        # length-1 axis instead lets broadcasting do it for free: queries are
-        # grouped (n_kv, repeat, ...) and the keys and values broadcast across
-        # the group they belong to.
-        repeat = cfg.n_heads // cfg.n_kv_heads
-        qh = q.transpose(1, 0, 2).reshape(cfg.n_kv_heads, repeat, n_tokens, cfg.head_dim)
-        kh = k_all.transpose(1, 2, 0)[:, None]
-        vh = v_all.transpose(1, 0, 2)[:, None]
-
-        scores = (qh @ kh) * (1.0 / math.sqrt(cfg.head_dim))
         # A single token attends to the whole cache, so there is nothing for
         # a causal mask to hide and building one is pure waste. It is only
         # needed when several tokens are processed at once.
+        mask = None
         if n_tokens > 1:
-            mask = self._causal_mask(n_tokens, offset, total)
-            scores = xp.where(mask, scores, float("-inf"))
+            mask = self._causal_mask(n_tokens, offset, k_all.shape[-2])
 
-        attn = b.softmax(scores)
-        out = (attn @ vh).reshape(cfg.n_heads, n_tokens, cfg.head_dim)
-        out = out.transpose(1, 0, 2).reshape(n_tokens, cfg.n_heads * cfg.head_dim)
+        out = b.attention(q, k_all, v_all, 1.0 / math.sqrt(cfg.head_dim), mask)
+        out = out[0].transpose(1, 0, 2).reshape(n_tokens, cfg.n_heads * cfg.head_dim)
         x = x + self._linear(out, p + "attn_output.weight", p + "attn_output.bias")
 
-        h = b.rms_norm(x, self.store.get(p + "ffn_norm.weight").reshape(-1), cfg.rms_eps)
-        gate, up = self._gate_up(h, layer, p)
-        return x + self._linear(b.silu(gate) * up, p + "ffn_down.weight")
+        if self.store.stream or self.store.pack_bits is not None:
+            h = b.rms_norm(x, ffn_norm, cfg.rms_eps)
+            gate, up = self._gate_up(h, layer, p)
+            return x + self._linear(b.silu(gate) * up, p + "ffn_down.weight")
+
+        gate_up, _ = self._fused_cache.get((layer, "gate_up")) or self._fused(
+            layer, "gate_up", ["ffn_gate.weight", "ffn_up.weight"])
+        return b.fused_ffn(x, ffn_norm, gate_up,
+                           self.store.get(p + "ffn_down.weight"), cfg.rms_eps)
 
     def _causal_mask(self, n_tokens: int, offset: int, total: int):
         """True where a query at an absolute position may see a key.
@@ -786,39 +822,42 @@ class KVCache:
         self.backend = backend or select_backend("inference")
         self._used = 0
 
-    def _empty(self, size, tail, like):
+    def _empty(self, size, like, n_tokens):
+        """A cache buffer shaped like `like` but with room for `size` tokens."""
         xp = self.backend.xp
-        return xp.zeros((size,) + tuple(tail), dtype=like.dtype)
+        shape = list(like.shape)
+        shape[-2] = size
+        return xp.zeros(tuple(shape), dtype=like.dtype)
 
     def append(self, layer: int, k, v):
-        n = k.shape[0]
+        n = k.shape[-2]
         buf_k, buf_v = self.k[layer], self.v[layer]
 
         if buf_k is None:
             size = max(self.capacity or 0, n)
-            buf_k = self._empty(size, k.shape[1:], k)
-            buf_v = self._empty(size, v.shape[1:], v)
+            buf_k = self._empty(size, k, n)
+            buf_v = self._empty(size, v, n)
             self.k[layer], self.v[layer] = buf_k, buf_v
             used = 0
         else:
             used = self._used
-            if used + n > buf_k.shape[0]:
-                grown = max(buf_k.shape[0] * 2, used + n)
-                bigger_k = self._empty(grown, k.shape[1:], k)
-                bigger_v = self._empty(grown, v.shape[1:], v)
-                bigger_k[:used] = buf_k[:used]
-                bigger_v[:used] = buf_v[:used]
+            if used + n > buf_k.shape[-2]:
+                grown = max(buf_k.shape[-2] * 2, used + n)
+                bigger_k = self._empty(grown, k, n)
+                bigger_v = self._empty(grown, v, n)
+                bigger_k[..., :used, :] = buf_k[..., :used, :]
+                bigger_v[..., :used, :] = buf_v[..., :used, :]
                 buf_k, buf_v = bigger_k, bigger_v
                 self.k[layer], self.v[layer] = buf_k, buf_v
 
-        buf_k[used:used + n] = k
-        buf_v[used:used + n] = v
+        buf_k[..., used:used + n, :] = k
+        buf_v[..., used:used + n, :] = v
 
         # The counter advances once per token, not once per layer, so it is
         # updated on the last layer only -- every layer sees the same span.
         if layer == len(self.k) - 1:
             self._used = used + n
-        return buf_k[:used + n], buf_v[:used + n]
+        return buf_k[..., :used + n, :], buf_v[..., :used + n, :]
 
     @property
     def length(self) -> int:
