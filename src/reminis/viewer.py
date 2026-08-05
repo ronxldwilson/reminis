@@ -721,6 +721,23 @@ const TENSOR_EXPLANATIONS = {{
   "ffn_up": "The <strong>up projection</strong> expands the representation to a wider dimension inside the FFN. The model thinks in a bigger space here before compressing back down.",
   "ffn_down": "The <strong>down projection</strong> compresses the FFN's wider representation back to the model's main dimension. Information is distilled on the way through.",
   "ffn_norm": "The <strong>FFN layer norm</strong> normalizes values before the feed-forward network. Same purpose as attn_norm but for the FFN sub-layer.",
+
+  // PyTorch / safetensors spellings of the same tensors. A model imported from
+  // safetensors uses these names throughout, so without them every tensor
+  // would fall back to the generic explanation.
+  "embed_tokens": "The <strong>embedding layer</strong> converts each word/token into a vector of numbers the model can work with. It is essentially a lookup table: token ID in, vector out. (GGUF calls this <code>token_embd</code>.)",
+  "lm_head": "The <strong>output projection</strong> converts the model's internal representation back into a probability for each possible next token in the vocabulary. Many models tie this to the embedding layer instead of storing it separately. (GGUF calls this <code>output</code>.)",
+  "q_proj": "The <strong>query (Q) matrix</strong> in the attention mechanism. It represents 'what am I looking for?' for each token. Multiplied with keys to compute attention scores. (GGUF calls this <code>attn_q</code>.)",
+  "k_proj": "The <strong>key (K) matrix</strong> in attention. It represents 'what do I contain?' for each token. Other tokens compare their queries against these keys to decide what to attend to. (GGUF calls this <code>attn_k</code>.)",
+  "v_proj": "The <strong>value (V) matrix</strong> in attention. Once attention scores decide which tokens are relevant, the values are what actually gets passed forward. (GGUF calls this <code>attn_v</code>.)",
+  "o_proj": "The <strong>attention output projection</strong>. After attention combines the value vectors, this matrix projects the result back to the model's main dimension. (GGUF calls this <code>attn_output</code>.)",
+  "gate_proj": "The <strong>gate projection</strong> in the feed-forward network. In SwiGLU architectures, it controls how much signal passes through, acting like a learned filter. (GGUF calls this <code>ffn_gate</code>.)",
+  "up_proj": "The <strong>up projection</strong> expands the representation to a wider dimension inside the FFN. The model thinks in a bigger space here before compressing back down. (GGUF calls this <code>ffn_up</code>.)",
+  "down_proj": "The <strong>down projection</strong> compresses the FFN's wider representation back to the model's main dimension. (GGUF calls this <code>ffn_down</code>.)",
+  "input_layernorm": "The <strong>attention layer norm</strong> normalizes values before they enter the attention mechanism. This keeps training stable and helps the model learn. (GGUF calls this <code>attn_norm</code>.)",
+  "post_attention_layernorm": "The <strong>FFN layer norm</strong> normalizes values after attention and before the feed-forward network. (GGUF calls this <code>ffn_norm</code>.)",
+  "lora_A": "One half of a <strong>LoRA factor pair</strong>. A LoRA fine-tune never touches the base weight; it learns two small matrices whose product is added to it. <code>lora_A</code> projects down to the small rank dimension.",
+  "lora_B": "The other half of a <strong>LoRA factor pair</strong>. <code>lora_B</code> projects back up from the rank dimension, so <code>B @ A</code> has the same shape as the weight it modifies while holding far fewer numbers.",
 }};
 
 // Longest match wins, so `ffn_gate_exps` is not shadowed by `ffn_gate` and
@@ -743,10 +760,18 @@ function getTensorExplanation(name) {{
 // unanchored /blk\\.(\d+)/ matches the `blk.0` inside `v.blk.0` and folds
 // vision layers into the text-block numbering. Anchoring on the prefix keeps
 // the two stacks apart.
+// Safetensors models keep PyTorch's names (`model.layers.0.self_attn.q_proj`)
+// rather than GGUF's (`blk.0.attn_q`), so both conventions are matched here.
+// Without this the diagram is simply empty for anything imported from
+// safetensors.
 function getBlockInfo(name) {{
   let m = name.match(/^blk\\.(\d+)\\./);
   if (m) return {{ stack: "text", idx: parseInt(m[1]) }};
   m = name.match(/^v\\.blk\\.(\d+)\\./);
+  if (m) return {{ stack: "vision", idx: parseInt(m[1]) }};
+  m = name.match(/^(?:model\\.)?layers\\.(\d+)\\./);
+  if (m) return {{ stack: "text", idx: parseInt(m[1]) }};
+  m = name.match(/vision_(?:tower|model)\\..*?layers\\.(\d+)\\./);
   if (m) return {{ stack: "vision", idx: parseInt(m[1]) }};
   return null;
 }}

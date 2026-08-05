@@ -10,24 +10,48 @@ from reminis import __version__
 def main():
     parser = argparse.ArgumentParser(
         prog="reminis",
-        description="Store LLM weights in a SQLite database. "
-                    "Convert GGUF losslessly, query, diff, and package changes as delta packs.",
+        description="Store LLM weights in a SQLite database. Convert GGUF and "
+                    "safetensors losslessly, query, diff, and package fine-tunes "
+                    "as delta packs.",
     )
     parser.add_argument("--version", action="version", version=f"reminis {__version__}")
 
     sub = parser.add_subparsers(dest="command")
 
-    # convert: GGUF -> SQLite
-    p_convert = sub.add_parser("convert", help="Convert a GGUF file to a SQLite database")
-    p_convert.add_argument("input", help="Path to the GGUF file")
+    # convert: GGUF or safetensors -> SQLite
+    p_convert = sub.add_parser(
+        "convert", help="Convert a GGUF or safetensors model to a SQLite database"
+    )
+    p_convert.add_argument(
+        "input",
+        help="A .gguf file, a .safetensors file, a model.safetensors.index.json, "
+             "or a directory holding a safetensors model",
+    )
     p_convert.add_argument("-o", "--output", help="Output database path (default: same name with .db)")
+    p_convert.add_argument(
+        "--format", choices=("auto", "gguf", "safetensors"), default="auto",
+        help="Input format (default: detected from the path)",
+    )
     p_convert.add_argument("-q", "--quiet", action="store_true", help="Suppress progress output")
 
-    # export: SQLite -> GGUF
-    p_export = sub.add_parser("export", help="Convert a SQLite database back to GGUF")
+    # export: SQLite -> GGUF or safetensors
+    p_export = sub.add_parser("export", help="Convert a SQLite database back to a model file")
     p_export.add_argument("input", help="Path to the SQLite database")
-    p_export.add_argument("-o", "--output", help="Output GGUF path (default: same name with .gguf)")
+    p_export.add_argument("-o", "--output", help="Output path (default: same name, format's extension)")
+    p_export.add_argument(
+        "--format", choices=("auto", "gguf", "safetensors"), default="auto",
+        help="Output format (default: whichever format the model was imported from)",
+    )
     p_export.add_argument("-q", "--quiet", action="store_true", help="Suppress progress output")
+
+    # lora: peft adapter -> delta pack
+    p_lora = sub.add_parser(
+        "lora", help="Convert a peft LoRA adapter into a delta pack against a base model"
+    )
+    p_lora.add_argument("adapter", help="adapter_model.safetensors, or the directory holding it")
+    p_lora.add_argument("base", help="Path to the base model database the adapter was trained on")
+    p_lora.add_argument("-o", "--output", required=True, help="Output delta pack path")
+    p_lora.add_argument("-q", "--quiet", action="store_true", help="Suppress progress output")
 
     # info: show database summary
     p_info = sub.add_parser("info", help="Show summary info about a reminis database")
@@ -71,12 +95,28 @@ def main():
         sys.exit(1)
 
     if args.command == "convert":
-        from reminis.converter import gguf_to_sqlite
-        gguf_to_sqlite(args.input, args.output, verbose=not args.quiet)
+        fmt = args.format if args.format != "auto" else _detect_input_format(args.input)
+        if fmt == "safetensors":
+            from reminis.safetensors_io import safetensors_to_sqlite
+            safetensors_to_sqlite(args.input, args.output, verbose=not args.quiet)
+        else:
+            from reminis.converter import gguf_to_sqlite
+            gguf_to_sqlite(args.input, args.output, verbose=not args.quiet)
 
     elif args.command == "export":
-        from reminis.converter import sqlite_to_gguf
-        sqlite_to_gguf(args.input, args.output, verbose=not args.quiet)
+        fmt = args.format if args.format != "auto" else _source_format(args.input)
+        if fmt == "safetensors":
+            from reminis.safetensors_io import sqlite_to_safetensors
+            sqlite_to_safetensors(args.input, args.output, verbose=not args.quiet)
+        else:
+            from reminis.converter import sqlite_to_gguf
+            sqlite_to_gguf(args.input, args.output, verbose=not args.quiet)
+
+    elif args.command == "lora":
+        from reminis.lora import lora_to_delta_pack
+        lora_to_delta_pack(
+            args.adapter, args.base, args.output, verbose=not args.quiet
+        )
 
     elif args.command == "info":
         _show_info(args.input)
@@ -105,6 +145,37 @@ def main():
         )
 
 
+def _detect_input_format(path: str) -> str:
+    """Guess the input format from the path.
+
+    A directory or an index file only ever means safetensors; GGUF is always a
+    single file. Anything else falls through to GGUF, which is what reminis
+    read before safetensors support existed.
+    """
+    p = Path(path)
+    if p.is_dir() or p.name.endswith(".index.json") or p.suffix == ".safetensors":
+        return "safetensors"
+    return "gguf"
+
+
+def _source_format(db_path: str) -> str:
+    """The format a database was imported from, so export defaults to it."""
+    import sqlite3
+
+    if not Path(db_path).exists():
+        return "gguf"
+    conn = sqlite3.connect(db_path)
+    try:
+        row = conn.execute(
+            "SELECT value FROM model_meta WHERE key = 'reminis.source_format'"
+        ).fetchone()
+    except sqlite3.DatabaseError:
+        return "gguf"
+    finally:
+        conn.close()
+    return row[0] if row else "gguf"
+
+
 def _show_info(db_path: str):
     import sqlite3
     from pathlib import Path
@@ -119,8 +190,8 @@ def _show_info(db_path: str):
     size_mb = path.stat().st_size / (1024 * 1024)
     print(f"Database: {db_path} ({size_mb:.1f} MB)")
 
-    # Model name and architecture
-    for key in ("general.name", "general.architecture"):
+    # Model name, architecture, and which format it came from
+    for key in ("general.name", "general.architecture", "reminis.source_format"):
         row = conn.execute("SELECT value FROM model_meta WHERE key = ?", (key,)).fetchone()
         if row:
             print(f"  {key}: {row[0]}")

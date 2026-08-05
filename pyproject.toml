@@ -1,7 +1,7 @@
 [project]
 name = "reminis"
-version = "0.3.0"
-description = "Store LLM weights in a SQLite database. Convert GGUF losslessly, query, diff, and package changes as delta packs."
+version = "0.4.0"
+description = "Store LLM weights in a SQLite database. Convert GGUF and safetensors losslessly, query, diff, and package fine-tunes as delta packs."
 readme = "README.md"
 requires-python = ">=3.10"
 license = "MIT"
@@ -42,4 +42,4 @@ packages = ["src/reminis"]
 # alongside the repo during development and must never reach the sdist.
 [tool.hatch.build.targets.sdist]
 include = ["src/reminis", "tests", "README.md", "LICENSE", "pyproject.toml"]
-exclude = ["models", "*.html", "*.gguf", "*.db"]
+exclude = ["models", "*.html", "*.gguf", "*.db", "*.safetensors"]

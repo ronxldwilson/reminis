@@ -1,4 +1,10 @@
-"""Convert between GGUF files and SQLite databases."""
+"""Convert between model files and SQLite databases.
+
+GGUF lives here; safetensors lives in ``safetensors_io`` and shares this
+schema. ``shape`` is stored reversed relative to the data layout for every
+format, because that is GGUF's convention and the diff, low-rank, and viewer
+code all read it that way.
+"""
 
 import json
 import sqlite3
@@ -10,6 +16,8 @@ import numpy as np
 from gguf.gguf_reader import GGUFReader
 from gguf import GGUFWriter
 from gguf.constants import GGMLQuantizationType, GGUFValueType, GGML_QUANT_SIZES
+
+from reminis.dtypes import DTYPE_SYSTEM_GGUF, DTYPE_SYSTEM_SAFETENSORS, dtype_system
 
 
 SCHEMA = """
@@ -125,6 +133,17 @@ def gguf_to_sqlite(gguf_path: str, db_path: str | None = None, verbose: bool = T
         )
         meta_count += 1
 
+    # Record which dtype system the dtype_id column belongs to, so a later
+    # export never mistakes a GGML enum value for a safetensors one.
+    for key, value in (
+        ("reminis.source_format", "gguf"),
+        ("reminis.dtype_system", DTYPE_SYSTEM_GGUF),
+    ):
+        conn.execute(
+            "INSERT OR REPLACE INTO model_meta (key, value, type) VALUES (?, ?, 'string')",
+            (key, value),
+        )
+
     if verbose:
         print(f"  Stored {meta_count} metadata fields")
 
@@ -190,6 +209,18 @@ def sqlite_to_gguf(db_path: str, gguf_path: str | None = None, verbose: bool = T
     t0 = time.time()
     conn = sqlite3.connect(str(db_path))
 
+    # dtype_id holds a GGML enum value for GGUF-sourced models and a
+    # reminis-local id for safetensors ones. Exporting the latter as GGUF would
+    # reinterpret those ids as quantization types and write a corrupt file.
+    system = dtype_system(conn)
+    if system == DTYPE_SYSTEM_SAFETENSORS:
+        conn.close()
+        raise ValueError(
+            f"{db_path} came from safetensors, whose dtypes are not GGML types. "
+            "Export it with `reminis export --format safetensors`, or convert "
+            "the original through the llama.cpp toolchain to get a GGUF."
+        )
+
     # Read architecture from metadata
     row = conn.execute("SELECT value FROM model_meta WHERE key = 'general.architecture'").fetchone()
     arch = row[0] if row else "llama"
@@ -200,7 +231,10 @@ def sqlite_to_gguf(db_path: str, gguf_path: str | None = None, verbose: bool = T
     meta_rows = conn.execute("SELECT key, value, type FROM model_meta").fetchall()
     meta_count = 0
     for key, value, type_name in meta_rows:
-        if key.startswith("GGUF."):
+        # GGUF.* are reader-internal; reminis.* are our own bookkeeping and
+        # must not leak into the exported file, or a round-trip would grow
+        # metadata keys the original never had.
+        if key.startswith(("GGUF.", "reminis.")):
             continue
         try:
             _write_meta_value(writer, key, value, type_name)

@@ -17,6 +17,8 @@ import zstandard
 
 from gguf.constants import GGMLQuantizationType
 
+from reminis.dtypes import from_float32, is_float_dtype, to_float32
+
 # zstd level 1 measured at 547 MB/s on XOR delta data, versus 4 MB/s for zlib
 # level 6 -- and it produces a *smaller* payload (32.1 MB vs 32.5 MB on a 54 MB
 # tensor). Delta data is high-entropy XORed float mantissas, so no level buys
@@ -42,13 +44,6 @@ def _decompress(data: bytes, encoding: str) -> bytes:
     if encoding.endswith("_zlib"):
         return zlib.decompress(data)
     return _decompressor.decompress(data)
-
-# Tensor types whose bytes decode directly to floats, so deltas are meaningful.
-NUMERIC_DTYPES = {
-    "F32": np.float32,
-    "F16": np.float16,
-    "BF16": np.float16,
-}
 
 DELTA_SCHEMA = """
 CREATE TABLE IF NOT EXISTS delta_meta (
@@ -147,14 +142,14 @@ def _encode_lowrank(
     Only 2D float tensors qualify: SVD needs a matrix, and quantized bytes
     cannot be decoded to values to decompose in the first place.
     """
-    np_dtype = NUMERIC_DTYPES.get(dtype)
-    if np_dtype is None or len(shape) != 2:
+    if not is_float_dtype(dtype) or len(shape) != 2:
         return None
 
-    # GGUF stores shape reversed relative to the data layout.
+    # Shape is stored reversed relative to the data layout (GGUF's convention,
+    # which reminis keeps for every format).
     m, n = shape[1], shape[0]
-    a = np.frombuffer(a_blob, dtype=np_dtype).astype(np.float32).reshape(m, n)
-    b = np.frombuffer(b_blob, dtype=np_dtype).astype(np.float32).reshape(m, n)
+    a = to_float32(a_blob, dtype).reshape(m, n)
+    b = to_float32(b_blob, dtype).reshape(m, n)
     delta = b - a
 
     delta_norm = float(np.linalg.norm(delta))
@@ -197,10 +192,15 @@ def _encode_lowrank(
     # Measure the error actually achieved, after factor rounding, rather than
     # trusting the spectral estimate.
     with np.errstate(all="ignore"):
-        rebuilt = (a + (left.astype(np.float32) @ right.astype(np.float32))).astype(np_dtype)
-    if not np.all(np.isfinite(rebuilt.astype(np.float32))):
+        approx = a + (left.astype(np.float32) @ right.astype(np.float32))
+    if not np.all(np.isfinite(approx)):
         return None
-    achieved = float(np.linalg.norm(rebuilt.astype(np.float32) - b) / np.linalg.norm(b))
+    # Round-trip through the tensor's own dtype, so the error measured is the
+    # error apply will actually deliver.
+    rebuilt = to_float32(from_float32(approx, dtype), dtype).reshape(m, n)
+    if not np.all(np.isfinite(rebuilt)):
+        return None
+    achieved = float(np.linalg.norm(rebuilt - b) / np.linalg.norm(b))
     if achieved > tolerance:
         return None  # rounding pushed it out of budget
 
@@ -216,7 +216,6 @@ def _encode_lowrank(
 
 def _decode_lowrank(raw: bytes, base_blob: bytes, dtype: str) -> bytes:
     """Rebuild a tensor from base weights plus low-rank delta factors."""
-    np_dtype = NUMERIC_DTYPES[dtype]
     header_len = int.from_bytes(raw[:4], "little")
     meta = json.loads(raw[4 : 4 + header_len])
     rank, m, n = meta["rank"], meta["m"], meta["n"]
@@ -226,7 +225,7 @@ def _decode_lowrank(raw: bytes, base_blob: bytes, dtype: str) -> bytes:
     left = body[: m * rank].reshape(m, rank).astype(np.float32)
     right = body[m * rank : m * rank + rank * n].reshape(rank, n).astype(np.float32)
 
-    base = np.frombuffer(base_blob, dtype=np_dtype).astype(np.float32).reshape(m, n)
+    base = to_float32(base_blob, dtype).reshape(m, n)
     with np.errstate(all="ignore"):
         rebuilt = base + (left @ right)
 
@@ -236,7 +235,7 @@ def _decode_lowrank(raw: bytes, base_blob: bytes, dtype: str) -> bytes:
         raise ValueError(
             "Low-rank reconstruction produced non-finite values; the delta pack is corrupt."
         )
-    return rebuilt.astype(np_dtype).tobytes()
+    return from_float32(rebuilt, dtype)
 
 
 def _model_fingerprint(conn: sqlite3.Connection) -> str:
@@ -270,9 +269,8 @@ def _tensor_delta_stats(a_blob: bytes, b_blob: bytes, dtype: str):
     if a_blob == b_blob:
         return {"identical": True}, None
 
-    np_dtype = NUMERIC_DTYPES.get(dtype)
-    if np_dtype is None:
-        # Quantized: we can tell that it changed, but not by how much.
+    if not is_float_dtype(dtype):
+        # Quantized or integer: we can tell that it changed, but not by how much.
         return {
             "identical": False,
             "numeric": False,
@@ -283,8 +281,8 @@ def _tensor_delta_stats(a_blob: bytes, b_blob: bytes, dtype: str):
             "mean_delta": None,
         }, None
 
-    a = np.frombuffer(a_blob, dtype=np_dtype).astype(np.float32)
-    b = np.frombuffer(b_blob, dtype=np_dtype).astype(np.float32)
+    a = to_float32(a_blob, dtype)
+    b = to_float32(b_blob, dtype)
 
     if a.shape != b.shape:
         return {"identical": False, "numeric": False, "shape_mismatch": True}, None

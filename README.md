@@ -2,7 +2,7 @@
 
 **Your model's weights are just data. Store them in a database.**
 
-`reminis` converts any GGUF model into a SQLite database where every tensor becomes a queryable, versionable, diffable row. Convert back to GGUF when you're done. Lossless. Fast.
+`reminis` converts any GGUF or safetensors model into a SQLite database where every tensor becomes a queryable, versionable, diffable row. Convert back when you're done. Lossless. Fast.
 
 ```bash
 pip install reminis
@@ -19,6 +19,13 @@ Once weights are in a database, you get — for free — everything that 40 year
 ```bash
 # Convert a GGUF model to SQLite
 reminis convert model.gguf
+
+# ...or a safetensors model. Point at the file, the index, or the directory;
+# sharded checkpoints and config.json are handled for you.
+reminis convert ./Llama-3.2-1B/
+
+# Turn a peft LoRA adapter into a delta pack against its base
+reminis lora ./my-adapter/ base.db -o capability.pack.db
 
 # Inspect what's inside
 reminis info model.db
@@ -54,6 +61,30 @@ Every tensor is SHA256-hashed before and after the round-trip. These architectur
 The MoE model is the interesting one: 72 of its tensors are **3-dimensional** expert stacks (e.g. `[512, 1024, 32]` in Q6_K), a shape the quantized export path had never seen. It generalizes correctly.
 
 Throughput is roughly linear with size — about 120 MB/s converting, over 1 GB/s exporting.
+
+### Safetensors
+
+Same SHA256 verification, on real downloaded checkpoints:
+
+| Model | Dtype | Tensors | Size | Convert | Export | Result |
+|---|---|---|---|---|---|---|
+| SmolLM-135M | F32 | 272 | 513 MB | 1.9s | 0.2s | lossless |
+| SmolLM2-135M-Instruct | **BF16** | 272 | 257 MB | 1.0s | 0.1s | lossless |
+
+BF16 is the case that matters: it is what most fine-tuning emits, and it is the reason reminis parses the format directly rather than through `safetensors.numpy`, which cannot load BF16 at all. The conversion is verified bit-identical to PyTorch in both directions, across normal values, subnormals, infinities, and NaN.
+
+### LoRA adapters against peft
+
+A rank-16 adapter on SmolLM2-135M (BF16 base, all 7 projection types targeted, 210 modules), converted to a pack, applied, and compared tensor-by-tensor against peft's own `merge_and_unload()`:
+
+| Check | Result |
+|---|---|
+| Tensors byte-identical to peft's merge | **272 / 272** |
+| Worst relative difference | 0.000e+00 |
+| Worst gap in BF16 representable steps | 0 |
+| Pack size | 17.3 MB (6.7% of the 256.6 MB base) |
+
+Bit-exact agreement with peft, on a BF16 base where rounding could have shown up and did not.
 
 ### Diff and apply at scale
 
@@ -113,14 +144,19 @@ Every tensor gets its own row with full metadata:
 
 | Column | Description |
 |--------|-------------|
-| `name` | Tensor path (e.g. `blk.5.attn_q.weight`) |
+| `name` | Tensor path (e.g. `blk.5.attn_q.weight`, or `model.layers.5.self_attn.q_proj.weight` from safetensors) |
 | `shape` | Dimensions as JSON (e.g. `[576, 576]`) |
-| `dtype` | Data type (`F16`, `F32`, `Q4_K`, `Q8_0`, etc.) |
+| `dtype` | Data type (`F16`, `F32`, `BF16`, `Q4_K`, `Q8_0`, etc.) |
+| `dtype_id` | Numeric type id — see the note below |
 | `n_elements` | Number of parameters |
 | `n_bytes` | Storage size in bytes |
 | `data` | Raw weight data as BLOB |
 
-All model metadata (architecture, context length, vocab size, etc.) is stored in a `model_meta` table.
+`shape` is stored **reversed relative to the data layout**, which is GGUF's convention; reminis keeps it for every format so one set of code reads both. A safetensors tensor of logical shape `[out, in]` is stored as `[in, out]` and un-reversed on export.
+
+`dtype_id` means different things in different databases — a GGML enum value for GGUF-sourced models, a reminis-local id for safetensors ones — so `model_meta` records which system applies under `reminis.dtype_system`. Read the `dtype` name unless you specifically need the id.
+
+All model metadata (architecture, context length, vocab size, etc.) is stored in a `model_meta` table. For safetensors models this is populated from the sibling `config.json` under `config.*` keys, since the format itself carries almost no metadata of its own.
 
 ## Query Your Model
 
@@ -207,13 +243,29 @@ NOTE: this is a lossy pack (120 tensors low-rank encoded). The result is not
 byte-identical to the original target; worst per-tensor relative error is 1.16e-04.
 ```
 
+## LoRA adapters ship as exact delta packs
+
+A LoRA adapter already *is* a low-rank delta — peft saves `lora_A` and `lora_B`, and the update it applies is `(alpha / r) * B @ A`. That is the same structure as a reminis low-rank pack, except the factors are the real ones rather than an SVD approximation of a finished merge.
+
+So `reminis lora` converts an adapter with no SVD, no merge, and no approximation error:
+
+```bash
+reminis lora ./my-adapter/ base.db -o capability.pack.db
+reminis apply base.db capability.pack.db -o merged.db
+```
+
+Verified against peft itself: the applied result is compared tensor-by-tensor against `merge_and_unload()`, on a toy float32 model and on a real BF16 SmolLM2-135M with 210 targeted modules. **Every tensor came out byte-identical to peft's own merge** in both cases — not merely close. The tests still assert a tolerance rather than byte-equality, since that is the property that actually matters and a mis-applied `alpha / r` would blow past it by orders of magnitude.
+
+`modules_to_save` tensors — ones peft trained outright rather than through a factor pair — are carried in the pack in full. Embedding LoRA (`lora_embedding_A/B`) is not handled yet, and reminis refuses such an adapter rather than writing a pack that quietly omits part of it.
+
 ## Python API
 
 ```python
-from reminis import gguf_to_sqlite, sqlite_to_gguf
+from reminis import gguf_to_sqlite, safetensors_to_sqlite, sqlite_to_gguf
 
-# Convert
+# Convert, from either format
 db_path = gguf_to_sqlite("model.gguf")
+db_path = safetensors_to_sqlite("./Llama-3.2-1B/")
 
 # Query with standard sqlite3
 import sqlite3
@@ -229,6 +281,8 @@ sqlite_to_gguf(db_path, "model_restored.gguf")
 
 ## Supported Formats
 
+### GGUF
+
 All GGUF tensor types are supported and verified, including:
 
 | Type | Description | Verified |
@@ -238,6 +292,18 @@ All GGUF tensor types are supported and verified, including:
 | Q8_0 | 8-bit quantized | Yes |
 | Q3_K, Q5_0, Q5_1 | Other quants | Yes |
 | IQ3_S, IQ4_NL, IQ4_XS | Importance-weighted quants | Yes |
+
+### Safetensors
+
+Read and written with numpy alone — the format is an 8-byte header length, a JSON header, and raw bytes, so no extra dependency is needed. Single-file, sharded (`model.safetensors.index.json`), and directory inputs all work, and a sibling `config.json` is ingested into `model_meta` and rebuilt on export.
+
+**BF16 is fully supported**, which is the point: it is what most fine-tuning produces, and `safetensors.numpy` cannot load it at all. reminis converts BF16 with round-to-nearest-even, verified bit-identical to PyTorch in both directions.
+
+Note that GGUF and safetensors use different tensor names (`blk.0.attn_q.weight` vs `model.layers.0.self_attn.q_proj.weight`) and different `dtype_id` spaces, so:
+
+- Exporting a safetensors-sourced database as GGUF is refused, rather than writing a file whose dtype ids mean something else.
+- Exporting a GGUF-sourced database as safetensors works when every dtype has an equivalent (F32/F16/BF16 and the integer types). Quantized GGML types have none, and are refused.
+- Diffing a GGUF base against a safetensors fine-tune is not supported; the fingerprint check catches it and fails clearly.
 
 ## Roadmap
 
@@ -250,7 +316,8 @@ All GGUF tensor types are supported and verified, including:
 - [x] Delta packs with verified apply (`reminis apply`)
 - [x] Validated to 7B across llama / qwen2 / granitemoe / clip
 - [x] Low-rank delta encoding for LoRA fine-tunes (`--lossy`)
-- [ ] Safetensors input, for the transformers/peft workflow
+- [x] Safetensors input and output, sharded and BF16 (`reminis convert ./model/`)
+- [x] peft LoRA adapters as exact delta packs (`reminis lora`)
 - [ ] Fine-tune tracking with edit logs
 - [ ] Surgical rollback of bad training steps
 - [ ] Model merging via SQL operations

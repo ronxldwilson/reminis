@@ -15,14 +15,18 @@ wheels/
 *.db-shm
 *.db-wal
 
-# GGUF models (large, user-provided)
+# Model files (large, user-provided)
 *.gguf
+*.safetensors
 
 # Generated viewers
 *.html
 
 # Test model working directory
 models/
+
+# Test scratch directories
+tests/tmp_*/
 
 # IDE
 .idea/
