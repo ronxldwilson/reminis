@@ -722,6 +722,25 @@ const TENSOR_EXPLANATIONS = {{
   "ffn_down": "The <strong>down projection</strong> compresses the FFN's wider representation back to the model's main dimension. Information is distilled on the way through.",
   "ffn_norm": "The <strong>FFN layer norm</strong> normalizes values before the feed-forward network. Same purpose as attn_norm but for the FFN sub-layer.",
 
+  // State-space (Mamba) tensors. These models have no attention at all: the
+  // block mixes across time with a recurrent scan instead.
+  "ssm_in": "The <strong>input projection</strong> of a state-space (Mamba) block. It expands the token representation into the wider inner dimension the recurrent scan runs in.",
+  "ssm_conv1d": "The <strong>short causal convolution</strong> in a Mamba block. Before the recurrent scan, each channel is mixed over a small window of recent tokens &mdash; a cheap local-context pass that attention would otherwise have to pay for.",
+  "ssm_x": "The <strong>selection projection</strong> in a Mamba block. It reads the current token and produces the per-token values of <code>B</code>, <code>C</code>, and the timestep, which is what makes the state space <em>selective</em> rather than fixed.",
+  "ssm_dt": "The <strong>timestep (delta) projection</strong> in a Mamba block. It decides, per token and per channel, how much the recurrent state should be updated versus carried forward &mdash; effectively a learned forget gate.",
+  "ssm_a": "The <strong>state transition matrix</strong> <code>A</code> of a Mamba block, stored in log form. It governs how the hidden state decays as the scan moves forward, so it controls how far back information survives.",
+  "ssm_d": "The <strong>skip (D) parameter</strong> of a Mamba block: a direct per-channel path from input to output that bypasses the recurrent state, much like a residual connection inside the scan.",
+  "ssm_out": "The <strong>output projection</strong> of a state-space block. It projects the scan's result back down to the model's main dimension.",
+  "ssm_norm": "The <strong>normalization inside the state-space block</strong>, applied to the scan output before it is projected back down.",
+
+  // RWKV tensors. Another attention-free design: time mixing carries
+  // information across tokens, channel mixing plays the role of the FFN.
+  "time_mix": "Part of RWKV's <strong>time mixing</strong> block, which is what replaces attention. Instead of comparing every token against every other, it carries a running state forward with a learned per-channel decay, so cost stays constant per token.",
+  "time_decay": "The <strong>decay rates</strong> in an RWKV time-mixing block. Each channel forgets the past at its own learned speed, which is how the model keeps some information for a long time and other information only briefly.",
+  "time_first": "The <strong>current-token bonus</strong> in RWKV time mixing. It gives the token being processed right now extra weight relative to the decayed history.",
+  "channel_mix": "RWKV's <strong>channel mixing</strong> block. It plays the same role the feed-forward network plays in a transformer: transform each position's representation, with no mixing across positions.",
+  "token_shift": "The <strong>token shift</strong> in RWKV. Each block blends the current token's vector with the previous one before mixing, giving the model a cheap one-step look backwards.",
+
   // PyTorch / safetensors spellings of the same tensors. A model imported from
   // safetensors uses these names throughout, so without them every tensor
   // would fall back to the generic explanation.
@@ -779,6 +798,139 @@ function getBlockInfo(name) {{
 function getLayerFromName(name) {{
   const info = getBlockInfo(name);
   return info ? info.idx : -1;
+}}
+
+// Metadata keys are namespaced by architecture (`granitemoe.expert_count`,
+// `mamba.ssm.state_size`), and the prefix is whatever `general.architecture`
+// says. Matching on the suffix avoids having to know the family up front.
+function metaNum(suffix) {{
+  for (const [k, v] of Object.entries(DATA.meta)) {{
+    if (k === suffix || k.endsWith("." + suffix)) {{
+      const n = Number(v);
+      if (Number.isFinite(n)) return n;
+    }}
+  }}
+  return null;
+}}
+
+// What a tensor does inside its block.
+//
+// Hardcoding an attention box and an FFN box only describes transformers. A
+// Mamba model has neither: every block is `ssm_*` plus one norm, so the old
+// diagram drew a Feed-Forward box reading 0 B and an attention box holding
+// nothing but a layer norm. Classifying by role instead lets each block show
+// the parts it actually has.
+//
+// Order matters. `moe` is tested before `ffn` because expert tensors are also
+// named `ffn_*`, and the recurrent roles are tested before `attn` because
+// RWKV names its norms `attn_norm` despite having no attention.
+const BLOCK_ROLES = [
+  {{
+    // The router is what makes a MoE model cheap, so it gets its own box
+    // rather than disappearing into the experts it selects.
+    key: "router", label: "Router", rgb: "241,161,79", order: 2,
+    parts: "Picks the experts per token",
+    test: n => /ffn_gate_inp|\\.gate\\.weight$|router/.test(n),
+  }},
+  {{
+    key: "moe", label: "Experts", rgb: "188,140,255", order: 3,
+    parts: "Stacked feed-forward experts",
+    test: n => /(_exps)(\\.|$)|experts\\./.test(n),
+  }},
+  {{
+    key: "ssm", label: "State Space (SSM)", rgb: "210,153,34", order: 1,
+    parts: "in, conv1d, x, dt, A, D, out",
+    test: n => /ssm_|conv1d|mamba/.test(n),
+  }},
+  {{
+    key: "timemix", label: "Time Mixing", rgb: "210,153,34", order: 1,
+    parts: "RWKV's replacement for attention",
+    test: n => /time_mix|time_decay|time_first|time_faaaa|time_maa|token_shift/.test(n),
+  }},
+  {{
+    key: "channelmix", label: "Channel Mixing", rgb: "63,185,80", order: 3,
+    parts: "RWKV's feed-forward",
+    test: n => /channel_mix/.test(n),
+  }},
+  {{
+    key: "attn", label: "Self-Attention", rgb: "88,166,255", order: 1,
+    parts: "Q, K, V, Output",
+    test: n => /attn|attention/.test(n),
+  }},
+  {{
+    key: "ffn", label: "Feed-Forward", rgb: "63,185,80", order: 3,
+    parts: "Gate, Up, Down",
+    test: n => /ffn_|mlp\\.|gate_proj|up_proj|down_proj/.test(n),
+  }},
+];
+
+// Norms are counted in the block total but never get their own box: they are a
+// few kilobytes next to megabytes, and a box for them would read as a stage of
+// computation rather than the stabiliser it is.
+function isNormTensor(name) {{
+  return /norm|layernorm|ln_\d|ln_f/.test(name);
+}}
+
+function classifyBlockTensor(name) {{
+  if (isNormTensor(name)) return "norm";
+  for (const role of BLOCK_ROLES) {{
+    if (role.test(name)) return role.key;
+  }}
+  return "other";
+}}
+
+// Mixture-of-Experts summary, or null for a dense model.
+//
+// The interesting number is not the file size: it is how much of the model runs
+// for any one token. A router picks `expert_used_count` of `expert_count`
+// experts, so the rest of the expert weights sit idle on every forward pass.
+function getMoEInfo() {{
+  const expertTensors = DATA.tensors.filter(t => /(_exps)(\\.|$)|experts\\./.test(t.name));
+  if (expertTensors.length === 0) return null;
+
+  const routers = DATA.tensors.filter(t => /ffn_gate_inp|\\.gate\\.weight$|router/.test(t.name));
+
+  // Metadata is authoritative, but the key depends on where the model came
+  // from: GGUF writes `<arch>.expert_count`, a HuggingFace config writes
+  // `num_local_experts` or `n_routed_experts`.
+  let total = metaNum("expert_count") || metaNum("num_local_experts")
+    || metaNum("n_routed_experts") || metaNum("num_experts");
+  if (!total) {{
+    // GGUF stacks every expert into one 3-D tensor, so the count is its
+    // trailing dimension. Safetensors keeps them separate and numbered, so
+    // the count is the highest index seen.
+    const s = expertTensors[0].shape;
+    if (s.length === 3) {{
+      total = s[s.length - 1];
+    }} else {{
+      let maxIdx = -1;
+      expertTensors.forEach(t => {{
+        const m = t.name.match(/experts\\.(\d+)\\./);
+        if (m) maxIdx = Math.max(maxIdx, parseInt(m[1]));
+      }});
+      if (maxIdx >= 0) total = maxIdx + 1;
+    }}
+  }}
+  const used = metaNum("expert_used_count") || metaNum("num_experts_per_tok")
+    || metaNum("num_experts_per_token");
+
+  const expertParams = expertTensors.reduce((a, t) => a + t.n_elements, 0);
+  const expertBytes = expertTensors.reduce((a, t) => a + t.n_bytes, 0);
+  const activeExpertParams = (total && used) ? Math.round(expertParams / total * used) : null;
+
+  return {{
+    total: total, used: used,
+    routerCount: routers.length,
+    routerBytes: routers.reduce((a, t) => a + t.n_bytes, 0),
+    tensorCount: expertTensors.length,
+    expertParams: expertParams,
+    expertBytes: expertBytes,
+    activeExpertParams: activeExpertParams,
+    // Everything that is not an expert runs on every token.
+    activeParams: activeExpertParams === null
+      ? null
+      : DATA.total_params - expertParams + activeExpertParams,
+  }};
 }}
 
 // Header
@@ -858,19 +1010,66 @@ function buildArchDiagram() {{
   }});
   const numLayers = Object.keys(layers).length;
   const numVision = Object.keys(visionLayers).length;
-  const embeds = DATA.tensors.filter(t => t.name.includes("token_embd"));
-  const norms = DATA.tensors.filter(t => t.name.includes("output_norm"));
-  const outputs = DATA.tensors.filter(t => t.name === "output.weight");
+  // Both naming conventions again: GGUF's `token_embd`/`output_norm`/`output`
+  // and PyTorch's `embed_tokens`/`model.norm`/`lm_head`.
+  const embeds = DATA.tensors.filter(t => /token_embd|embed_tokens/.test(t.name));
+  const norms = DATA.tensors.filter(t => /output_norm|^(?:model\.)?norm\.weight$/.test(t.name));
+  const outputs = DATA.tensors.filter(t => t.name === "output.weight" || /lm_head/.test(t.name));
+
+  // Not every stack is a transformer stack, so the wording follows what the
+  // blocks actually contain rather than assuming attention is in there.
+  const allBlockTensors = Object.values(layers).flat();
+  const roleKeys = new Set(allBlockTensors.map(t => classifyBlockTensor(t.name)));
+  const isSSM = roleKeys.has("ssm");
+  const isRWKV = roleKeys.has("timemix") || roleKeys.has("channelmix");
+  const hasAttn = roleKeys.has("attn") && allBlockTensors.some(
+    t => classifyBlockTensor(t.name) === "attn" && !isNormTensor(t.name));
+  let blockNoun = hasAttn ? "transformer block" : "block";
+  if ((isSSM || isRWKV) && hasAttn) blockNoun = "hybrid block";
+  else if (isSSM) blockNoun = "state-space block";
+  else if (isRWKV) blockNoun = "RWKV block";
+
+  const HOW_IT_WORKS = hasAttn
+    ? "A large language model processes text by converting words into numbers (embeddings), then passing them through a stack of <strong>transformer blocks</strong>. Each block has two parts: <strong>self-attention</strong> (which lets every word look at every other word to understand context) and a <strong>feed-forward network</strong> (which transforms the representation). After all blocks, the output layer converts the final numbers back into a probability for each possible next word."
+    : "This model has <strong>no attention layers</strong>. Instead of letting every token look at every other token &mdash; which costs more the longer the text gets &mdash; it carries a fixed-size <strong>recurrent state</strong> forward as it reads, updating that state one token at a time. The cost per token stays flat no matter how long the context is, at the price of having to compress the past into that state rather than being able to look it up. Everything else is familiar: embeddings in, a stack of blocks, an output projection back to vocabulary probabilities.";
 
   let html = `<div style="max-width:700px;margin:0 auto;">`;
 
   const intro = numLayers > 0
-    ? "This shows how the model's layers are stacked. Text flows from top (input) to bottom (output), passing through each transformer block."
+    ? `This shows how the model's layers are stacked. Text flows from top (input) to bottom (output), passing through each ${{blockNoun}}.`
     : "This file's components are shown below.";
   html += `<p style="color:var(--text2);font-size:13px;margin-bottom:16px;">
     ${{intro}}
-    <span class="info-btn" onclick="showInfo(this,'How an LLM works','A large language model processes text by converting words into numbers (embeddings), then passing them through a stack of <strong>transformer blocks</strong>. Each block has two parts: <strong>self-attention</strong> (which lets every word look at every other word to understand context) and a <strong>feed-forward network</strong> (which transforms the representation). After all blocks, the output layer converts the final numbers back into a probability for each possible next word.')">i</span>
+    <span class="info-btn" onclick="showInfo(this,'How this model works','${{HOW_IT_WORKS.replace(/'/g,"&#39;")}}')">i</span>
   </p>`;
+
+  // Mixture-of-Experts summary. Parameter count and working set are the same
+  // number for a dense model and very different ones here, so a file size on
+  // its own would overstate what actually runs per token.
+  const moe = getMoEInfo();
+  if (moe && moe.total) {{
+    const routed = moe.used ? `${{moe.total}} experts &middot; ${{moe.used}} active per token` : `${{moe.total}} experts`;
+    let activeLine = "";
+    if (moe.activeParams !== null) {{
+      const pct = (100 * moe.activeParams / DATA.total_params).toFixed(0);
+      activeLine = `<div style="font-size:12px;color:var(--text2);margin-top:6px;">
+        <strong style="color:var(--text);">${{fmtNum(moe.activeParams)}}</strong> of ${{fmtNum(DATA.total_params)}} parameters run for any one token (${{pct}}%).
+        The other ${{fmtNum(DATA.total_params - moe.activeParams)}} sit in experts the router did not pick.
+      </div>`;
+    }}
+    html += `<div style="border:1px solid rgba(188,140,255,0.35);border-radius:8px;padding:16px;margin-bottom:20px;background:rgba(188,140,255,0.07);">
+      <div style="display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap;">
+        <span style="font-weight:600;">Mixture of Experts
+          <span class="info-btn" onclick="showInfo(this,'Mixture of Experts','Instead of one feed-forward network per block, this model holds <strong>${{moe.total}}</strong> of them, called experts. A small <strong>router</strong> (<code>ffn_gate_inp</code>) scores the experts for each token and runs only the top ${{moe.used || "few"}}. That is why a MoE model can hold a large number of parameters while costing far less than that to run: every token pays for the router, the attention layers, and its own handful of experts &mdash; not the whole file. The experts are stored stacked, so one tensor such as <code>ffn_gate_exps</code> holds every expert&#39;s gate matrix in a single 3-D array.')">i</span>
+        </span>
+        <span style="font-size:12px;color:var(--text2);font-family:var(--mono);">${{routed}} &middot; ${{fmtBytes(moe.expertBytes)}} of experts</span>
+      </div>
+      ${{activeLine}}
+      ${{moe.routerCount > 0 ? `<div style="font-size:12px;color:var(--text2);margin-top:6px;">
+        Routing is learned: ${{moe.routerCount}} router tensor${{moe.routerCount === 1 ? "" : "s"}} totalling ${{fmtBytes(moe.routerBytes)}} decide which experts each token reaches.
+      </div>` : ""}}
+    </div>`;
+  }}
 
   // A vision tower is a separate stack. Rendering it inline with the text
   // blocks would imply text flows through it, which it does not.
@@ -910,20 +1109,20 @@ function buildArchDiagram() {{
 
   if (showDetailed) {{
     layerKeys.forEach(idx => {{
-      html += buildLayerBlock(idx, layers[idx]);
+      html += buildLayerBlock(idx, layers[idx], moe);
     }});
   }} else {{
     // Show first 2, collapsed middle, last 2
     layerKeys.slice(0, 2).forEach(idx => {{
-      html += buildLayerBlock(idx, layers[idx]);
+      html += buildLayerBlock(idx, layers[idx], moe);
     }});
     const middle = numLayers - 4;
     html += `<div style="border:1px dashed var(--border);border-radius:8px;padding:16px;text-align:center;color:var(--text2);margin-bottom:2px;font-size:13px;">
-      &#8942; ${{middle}} more transformer blocks (same structure) &#8942;
+      &#8942; ${{middle}} more ${{blockNoun}}s (same structure) &#8942;
     </div>`;
     html += `<div style="text-align:center;color:var(--text2);font-size:18px;line-height:1;">&#8595;</div>`;
     layerKeys.slice(-2).forEach(idx => {{
-      html += buildLayerBlock(idx, layers[idx]);
+      html += buildLayerBlock(idx, layers[idx], moe);
     }});
   }}
 
@@ -947,29 +1146,56 @@ function buildArchDiagram() {{
   document.getElementById("archDiagram").innerHTML = html;
 }}
 
-function buildLayerBlock(idx, tensors) {{
-  const attnTensors = tensors.filter(t => t.name.includes("attn"));
-  const ffnTensors = tensors.filter(t => t.name.includes("ffn"));
-  const attnBytes = attnTensors.reduce((a,t) => a+t.n_bytes, 0);
-  const ffnBytes = ffnTensors.reduce((a,t) => a+t.n_bytes, 0);
+function buildLayerBlock(idx, tensors, moe) {{
   const totalBytes = tensors.reduce((a,t) => a+t.n_bytes, 0);
+
+  // Only draw boxes for the roles this block actually contains. A dense
+  // transformer gets two; a Mamba block gets one; a hybrid model gets whatever
+  // that particular block holds, which is the point.
+  const groups = BLOCK_ROLES
+    .map(role => ({{ role: role, tensors: tensors.filter(t => classifyBlockTensor(t.name) === role.key) }}))
+    .filter(g => g.tensors.length > 0)
+    // Array order is match order (`moe` has to be tried before `ffn`, whose
+    // names it shares); `order` is draw order, so a block always reads in the
+    // sequence the data flows through it: mixing first, then the per-token
+    // transform.
+    .sort((a, b) => a.role.order - b.role.order);
+
+  let boxes = "";
+  if (groups.length === 0) {{
+    // An architecture we do not recognise. Saying nothing beats drawing empty
+    // boxes labelled with parts the model does not have.
+    const kinds = [...new Set(tensors.map(
+      t => t.name.replace(/^(?:v\\.)?blk\\.\d+\\.|^(?:model\\.)?layers\\.\d+\\./, "")))].slice(0, 6);
+    boxes = `<div style="background:var(--bg3);border:1px solid var(--border);border-radius:6px;padding:10px;text-align:center;">
+      <div style="font-size:12px;font-weight:600;">Block weights</div>
+      <div style="font-size:11px;color:var(--text2);margin-top:2px;font-family:var(--mono);">${{kinds.join(", ")}}</div>
+      <div style="font-size:11px;color:var(--text2);">${{fmtBytes(totalBytes)}}</div>
+    </div>`;
+  }} else {{
+    boxes = groups.map(g => {{
+      const bytes = g.tensors.reduce((a,t) => a+t.n_bytes, 0);
+      let parts = g.role.parts;
+      if (g.role.key === "moe" && moe && moe.total) {{
+        parts = moe.used
+          ? `${{moe.total}} experts, ${{moe.used}} active per token`
+          : `${{moe.total}} experts`;
+      }}
+      return `<div style="background:rgba(${{g.role.rgb}},0.1);border:1px solid rgba(${{g.role.rgb}},0.25);border-radius:6px;padding:10px;text-align:center;">
+        <div style="font-size:12px;font-weight:600;color:rgb(${{g.role.rgb}});">${{g.role.label}}</div>
+        <div style="font-size:11px;color:var(--text2);margin-top:2px;">${{parts}}</div>
+        <div style="font-size:11px;color:var(--text2);">${{fmtBytes(bytes)}}</div>
+      </div>`;
+    }}).join("");
+  }}
 
   let html = `<div style="border:1px solid var(--border);border-radius:8px;padding:16px;margin-bottom:2px;background:var(--bg2);">
     <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px;">
       <span style="font-weight:600;font-size:14px;">Block ${{idx}}</span>
       <span style="font-size:12px;color:var(--text2);font-family:var(--mono);">${{tensors.length}} tensors &middot; ${{fmtBytes(totalBytes)}}</span>
     </div>
-    <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;">
-      <div style="background:rgba(88,166,255,0.1);border:1px solid rgba(88,166,255,0.2);border-radius:6px;padding:10px;text-align:center;">
-        <div style="font-size:12px;font-weight:600;color:var(--accent);">Self-Attention</div>
-        <div style="font-size:11px;color:var(--text2);margin-top:2px;">Q, K, V, Output</div>
-        <div style="font-size:11px;color:var(--text2);">${{fmtBytes(attnBytes)}}</div>
-      </div>
-      <div style="background:rgba(63,185,80,0.1);border:1px solid rgba(63,185,80,0.2);border-radius:6px;padding:10px;text-align:center;">
-        <div style="font-size:12px;font-weight:600;color:var(--green);">Feed-Forward</div>
-        <div style="font-size:11px;color:var(--text2);margin-top:2px;">Gate, Up, Down</div>
-        <div style="font-size:11px;color:var(--text2);">${{fmtBytes(ffnBytes)}}</div>
-      </div>
+    <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:8px;">
+      ${{boxes}}
     </div>
   </div>`;
   html += `<div style="text-align:center;color:var(--text2);font-size:18px;line-height:1;">&#8595;</div>`;

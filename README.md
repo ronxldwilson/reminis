@@ -67,11 +67,34 @@ Every tensor is SHA256-hashed before and after the round-trip. These architectur
 | `qwen2` | Qwen2.5-0.5B-Instruct FP16 | 291 | 1208 MB | 14.4s | 0.9s | lossless |
 | `granitemoe` | Granite-3.1-1B-A400M Q4_K_M | 242 | 784 MB | 6.5s | 0.5s | lossless |
 | `clip` (vision) | SmolVLM-256M projector F16 | 198 | 181 MB | 1.0s | 0.1s | lossless |
+| `mamba` | Mamba-130M Q4_K_M | 242 | 86 MB | 1.7s | 0.04s | lossless |
+| `rwkv7` | RWKV7-G1h-1.5B Q2_K | 678 | 644 MB | 3.5s | 0.4s | lossless |
 | `llama` | SmolLM-135M, 9 quantizations | 272 | 84–258 MB | ~2s | ~0.1s | lossless |
 
 The MoE model is the interesting one: 72 of its tensors are **3-dimensional** expert stacks (e.g. `[512, 1024, 32]` in Q6_K), a shape the quantized export path had never seen. It generalizes correctly.
 
+Mamba and RWKV7 are there because they are not transformers at all — no attention, no feed-forward network — and the RWKV7 file mixes BF16 tensors into a GGUF alongside Q2_K and Q6_K. Both round-trip byte-for-byte.
+
 Throughput is roughly linear with size — about 120 MB/s converting, over 1 GB/s exporting.
+
+### The architecture diagram
+
+`reminis view` builds each block out of the tensors that are actually in it, instead of assuming every model is a transformer:
+
+| Family | What a block shows |
+|---|---|
+| Dense transformer | Self-Attention, then Feed-Forward |
+| Mixture of Experts | Self-Attention, then the expert stack and its router |
+| Mamba / state space | State Space (SSM) — no attention, because there is none |
+| RWKV | Time Mixing, then Channel Mixing |
+| Hybrid (attention in some blocks, a scan in others) | whichever of those that block holds |
+| Anything unrecognised | the block's tensors and their size, with no invented labels |
+
+For a MoE model the diagram also answers the question the file size cannot. Granite-3.1-1B-A400M reads **428.7M of 1.33B parameters run for any one token (32%)** — the router picks 8 of 32 experts, so the remaining 906M sit idle on every forward pass. That 428.7M is a good check on the arithmetic: it is the "A400M" in the model's own name.
+
+Both naming conventions are handled, so a MoE model imported from safetensors (experts stored one per tensor, `num_local_experts` in the config) reports the same numbers as one imported from GGUF (experts stacked into 3-D tensors, `expert_count` in the metadata).
+
+`tests/test_viewer.py` renders the diagram under node with a stub DOM and asserts on what it produces, since the diagram is built by JavaScript at page load and checking the HTML for a string would prove nothing. It skips when node is not on PATH.
 
 ### Safetensors
 
@@ -471,7 +494,7 @@ Note that GGUF and safetensors use different tensor names (`blk.0.attn_q.weight`
 - [x] Interactive HTML viewer (`reminis view`)
 - [x] Weight diffing between model versions (`reminis diff`)
 - [x] Delta packs with verified apply (`reminis apply`)
-- [x] Validated to 7B across llama / qwen2 / granitemoe / clip
+- [x] Validated to 7B across llama / qwen2 / granitemoe / clip / mamba / rwkv7
 - [x] Low-rank delta encoding for LoRA fine-tunes (`--lossy`)
 - [x] Safetensors input and output, sharded and BF16 (`reminis convert ./model/`)
 - [x] peft LoRA adapters as exact delta packs (`reminis lora`)
@@ -479,6 +502,8 @@ Note that GGUF and safetensors use different tensor names (`blk.0.attn_q.weight`
 - [x] Hash-verified rewind to a snapshot (`reminis rollback`)
 - [x] Measured why *surgical* rollback of a mid-run step does not work
 - [x] Many models in one database, derived ones stored as deltas (`reminis registry`)
+- [x] MoE expert routing in the viewer: expert count, router, active-vs-total parameters
+- [x] Attention-free architectures in the viewer (Mamba / state space, RWKV, hybrids)
 - [ ] Model merging via SQL operations
 - [ ] Inference from database-stored weights
 - [ ] Unsloth integration
