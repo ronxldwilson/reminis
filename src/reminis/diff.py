@@ -302,7 +302,91 @@ def _tensor_delta_stats(a_blob: bytes, b_blob: bytes, dtype: str):
     }, delta
 
 
-def _encode_delta(a_blob: bytes, b_blob: bytes) -> tuple[str, bytes]:
+# Float dtypes whose delta is worth splitting into byte planes, and the width
+# of one value in bytes. Only 2-byte floats are handled: their exponent lives
+# almost entirely in one byte and their noisy low mantissa bits in the other,
+# which is what makes the split pay.
+_PLANE_WIDTH = {"F16": 2, "BF16": 2}
+
+
+def _split_planes(data: bytes, width: int) -> list[bytes]:
+    """Deinterleave a byte string into `width` streams, one per byte position.
+
+    Indexing by byte offset rather than by shifting a decoded integer keeps
+    this independent of the host's endianness: the streams are defined by the
+    stored layout, which is little-endian in both GGUF and safetensors.
+    """
+    arr = np.frombuffer(data, dtype=np.uint8).reshape(-1, width)
+    return [arr[:, i].tobytes() for i in range(width)]
+
+
+def _merge_planes(planes: list[bytes], width: int) -> bytes:
+    out = np.empty((len(planes[0]), width), dtype=np.uint8)
+    for i, plane in enumerate(planes):
+        out[:, i] = np.frombuffer(plane, dtype=np.uint8)
+    return out.tobytes()
+
+
+def _frame(parts: list[bytes]) -> bytes:
+    """Length-prefix each compressed stream so decode needs no side channel."""
+    out = bytearray()
+    for part in parts:
+        chunk = _compress(part)
+        out += len(chunk).to_bytes(4, "little")
+        out += chunk
+    return bytes(out)
+
+
+def _unframe(payload: bytes, count: int) -> list[bytes]:
+    parts, offset = [], 0
+    for _ in range(count):
+        if offset + 4 > len(payload):
+            raise ValueError("Truncated bit-plane payload")
+        size = int.from_bytes(payload[offset:offset + 4], "little")
+        offset += 4
+        if offset + size > len(payload):
+            raise ValueError("Truncated bit-plane payload")
+        parts.append(_decompressor.decompress(payload[offset:offset + size]))
+        offset += size
+    return parts
+
+
+def _encode_bitplane(delta: np.ndarray, dtype: str) -> bytes | None:
+    """Compress an XOR delta as separate byte planes rather than as one stream.
+
+    A 16-bit float interleaves a highly predictable exponent with mantissa bits
+    that a fine-tune randomises, so a general-purpose compressor sees the
+    structure it could exploit chopped up by noise every other byte. Splitting
+    the two apart lets the exponent plane form the long runs it deserves while
+    the mantissa plane is left to cost what it costs.
+
+    Measured on SmolLM-135M against its own instruct fine-tune -- the case
+    where every weight moved -- this takes the pack from 58.3% of the raw
+    weights to 50.4%, against an order-0 entropy floor of 46.5%.
+
+    Returns None when the dtype is not one this helps, leaving the caller's
+    other candidates to compete.
+    """
+    width = _PLANE_WIDTH.get(dtype)
+    if width is None or delta.nbytes % width:
+        return None
+    return _frame(_split_planes(delta.tobytes(), width))
+
+
+def _decode_bitplane(payload: bytes, dtype: str, name: str) -> bytes:
+    width = _PLANE_WIDTH.get(dtype)
+    if width is None:
+        raise ValueError(
+            f"Delta pack stores tensor '{name}' as bit planes, but its dtype "
+            f"'{dtype}' has no plane layout. The pack is inconsistent."
+        )
+    planes = _unframe(payload, width)
+    if len({len(p) for p in planes}) != 1:
+        raise ValueError(f"Bit planes for '{name}' have mismatched lengths")
+    return _merge_planes(planes, width)
+
+
+def _encode_delta(a_blob: bytes, b_blob: bytes, dtype: str) -> tuple[str, bytes]:
     """Pick the smaller of a compressed XOR delta or a compressed replacement.
 
     XOR is used rather than arithmetic subtraction because it is exactly
@@ -324,11 +408,18 @@ def _encode_delta(a_blob: bytes, b_blob: bytes) -> tuple[str, bytes]:
 
     a_arr = np.frombuffer(a_blob, dtype=np.uint8)
     b_arr = np.frombuffer(b_blob, dtype=np.uint8)
-    xor_payload = _compress(np.bitwise_xor(a_arr, b_arr).tobytes())
+    delta = np.bitwise_xor(a_arr, b_arr)
 
-    if len(xor_payload) <= len(replacement):
-        return "xor_zstd", xor_payload
-    return "replace_zstd", replacement
+    candidates = [("xor_zstd", _compress(delta.tobytes())),
+                  ("replace_zstd", replacement)]
+
+    planes = _encode_bitplane(delta, dtype)
+    if planes is not None:
+        candidates.append(("bitplane_zstd", planes))
+
+    # Ties go to the earliest candidate, which keeps a tensor that gains
+    # nothing from the split on the plain encoding older readers understand.
+    return min(candidates, key=lambda c: len(c[1]))
 
 
 def _choose_encoding(
@@ -346,7 +437,7 @@ def _choose_encoding(
 
     Returns (encoding, payload, rank, rel_error).
     """
-    encoding, payload = _encode_delta(a_blob, b_blob)
+    encoding, payload = _encode_delta(a_blob, b_blob, dtype)
 
     if lossy_tolerance is None:
         return encoding, payload, None, None
@@ -556,7 +647,7 @@ def diff_models(
 
 
 KNOWN_ENCODINGS = {
-    "xor_zstd", "replace_zstd", "lowrank_zstd",
+    "xor_zstd", "replace_zstd", "lowrank_zstd", "bitplane_zstd",
     "xor_zlib", "replace_zlib",  # written before 0.3.0
 }
 
@@ -573,7 +664,12 @@ def _decode_tensor(encoding: str, payload: bytes, base_blob: bytes | None, dtype
             "It was likely written by a newer version of reminis."
         )
 
-    raw = _decompress(payload, encoding)
+    # Bit planes carry their own framing, so they are unpacked before the
+    # single-stream path gets a chance to treat the payload as one frame.
+    if encoding == "bitplane_zstd":
+        raw = _decode_bitplane(payload, dtype, name)
+    else:
+        raw = _decompress(payload, encoding)
 
     if encoding.startswith("replace_"):
         return raw

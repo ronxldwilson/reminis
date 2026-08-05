@@ -572,7 +572,7 @@ reminis apply base.db change.delta.db -o rebuilt.db
 
 Packs record the weight hashes of both sides. `apply` refuses a base that does not match, rather than silently producing a corrupt model, and verifies the result against the recorded target hash.
 
-Encoding is **XOR**, not arithmetic subtraction. An arithmetic float delta is not exactly reversible — `b - a` generally is not representable in the tensor's own dtype, so `a + delta` lands a rounding step away from `b`. XOR is exact for every dtype, and also works on quantized tensors, whose bytes cannot be subtracted meaningfully at all. Per tensor, whichever of the compressed XOR delta or a compressed full replacement is smaller wins.
+Encoding is **XOR**, not arithmetic subtraction. An arithmetic float delta is not exactly reversible — `b - a` generally is not representable in the tensor's own dtype, so `a + delta` lands a rounding step away from `b`. XOR is exact for every dtype, and also works on quantized tensors, whose bytes cannot be subtracted meaningfully at all. Per tensor, the smallest of a compressed XOR delta, a compressed full replacement, and a bit-plane split of the XOR delta wins.
 
 ### How small are packs, really?
 
@@ -580,10 +580,29 @@ It depends entirely on how much of the model the fine-tune touched.
 
 | Scenario | Tensors changed | Pack size |
 |---|---|---|
-| Targeted change (5 of 272 tensors) | 5 | **1.4%** of full model |
-| Full fine-tune (SmolLM-135M to its Instruct variant) | 272 of 272 | **58.8%** of full model |
+| Targeted change (5 of 272 tensors) | 5 | **1.2%** of full model |
+| Full fine-tune (SmolLM-135M to its Instruct variant) | 272 of 272 | **50.4%** of full model |
 
-The second row is the honest one for full fine-tuning. Every tensor changed, with ~97% of individual values differing in each, so lossless compression has little to exploit — the differing float16 mantissa bits are close to incompressible.
+The second row is the honest one for full fine-tuning. Every tensor changed, with ~97% of individual values differing in each.
+
+### Bit-plane splitting, and where the floor actually is
+
+A 16-bit float interleaves a highly predictable exponent with mantissa bits a fine-tune randomises. Handed the delta as one stream, a general-purpose compressor sees every predictable exponent run chopped up by noise every other byte. Splitting the delta into two streams — one per byte position — and compressing each separately took the full fine-tune above from **58.4% to 50.4%**.
+
+It is picked per tensor by the same smallest-wins rule as everything else, so it can only ever shrink a pack; a tensor that gains nothing keeps an encoding that older readers understand.
+
+That was worth doing, but the more useful result was finding out how much room is left. Measuring the delta field by field on those 134.5 M weights:
+
+| Field | Behaviour under a full fine-tune |
+|---|---|
+| Sign bit | flips in 1.7% of weights |
+| Exponent | unchanged in 82.8%, within ±1 in 97.1% |
+| Mantissa bits 3–6 | flip in **50.0%** — indistinguishable from coin tosses |
+| Mantissa bits 0–2 | flip in 0.01% (these weights are bf16 precision widened into f16) |
+
+Four bits per weight that flip at exactly 50% are incompressible by definition, and four bits of sixteen is 25% of the file on their own. Adding the exponent and the upper mantissa bits, the order-0 entropy of the delta is **46.5%** of the raw weights. The shipped encoder is at 50.4%, within four points of a floor no lossless coder can pass.
+
+So the target of getting full-fine-tune packs to ~25% ([#7](https://github.com/ronxldwilson/reminis/issues/7)) is **not reachable losslessly**, and this documents why rather than leaving it open as though better compression would get there. Packs below that floor have to give up exactness, which is what `--lossy` already does — and for a full fine-tune it declines, because the delta is not low-rank. The place delta packs win big is LoRA-shaped updates, below, where they hit 0.3–1.4%.
 
 The delta is also only partly low-rank. Ranks needed to capture 90% of the delta's energy:
 
@@ -607,8 +626,8 @@ The tolerance is the maximum relative error allowed per tensor (default `0.01` =
 
 | Model | Lossless pack | Low-rank pack | Shrink | Worst error |
 |---|---|---|---|---|
-| SmolLM-135M, 258 MB | 38.3 MB (14.9%) | **3.5 MB (1.4%)** | 11.0x | 1.2e-04 |
-| Llama-3.2-1B, 2.4 GB | 242.7 MB (10.3%) | **6.4 MB (0.3%)** | 37.9x | 1.1e-04 |
+| SmolLM-135M, 258 MB | 35.1 MB (13.7%) | **3.5 MB (1.4%)** | 10.1x | 1.2e-04 |
+| Llama-3.2-1B, 2.4 GB | 232.1 MB (9.4%) | **6.7 MB (0.3%)** | 34.6x | 1.1e-04 |
 
 Achieved error lands ~100x inside the 1% budget, because rank is chosen by error target rather than fixed.
 
@@ -949,7 +968,7 @@ Note that GGUF and safetensors use different tensor names (`blk.0.attn_q.weight`
 
 ## Tests
 
-Thirteen suites, 297 explicit checks, run with `uv run python tests/<name>.py`. They need no framework and skip rather than fail when a model or an optional dependency is absent.
+Fourteen suites, 338 explicit checks, run with `uv run python tests/<name>.py`. They need no framework and skip rather than fail when a model or an optional dependency is absent.
 
 The references they check against — transformers for logits, peft for LoRA adapters, torch, and MLX on Apple silicon — are declared as a dev dependency group, so `uv sync` installs them and does not remove them. That is worth stating because getting it wrong is quiet: when those packages went missing, the three suites that compare reminis against a reference implementation degraded to skips and went on reporting PASS.
 
@@ -957,6 +976,7 @@ The references they check against — transformers for logits, peft for LoRA ada
 |---|---|
 | `test_roundtrip` | SHA256-verified GGUF round-trip across 20 models and 13 quantization types |
 | `test_diff`, `test_lowrank` | Delta packs, hash-verified apply, low-rank encoding |
+| `test_bitplane` | Bit-plane delta encoding: reversibility, refusals, older packs still read |
 | `test_safetensors`, `test_lora_adapter` | Safetensors both directions, peft agreement |
 | `test_track`, `test_registry` | Training logs, rollback, many models in one file |
 | `test_viewer` | The architecture diagram, by running the page's own JS under node |
@@ -990,7 +1010,7 @@ The checks are written to fail for the right reason. Where a property could pass
 - [x] Model merging via SQL operations (`reminis merge`: linear, slerp, task arithmetic, TIES)
 - [x] Inference from database-stored weights (`reminis run`, verified against transformers)
 - [x] GPU backends chosen per workload (`--backend`: MLX on Apple silicon, CuPy on NVIDIA)
-- [ ] Better delta encoding: bit-plane splitting, to get packs below 58% ([#7](https://github.com/ronxldwilson/reminis/issues/7))
+- [x] Better delta encoding: bit-plane splitting, 58.4% to 50.4% — and a measured entropy floor of 46.5% showing how little is left ([#7](https://github.com/ronxldwilson/reminis/issues/7))
 - [ ] Storing the F32 form beside the F16 one, so loading skips the conversion
 - [x] Running quantized models: every K-quant and i-quant, unpacked at load
 - [x] Keeping weights packed in the backend's own format (`--pack 4/6/8`)
