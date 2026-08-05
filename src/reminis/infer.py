@@ -6,12 +6,17 @@ are rows in ``model_meta``. So this module loads no config, downloads nothing,
 and imports neither torch nor llama.cpp -- it is numpy over the result of a
 ``SELECT``.
 
-The point is not speed. A pure-numpy forward pass is roughly an order of
-magnitude slower than llama.cpp, and it will stay that way. The point is that
-a reminis database is a *complete*, self-contained model rather than an
-archive of one: if it can generate text, then the conversion kept everything
-that mattered, and a merged or rolled-back or delta-applied database can be
-checked by asking it to speak rather than by comparing hashes.
+The point is not speed. It is that a reminis database is a *complete*,
+self-contained model rather than an archive of one: if it can generate text,
+then the conversion kept everything that mattered, and a merged or
+rolled-back or delta-applied database can be checked by asking it to speak
+rather than by comparing hashes.
+
+Speed, measured rather than assumed, turns out to be less embarrassing than
+expected -- roughly 0.7-0.9x llama.cpp's CPU token generation on the same
+F16 models, since both end up in the platform BLAS for the large matrix
+multiplies. Against llama.cpp on the GPU it is 2.5-3x slower, and against a
+quantized model it does not compete at all, because it cannot run one.
 
 ``--stream`` takes that further. In streaming mode no weight is ever cached:
 every matrix multiplication in every layer re-reads its operand from SQLite
