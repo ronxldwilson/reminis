@@ -24,7 +24,7 @@ The database is also still a *model*, not an archive of one: `reminis run` gener
 
 **It is not a runtime, and `reminis run` is not a way to serve a model.** It exists so a database can be checked by asking it to speak — after a merge, a rollback, or a delta apply, a hash tells you the bytes changed but cannot tell you the result is still a working model. That is a testing tool, and a genuinely useful one. It is not an inference engine, and three things stop it from becoming one:
 
-- It cannot run quantized weights at all, and quantization is the answer to running large models on small machines.
+- It runs quantized weights by *unpacking* them, so a quantized model becomes runnable but not small. `--pack` claws some of that back, at the cost of a second rounding llama.cpp never pays.
 - On the numpy backend it decodes weights to F32, so it holds **twice** the F16 file, where llama.cpp memory-maps the file as-is. (The MLX backend keeps float16 and does not, which is most of why it is faster.)
 - `--stream` costs about 1.2 seconds per gigabyte of model, per token, because every token re-reads and re-converts everything. Measured: 0.26 s/token for a 0.25 GB model, 2.74 s/token for a 2.31 GB one. A 70B would be around three minutes per token.
 
@@ -47,6 +47,7 @@ Where the small-machine story is real is *upstream* of inference: a 70B model ca
 | Ask questions about weights | any SQL client | The tensors are rows. Sort by magnitude, group by layer, join across models. |
 | Check a model still works after surgery | `reminis run` | It generates text, or it does not. |
 | Move between GGUF and safetensors | `reminis convert`, `reminis export` | Lossless in both directions, verified by SHA256. |
+| Run a quantized model you were given | `reminis run` | Every K-quant and i-quant, unpacked at load; `--pack` to keep it small. |
 
 ## How it compares
 
@@ -222,7 +223,7 @@ Against llama.cpp **on the GPU**, it is 2.6–2.8× slower at generation and 8�
 Two caveats point the other way, and neither is fixable by tuning:
 
 - reminis decodes every weight to F32 and keeps it there, so it holds **twice the F16 file** in memory where llama.cpp memory-maps the file as-is. Token generation is bandwidth-bound, so that accounts for much of the remaining gap by itself.
-- The comparison is confined to F16 because reminis cannot run quantized weights at all. The same SmolLM at Q4_K_M does 178 tg on Metal out of a 99 MB file — a model reminis can store, diff, merge and export losslessly, but not yet run.
+- The comparison is confined to F16 for a like-for-like matmul. reminis does run quantized models now — see below — but by unpacking them, where llama.cpp multiplies the original blocks directly and pays no second rounding.
 
 Then there is `--stream`, which is a demonstration rather than a capability:
 
@@ -232,6 +233,27 @@ Then there is `--stream`, which is a demonstration rather than a capability:
 | Llama-3.2-1B f16 | 2.31 GB | 2.74 s/token |
 
 Nothing is cached, so every token re-reads and re-converts the entire model — eight tokens of SmolLM read **2,796 MB across 2,457 queries** out of a 258 MB file. Peak memory is one layer instead of one model, which sounds like it should let a large model run on a small machine. It does not. The cost is flatly linear in model size, about 1.2 seconds per gigabyte per token, so a 7B lands near 17 s/token and a 70B near three minutes. `--stream` shows that the weights are genuinely data paged in on demand; it is not a way to run a model that would not otherwise fit, and llama.cpp already memory-maps its files for exactly that case.
+
+### Quantized models
+
+Quantized tensors are unpacked at load through the `gguf` package, which reminis already depends on for reading the format. Every quantization llama.cpp writes works, including the i-quants: **Q2_K, Q3_K_M, Q4_K_M, Q5_K_M, Q6_K, Q8_0, IQ3_M, IQ4_XS** all generate coherent text.
+
+The check that matters is not that it generates — wrong block arithmetic still produces fluent nonsense — but that the unpacked weights match the floats they were quantized from. The same SmolLM-135M exists here in both Q4_K_M and F16, so that is a direct comparison: **all 272 tensors correlate at 0.99728 or better**, with relative errors of 0.7–4.3%, which is exactly what Q4_K/Q5_0/Q6_K/Q8_0 rounding looks like. Wrong unpacking would give correlation near zero.
+
+**Be clear what this is not.** Unpacked blocks become float16 in memory, so the Q4_K_M model holds 772 MB against the F16 model's 784 MB — near-identical, from a file that is 101 MB rather than 258 MB. **Quantization saves disk and download here, not RAM.**
+
+`--pack` recovers part of that by re-packing into the backend's own quantization format and multiplying without unpacking. It costs a second rounding on top of the file's own, and the trade is measurable:
+
+| | Weights resident | Generation | Logits vs unpacked |
+|---|---|---|---|
+| unpacked (default) | 258 MB | 113 tok/s | — |
+| `--pack 8` | 172 MB (1.5×) | 110 tok/s | corr 0.9999, top-5 intact |
+| `--pack 6` | 148 MB (1.7×) | 115 tok/s | corr 0.9981, top-5 intact |
+| `--pack 4` | **122 MB (2.1×)** | **128 tok/s** | corr 0.9710, top-5 **reordered** |
+
+4-bit is smallest and fastest — less memory to read is less time reading it — but the double quantization visibly reorders the ranking. 6-bit is the honest recommendation: 1.7× smaller, slightly faster, top-5 unchanged.
+
+Note what this does *not* beat. MLX's 4-bit packing of a Q4_K tensor is 0.63 MB where the original GGUF block was 0.47 MB — GGML's K-quants are more space-efficient, and llama.cpp multiplies them directly with no requantization error at all. This narrows the gap; it does not close it.
 
 ### Backends: numpy, MLX, CuPy
 
@@ -766,7 +788,9 @@ Note that GGUF and safetensors use different tensor names (`blk.0.attn_q.weight`
 - [x] GPU backends chosen per workload (`--backend`: MLX on Apple silicon, CuPy on NVIDIA)
 - [ ] Better delta encoding: bit-plane splitting, to get packs below 58% ([#7](https://github.com/ronxldwilson/reminis/issues/7))
 - [ ] Storing the F32 form beside the F16 one, so loading skips the conversion
-- [ ] Running quantized models directly, without an F16 conversion first
+- [x] Running quantized models: every K-quant and i-quant, unpacked at load
+- [x] Keeping weights packed in the backend's own format (`--pack 4/6/8`)
+- [ ] Multiplying GGML's K-quant blocks directly, without the second rounding
 - [ ] Running attention-free architectures (Mamba / state space, RWKV)
 - [ ] Unsloth integration
 

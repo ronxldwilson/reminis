@@ -31,8 +31,28 @@ and as the merge row shows, a benchmark of the wrong thing counts as unproven.
 """
 
 import os
+from dataclasses import dataclass
 
 import numpy as np
+
+
+@dataclass
+class QuantizedWeight:
+    """A weight matrix kept packed, for a backend that multiplies it packed.
+
+    GGML's K-quants cannot be multiplied directly by any of these libraries,
+    so a quantized model is normally unpacked to float16 at load and the
+    memory saving is lost. This keeps the saving by re-packing into the
+    backend's own quantization format instead, at the cost of a second
+    rounding on top of the one the file already has.
+    """
+
+    q: object
+    scales: object
+    biases: object
+    group_size: int
+    bits: int
+    shape: tuple
 
 # Workload names, and which backends are worth trying for each in order of
 # preference. A name absent from here gets numpy.
@@ -118,6 +138,19 @@ class Backend:
 
     def contiguous(self, x):
         return x
+
+    # -- packed weights ----------------------------------------------------
+
+    def can_pack(self) -> bool:
+        """Whether this backend can multiply by a weight without unpacking it."""
+        return False
+
+    def pack(self, arr, bits: int, group_size: int = 32):
+        raise NotImplementedError
+
+    def matmul_weight(self, x, w):
+        """x @ w.T, whether w is a plain matrix or a packed one."""
+        return x @ w.T
 
     # -- the pieces of a forward pass -------------------------------------
 
@@ -292,6 +325,23 @@ class MLXBackend(Backend):
     @property
     def xp(self):
         return self.mx
+
+    def can_pack(self) -> bool:
+        return True
+
+    def pack(self, arr, bits: int, group_size: int = 32):
+        mx = self.mx
+        q, scales, biases = mx.quantize(arr, group_size=group_size, bits=bits)
+        mx.eval(q, scales, biases)
+        return QuantizedWeight(q, scales, biases, group_size, bits, arr.shape)
+
+    def matmul_weight(self, x, w):
+        if not isinstance(w, QuantizedWeight):
+            return x @ w.T
+        return self.mx.quantized_matmul(
+            x, w.q, w.scales, w.biases, transpose=True,
+            group_size=w.group_size, bits=w.bits,
+        )
 
     def rms_norm(self, x, weight, eps: float):
         return self.mx.fast.rms_norm(x, weight, eps)

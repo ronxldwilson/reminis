@@ -86,10 +86,23 @@ class WeightStore:
     the mode that makes the "the model lives in the database" claim literal.
     """
 
-    def __init__(self, db_path: str, stream: bool = False, backend=None):
+    # Weights worth keeping packed: the per-layer matrices, which are almost
+    # all of a model's bytes and are only ever used as the right-hand side of
+    # a matrix multiply. Embeddings are indexed row-wise rather than
+    # multiplied, and norms are tiny, so neither is packed.
+    _PACKABLE = (
+        "attn_q.weight", "attn_k.weight", "attn_v.weight", "attn_output.weight",
+        "ffn_gate.weight", "ffn_up.weight", "ffn_down.weight",
+    )
+
+    def __init__(self, db_path: str, stream: bool = False, backend=None,
+                 pack_bits: int | None = None, pack_group: int = 32):
         self.path = db_path
         self.stream = stream
         self.backend = backend or select_backend("inference")
+        self.pack_bits = pack_bits
+        self.pack_group = pack_group
+        self.packed = 0
         self.conn = sqlite3.connect(db_path)
         self.conn.execute("PRAGMA query_only = 1")
         # Memory-map the file rather than copying each blob through SQLite's
@@ -154,11 +167,23 @@ class WeightStore:
                 f"'{name}' is stored as {dtype}, which is neither a float type "
                 f"nor a quantization reminis can unpack."
             )
+        if self._should_pack(name):
+            arr = self.backend.pack(arr, self.pack_bits, self.pack_group)
+            self.packed += 1
+
         self.bytes_read += len(blob)
         self.reads += 1
         if not self.stream:
             self._cache[name] = arr
         return arr
+
+    def _should_pack(self, name: str) -> bool:
+        return (
+            self.pack_bits is not None
+            and self.backend.can_pack()
+            and name.startswith("blk.")
+            and name.endswith(self._PACKABLE)
+        )
 
     def get_numpy(self, name: str) -> np.ndarray:
         """A tensor as plain float32 numpy, whatever the backend is.
@@ -450,9 +475,11 @@ class Model:
     others are checked against it.
     """
 
-    def __init__(self, db_path: str, stream: bool = False, backend=None):
+    def __init__(self, db_path: str, stream: bool = False, backend=None,
+                 pack_bits: int | None = None):
         self.backend = backend or select_backend("inference")
-        self.store = WeightStore(db_path, stream=stream, backend=self.backend)
+        self.store = WeightStore(db_path, stream=stream, backend=self.backend,
+                                 pack_bits=pack_bits)
         meta = dict(self.store.conn.execute("SELECT key, value FROM model_meta"))
         self.meta = meta
         self.cfg = Config(meta, self.store)
@@ -531,7 +558,7 @@ class Model:
     # -- one layer --------------------------------------------------------
 
     def _linear(self, x, name: str, bias: str | None = None):
-        y = x @ self.store.get(name).T
+        y = self.backend.matmul_weight(x, self.store.get(name))
         if bias and self.store.has(bias):
             y = y + self.store.get(bias).reshape(-1)
         return y
@@ -571,7 +598,10 @@ class Model:
         return entry
 
     def _qkv(self, h: np.ndarray, layer: int, prefix: str):
-        if self.store.stream:
+        # Packed weights cannot be stacked into one matrix -- concatenating
+        # them would mean unpacking, which is the thing being avoided -- so
+        # fusion and packing are alternatives, not companions.
+        if self.store.stream or self.store.pack_bits is not None:
             return (self._linear(h, prefix + "attn_q.weight", prefix + "attn_q.bias"),
                     self._linear(h, prefix + "attn_k.weight", prefix + "attn_k.bias"),
                     self._linear(h, prefix + "attn_v.weight", prefix + "attn_v.bias"))
@@ -588,7 +618,7 @@ class Model:
         return out[:, :cut_q], out[:, cut_q:cut_k], out[:, cut_k:]
 
     def _gate_up(self, h: np.ndarray, layer: int, prefix: str):
-        if self.store.stream:
+        if self.store.stream or self.store.pack_bits is not None:
             return (self._linear(h, prefix + "ffn_gate.weight"),
                     self._linear(h, prefix + "ffn_up.weight"))
 
@@ -684,7 +714,9 @@ class Model:
                            self.cfg.rms_eps)
             last = x[-1:]
             out_name = "token_embd.weight" if self.cfg.tied_output else "output.weight"
-            logits = (last @ self.store.get(out_name).T).reshape(-1)
+            logits = self.backend.matmul_weight(
+                last, self.store.get(out_name)
+            ).reshape(-1)
             b.eval(logits)
 
         # Sampling happens in numpy whatever the backend: the vocabulary-sized
@@ -794,6 +826,7 @@ def generate(
     verbose: bool = True,
     on_token=None,
     backend: str | None = None,
+    pack_bits: int | None = None,
 ) -> dict:
     """Generate text from a model stored in a reminis database.
 
@@ -804,6 +837,11 @@ def generate(
         temperature: 0 is greedy; higher is more random.
         top_p: Nucleus sampling cutoff. 1 disables it.
         seed: Seed for sampling, so a run can be repeated exactly.
+        pack_bits: Keep the big per-layer matrices packed at this many bits
+            instead of unpacking them to float16, on a backend that can
+            multiply them packed. Trades accuracy for memory: 6 keeps the
+            top-5 ranking intact for 1.7x less, 4 goes to 2.1x less and
+            visibly reorders it.
         stream: Re-read every weight from SQLite instead of caching it, so
             peak memory is one layer rather than the whole model.
         chat: Wrap the prompt in the model's chat template, when it has a
@@ -822,7 +860,7 @@ def generate(
         raise FileNotFoundError(f"Database not found: {db_path}")
 
     chosen = select_backend("inference", backend)
-    model = Model(db_path, stream=stream, backend=chosen)
+    model = Model(db_path, stream=stream, backend=chosen, pack_bits=pack_bits)
     tok = model.tokenizer
     rng = np.random.default_rng(seed)
 
@@ -894,6 +932,7 @@ def generate(
             "bytes_read": model.store.bytes_read,
             "queries": model.store.reads,
             "backend": chosen.name,
+            "packed_tensors": model.store.packed,
         }
     finally:
         model.close()
@@ -922,6 +961,7 @@ def run_cli(args, on_error=None):
             max_tokens=args.max_tokens, temperature=args.temp, top_p=args.top_p,
             seed=args.seed, stream=args.stream, chat=args.chat,
             verbose=not args.quiet, backend=args.backend,
+            pack_bits=args.pack,
         )
     except (UnsupportedModel, ValueError, FileNotFoundError) as exc:
         print(f"Error: {exc}")

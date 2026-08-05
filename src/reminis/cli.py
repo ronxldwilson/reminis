@@ -109,6 +109,14 @@ def main():
              "one this machine has: mlx on Apple silicon, cupy on NVIDIA, "
              "numpy otherwise. numpy is the reference implementation.",
     )
+    p_run.add_argument(
+        "--pack", type=int, choices=(4, 6, 8), metavar="BITS",
+        help="Keep the per-layer matrices packed at this many bits rather "
+             "than unpacking them to float16. Needs a backend that can "
+             "multiply packed weights (mlx). Measured on a Q4_K_M SmolLM: "
+             "8 bits is 1.5x less memory, 6 is 1.7x, 4 is 2.1x and 13%% "
+             "faster but reorders the top-5 tokens.",
+    )
     p_run.add_argument("-q", "--quiet", action="store_true", help="Suppress progress output")
 
     # merge: combine several models into one

@@ -380,6 +380,74 @@ def test_quantized_models():
           n_quant > 0, f"{n_quant} quantized tensors in the file")
 
 
+def test_packed_weights():
+    """Keeping weights packed must cost memory-accuracy, not correctness.
+
+    Packing re-quantizes into the backend's own format, so the weights are
+    rounded a second time on top of whatever the file already did. The
+    question is not whether that changes the numbers -- it must -- but
+    whether the model still ranks tokens the same way, and whether the
+    memory it saves is real.
+    """
+    print("\nPacked weights")
+    quant_db = MODELS_DIR / "smollm-q4km.db"
+    if not quant_db.exists():
+        print("  skip  needs a quantized SmolLM database")
+        return
+
+    backend = select_backend("inference")
+    if not backend.can_pack():
+        print(f"  skip  the {backend.name} backend cannot multiply packed weights")
+        return
+
+    prompt = "The capital of France is Paris, and the capital of Germany is"
+
+    def logits_and_memory(bits):
+        model = Model(str(quant_db), pack_bits=bits)
+        try:
+            for name in model.store._shapes:
+                model.store.get(name)
+            model.backend.eval()
+            resident = _resident_mb(model.backend)
+            ids = model.tokenizer.encode(prompt, add_special=False)
+            lg = model.forward(
+                ids, KVCache(model.cfg.n_layers, capacity=64, backend=model.backend), 0
+            )
+            return lg, resident, model.store.packed
+        finally:
+            model.close()
+
+    reference, ref_mem, n_unpacked = logits_and_memory(None)
+    check("nothing is packed when packing is off", n_unpacked == 0)
+
+    for bits, min_saving in ((8, 1.2), (6, 1.4), (4, 1.8)):
+        lg, mem, packed = logits_and_memory(bits)
+        check(f"{bits}-bit: the per-layer matrices were packed", packed > 0)
+        check(f"{bits}-bit: picks the same next token",
+              int(np.argmax(lg)) == int(np.argmax(reference)))
+        corr = float(np.corrcoef(lg, reference)[0, 1])
+        check(f"{bits}-bit: logits still track the unpacked model",
+              corr > 0.95, f"corr {corr:.6f}")
+        saving = ref_mem / mem if mem else 0
+        check(f"{bits}-bit: uses at least {min_saving}x less weight memory",
+              saving >= min_saving, f"{ref_mem:.0f} -> {mem:.0f} MB is {saving:.2f}x")
+        print(f"        ({bits}-bit: {ref_mem:.0f} -> {mem:.0f} MB, "
+              f"{saving:.2f}x smaller, correlation {corr:.6f})")
+
+
+def _resident_mb(backend):
+    """How much the backend is actually holding, where it can say."""
+    try:
+        import mlx.core as mx
+
+        mx.clear_cache()
+        return mx.get_active_memory() / 1024 ** 2
+    except Exception:
+        import resource
+
+        return resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024 ** 2
+
+
 def test_merged_model_runs():
     """The payoff: a model that was assembled by SQL still speaks."""
     print("\nA merged model")
@@ -422,6 +490,7 @@ def main():
     test_architectures()
     test_refusals()
     test_quantized_models()
+    test_packed_weights()
     test_merged_model_runs()
 
     print("\n" + "=" * 70)
