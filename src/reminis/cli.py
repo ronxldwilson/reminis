@@ -274,6 +274,28 @@ def main():
     p_prepare.add_argument("--drop", action="store_true",
                            help="Delete the index and reclaim its space")
 
+    # sweep: run one model at several precisions and compare
+    p_sweep = sub.add_parser(
+        "sweep",
+        help="Run a model at several precisions and report what each costs in "
+             "memory and in agreement with full precision",
+    )
+    p_sweep.add_argument("database", help="Path to the model database")
+    p_sweep.add_argument(
+        "--bits", default="8,6,4", metavar="LIST",
+        help="Comma-separated widths to try (default 8,6,4)",
+    )
+    p_sweep.add_argument("--prompt", help="Text to measure agreement over. The "
+                                          "default is a fixed mixed-domain passage.")
+    p_sweep.add_argument(
+        "--backend", choices=("auto", "numpy", "mlx", "cupy"), default="auto",
+        help="Which array library to compute with (default auto)",
+    )
+    p_sweep.add_argument(
+        "--kv-bits", type=int, choices=(4, 8), metavar="BITS",
+        help="Also compress the key/value cache to this many bits",
+    )
+
     # apply: apply a delta pack to a base model
     p_apply = sub.add_parser("apply", help="Apply a delta pack to a base model")
     p_apply.add_argument("base", help="Path to the base model database")
@@ -390,6 +412,29 @@ def main():
 
     elif args.command == "prepare":
         _prepare(args, parser)
+
+    elif args.command == "sweep":
+        from reminis.sweep import sweep
+
+        widths = []
+        for piece in args.bits.split(","):
+            piece = piece.strip()
+            if not piece:
+                continue
+            if not piece.isdigit() or int(piece) not in (2, 3, 4, 5, 6, 8):
+                parser.error(
+                    f"--bits takes a comma-separated list drawn from "
+                    f"2, 3, 4, 5, 6 and 8; got '{piece}'"
+                )
+            widths.append(int(piece))
+        if not widths:
+            parser.error("--bits needs at least one width")
+
+        sweep(
+            args.database, widths, prompt=args.prompt,
+            backend=None if args.backend == "auto" else args.backend,
+            kv_bits=args.kv_bits,
+        )
 
     elif args.command == "apply":
         from reminis.diff import apply_delta

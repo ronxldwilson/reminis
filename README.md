@@ -503,6 +503,41 @@ ALL TESTS PASSED - every tensor in every model matches byte-for-byte
 
 Every tensor in every model was hashed with SHA256 before and after the round-trip. Zero data loss.
 
+### Choosing a precision by measuring, not by folklore
+
+How much quantization a model tolerates depends on the model, and the usual way to find out is to read someone else's table and hope it transfers. `reminis sweep` runs the model at each width and reports what each one costs:
+
+```bash
+reminis sweep models/SmolLM-135M.f16.db --bits 8,6,4
+```
+
+```
+  bits   resident   of f16    top-1    top-5         KL   forward
+   f16     269 MB   100.0%   100.0%   100.0%     0.0000     0.25s
+     8     142 MB    52.8%    98.4%    95.9%     0.0065     0.30s
+     6     109 MB    40.3%    92.1%    87.9%     0.0806     0.17s
+     4      75 MB    27.8%    61.9%    67.3%     0.3876     0.16s
+```
+
+`top-1` is how often the packed model's best next token is the one full precision would have picked, measured across every position of a fixed passage in one batched prefill. `top-5` is how much of the candidate set survives — a model can hold its top-1 while shuffling everything behind it. `KL` is the whole distribution, in nats.
+
+The point is that the answer moves. The same sweep on Mistral-7B:
+
+```
+  bits   resident    of 8b    top-1    top-5         KL   forward
+    8*    7475 MB   100.0%   100.0%   100.0%     0.0000    19.63s
+     6    5663 MB    75.8%    90.8%    90.8%     0.0278    43.98s
+     4    3851 MB    51.5%    89.2%    87.7%     0.0558    41.08s
+```
+
+On SmolLM-135M, 4-bit throws away a third of the top-1 agreement. On Mistral-7B it lands within 1.6 points of 6-bit while using two-thirds the memory, so 4-bit is plainly the right choice — the opposite conclusion from the same flag. Small models have less redundancy to spend.
+
+**It refuses to thrash.** Mistral-7B at float16 needs about 14.5 GB resident against 10.2 GB usable on this machine. Rather than swap for ten minutes and report a meaningless timing, the sweep predicts the resident size per rung, falls back to the widest one that fits, and marks it — that is what the `*` and the `of 8b` header mean. Agreement is then agreement with 8-bit, not with the original weights, and the output says so rather than letting the column header imply otherwise.
+
+The `forward` column is one batched prefill and is the least trustworthy column here: later rungs run with the page cache already under pressure from earlier ones. Read it as an order of magnitude, not a benchmark.
+
+This is the kind of question the database makes cheap. Every rung is derived from the same rows on the way to the GPU, so comparing four precisions does not mean keeping four copies of the model on disk, and the exact source weights are still sitting there byte-intact when the sweep finishes.
+
 ## What's in the Database
 
 ```
@@ -968,7 +1003,7 @@ Note that GGUF and safetensors use different tensor names (`blk.0.attn_q.weight`
 
 ## Tests
 
-Fourteen suites, 338 explicit checks, run with `uv run python tests/<name>.py`. They need no framework and skip rather than fail when a model or an optional dependency is absent.
+Fifteen suites, 363 explicit checks, run with `uv run python tests/<name>.py`. They need no framework and skip rather than fail when a model or an optional dependency is absent.
 
 The references they check against — transformers for logits, peft for LoRA adapters, torch, and MLX on Apple silicon — are declared as a dev dependency group, so `uv sync` installs them and does not remove them. That is worth stating because getting it wrong is quiet: when those packages went missing, the three suites that compare reminis against a reference implementation degraded to skips and went on reporting PASS.
 
@@ -977,6 +1012,7 @@ The references they check against — transformers for logits, peft for LoRA ada
 | `test_roundtrip` | SHA256-verified GGUF round-trip across 20 models and 13 quantization types |
 | `test_diff`, `test_lowrank` | Delta packs, hash-verified apply, low-rank encoding |
 | `test_bitplane` | Bit-plane delta encoding: reversibility, refusals, older packs still read |
+| `test_sweep` | Precision sweeps: agreement maths, resident-size prediction, reference choice |
 | `test_safetensors`, `test_lora_adapter` | Safetensors both directions, peft agreement |
 | `test_track`, `test_registry` | Training logs, rollback, many models in one file |
 | `test_viewer` | The architecture diagram, by running the page's own JS under node |

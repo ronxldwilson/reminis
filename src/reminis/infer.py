@@ -1617,8 +1617,16 @@ class Model:
         self._mask_cache[key] = mask
         return mask
 
-    def forward(self, tokens: list[int], cache: "KVCache", offset: int) -> np.ndarray:
-        """Logits for the last token of `tokens`.
+    def forward(self, tokens: list[int], cache: "KVCache", offset: int,
+                all_positions: bool = False) -> np.ndarray:
+        """Logits for the last token of `tokens`, or for every one of them.
+
+        Decoding only ever needs the last position, so that is the default and
+        the output projection is applied to a single row. `all_positions` runs
+        it across the whole batch instead, returning (n_tokens, vocab), which
+        is what comparing two models position by position needs -- and doing it
+        in one batched pass rather than one call per token is the difference
+        between a matrix product and a few dozen matrix-vector products.
 
         Floating-point warnings are silenced for the duration. Two of them
         would otherwise fire on every token for reasons that are not bugs:
@@ -1640,11 +1648,11 @@ class Model:
 
             x = b.rms_norm(x, self.store.get("output_norm.weight").reshape(-1),
                            self.cfg.rms_eps)
-            last = x[-1:]
+            tail = x if all_positions else x[-1:]
             out_name = "token_embd.weight" if self.cfg.tied_output else "output.weight"
-            logits = self.backend.matmul_weight(
-                last, self.store.get(out_name)
-            ).reshape(-1)
+            logits = self.backend.matmul_weight(tail, self.store.get(out_name))
+            if not all_positions:
+                logits = logits.reshape(-1)
             if self.cfg.logit_scale != 1.0:
                 logits = logits / self.cfg.logit_scale
             b.eval(logits)
