@@ -13,10 +13,11 @@ rolled-back or delta-applied database can be checked by asking it to speak
 rather than by comparing hashes.
 
 Speed, measured rather than assumed, turns out to be less embarrassing than
-expected -- roughly 0.7-0.9x llama.cpp's CPU token generation on the same
-F16 models, since both end up in the platform BLAS for the large matrix
-multiplies. Against llama.cpp on the GPU it is 2.5-3x slower, and against a
-quantized model it does not compete at all, because it cannot run one.
+expected -- 0.86-0.89x llama.cpp's CPU token generation across three model
+sizes, and faster than it at prompt processing, since both end up in the
+platform BLAS for the large matrix multiplies. Against llama.cpp on the GPU
+it is 2.6-2.8x slower, and against a quantized model it does not compete at
+all, because it cannot run one.
 
 ``--stream`` takes that further. In streaming mode no weight is ever cached:
 every matrix multiplication in every layer re-reads its operand from SQLite
@@ -82,6 +83,12 @@ class WeightStore:
         self.stream = stream
         self.conn = sqlite3.connect(db_path)
         self.conn.execute("PRAGMA query_only = 1")
+        # Memory-map the file rather than copying each blob through SQLite's
+        # own buffer. Measured on a 258 MB model, reading every weight goes
+        # from 4.1 GB/s to 6.7 GB/s, which shows up in load time and in every
+        # single read that streaming mode does. The size is a ceiling, not an
+        # allocation: SQLite maps what the file actually needs.
+        self.conn.execute("PRAGMA mmap_size = 34359738368")
         self._cache: dict[str, np.ndarray] = {}
         self.bytes_read = 0
         self.reads = 0
@@ -126,6 +133,10 @@ class WeightStore:
         if not self.stream:
             self._cache[name] = arr
         return arr
+
+    def drop(self, name: str):
+        """Forget a cached tensor, once something else stands in for it."""
+        self._cache.pop(name, None)
 
     def close(self):
         self.conn.close()
@@ -411,7 +422,8 @@ class Model:
         self.meta = meta
         self.cfg = Config(meta, self.store)
         self.tokenizer = Tokenizer(meta)
-        self._rope_cache: dict[int, tuple[np.ndarray, np.ndarray]] = {}
+        self._rope_cache: tuple | None = None
+        self._fused_cache: dict[tuple[int, str], tuple] = {}
 
     def close(self):
         self.store.close()
@@ -419,7 +431,17 @@ class Model:
     # -- rotary embeddings ------------------------------------------------
 
     def _rope_tables(self, n_positions: int, offset: int):
-        """cos/sin for positions [offset, offset + n_positions)."""
+        """cos/sin for positions [offset, offset + n_positions).
+
+        Every layer in a forward pass asks for the same positions, so the
+        trigonometry was being redone once per layer -- thirty times per
+        token on a 135M model. One entry is enough to hold it.
+        """
+        if self._rope_cache is not None:
+            key_n, key_offset, cos, sin = self._rope_cache
+            if key_n == n_positions and key_offset == offset:
+                return cos, sin
+
         cfg = self.cfg
         half = cfg.rope_dim // 2
         inv_freq = 1.0 / (
@@ -429,7 +451,9 @@ class Model:
             inv_freq = inv_freq / cfg.rope_factors[:half]
         pos = np.arange(offset, offset + n_positions, dtype=np.float32)
         angles = pos[:, None] * inv_freq[None, :]
-        return np.cos(angles), np.sin(angles)
+        cos, sin = np.cos(angles), np.sin(angles)
+        self._rope_cache = (n_positions, offset, cos, sin)
+        return cos, sin
 
     def _apply_rope(self, x: np.ndarray, cos: np.ndarray, sin: np.ndarray) -> np.ndarray:
         """Rotate the first `rope_dim` channels of each head.
@@ -467,6 +491,66 @@ class Model:
             y = y + self.store.get(bias).ravel()
         return y
 
+    def _fused(self, layer: int, key: str, names: list[str]):
+        """One weight matrix standing in for several stacked ones.
+
+        Q, K and V are three separate matrix-vector products reading three
+        separate regions of memory, and so are the FFN's gate and up. Stacking
+        each group into a single matrix turns them into one call over one
+        contiguous region. Decoding is memory-bound, so what this buys is not
+        arithmetic but streaming: measured on the real shapes, the fused QKV
+        is about a third faster than the three separate ones.
+
+        The originals are dropped from the cache as the fused copy is built,
+        so this costs no extra memory. It is skipped entirely in streaming
+        mode, where caching anything would defeat the point.
+        """
+        cached = self._fused_cache.get((layer, key))
+        if cached is not None:
+            return cached
+
+        prefix = f"blk.{layer}."
+        weight = np.ascontiguousarray(
+            np.concatenate([self.store.get(prefix + n) for n in names], axis=0)
+        )
+        biases = [prefix + n.replace(".weight", ".bias") for n in names]
+        bias = None
+        if all(self.store.has(b) for b in biases):
+            bias = np.concatenate([self.store.get(b).ravel() for b in biases])
+
+        for n in names:
+            self.store.drop(prefix + n)
+        entry = (weight, bias)
+        self._fused_cache[(layer, key)] = entry
+        return entry
+
+    def _qkv(self, h: np.ndarray, layer: int, prefix: str):
+        if self.store.stream:
+            return (self._linear(h, prefix + "attn_q.weight", prefix + "attn_q.bias"),
+                    self._linear(h, prefix + "attn_k.weight", prefix + "attn_k.bias"),
+                    self._linear(h, prefix + "attn_v.weight", prefix + "attn_v.bias"))
+
+        weight, bias = self._fused(
+            layer, "qkv",
+            ["attn_q.weight", "attn_k.weight", "attn_v.weight"],
+        )
+        out = h @ weight.T
+        if bias is not None:
+            out += bias
+        cut_q = self.cfg.n_heads * self.cfg.head_dim
+        cut_k = cut_q + self.cfg.n_kv_heads * self.cfg.head_dim
+        return out[:, :cut_q], out[:, cut_q:cut_k], out[:, cut_k:]
+
+    def _gate_up(self, h: np.ndarray, layer: int, prefix: str):
+        if self.store.stream:
+            return (self._linear(h, prefix + "ffn_gate.weight"),
+                    self._linear(h, prefix + "ffn_up.weight"))
+
+        weight, _ = self._fused(layer, "gate_up", ["ffn_gate.weight", "ffn_up.weight"])
+        out = h @ weight.T
+        half = out.shape[1] // 2
+        return out[:, :half], out[:, half:]
+
     def _block(self, x: np.ndarray, layer: int, cache: "KVCache", offset: int):
         cfg = self.cfg
         p = f"blk.{layer}."
@@ -474,10 +558,7 @@ class Model:
 
         h = _rms_norm(x, self.store.get(p + "attn_norm.weight").ravel(), cfg.rms_eps)
 
-        q = self._linear(h, p + "attn_q.weight", p + "attn_q.bias")
-        k = self._linear(h, p + "attn_k.weight", p + "attn_k.bias")
-        v = self._linear(h, p + "attn_v.weight", p + "attn_v.bias")
-
+        q, k, v = self._qkv(h, layer, p)
         q = q.reshape(n_tokens, cfg.n_heads, cfg.head_dim)
         k = k.reshape(n_tokens, cfg.n_kv_heads, cfg.head_dim)
         v = v.reshape(n_tokens, cfg.n_kv_heads, cfg.head_dim)
@@ -489,33 +570,34 @@ class Model:
         k_all, v_all = cache.append(layer, k, v)
         total = k_all.shape[0]
 
-        # Grouped-query attention: each key/value head serves several query
-        # heads, so the cache is repeated rather than stored per query head.
+        # Grouped-query attention. Each key/value head serves `repeat` query
+        # heads, and the obvious way to write that is np.repeat on the cache
+        # -- which copies the whole cache, every layer, every token. Adding a
+        # length-1 axis instead lets broadcasting do it for free: queries are
+        # grouped (n_kv, repeat, ...) and the keys and values broadcast across
+        # the group they belong to.
         repeat = cfg.n_heads // cfg.n_kv_heads
-        if repeat > 1:
-            k_all = np.repeat(k_all, repeat, axis=1)
-            v_all = np.repeat(v_all, repeat, axis=1)
+        qh = q.transpose(1, 0, 2).reshape(cfg.n_kv_heads, repeat, n_tokens, cfg.head_dim)
+        kh = k_all.transpose(1, 2, 0)[:, None]
+        vh = v_all.transpose(1, 0, 2)[:, None]
 
-        # (heads, tokens, dim) so the per-head matmuls batch.
-        qh = q.transpose(1, 0, 2)
-        kh = k_all.transpose(1, 2, 0)
-        vh = v_all.transpose(1, 0, 2)
+        scores = (qh @ kh) * np.float32(1.0 / math.sqrt(cfg.head_dim))
+        # A single token attends to the whole cache, so there is nothing for
+        # a causal mask to hide and building one is pure waste. It is only
+        # needed when several tokens are processed at once.
+        if n_tokens > 1:
+            rows = np.arange(offset, offset + n_tokens)[:, None]
+            cols = np.arange(total)[None, :]
+            scores = np.where(cols <= rows, scores, np.float32(-np.inf))
 
-        scores = (qh @ kh) * (1.0 / math.sqrt(cfg.head_dim))
-        # Causal mask, written against absolute positions so it is correct
-        # both for a batched prompt and for one token against a long cache.
-        rows = np.arange(offset, offset + n_tokens)[:, None]
-        cols = np.arange(total)[None, :]
-        scores = np.where(cols <= rows, scores, np.float32(-np.inf))
-
-        attn = _softmax(scores.astype(np.float32))
-        out = (attn @ vh).transpose(1, 0, 2).reshape(n_tokens, cfg.n_heads * cfg.head_dim)
+        attn = _softmax(scores)
+        out = (attn @ vh).reshape(cfg.n_heads, n_tokens, cfg.head_dim)
+        out = out.transpose(1, 0, 2).reshape(n_tokens, cfg.n_heads * cfg.head_dim)
         x = x + self._linear(out, p + "attn_output.weight", p + "attn_output.bias")
 
         h = _rms_norm(x, self.store.get(p + "ffn_norm.weight").ravel(), cfg.rms_eps)
-        gate = _silu(self._linear(h, p + "ffn_gate.weight"))
-        up = self._linear(h, p + "ffn_up.weight")
-        return x + self._linear(gate * up, p + "ffn_down.weight")
+        gate, up = self._gate_up(h, layer, p)
+        return x + self._linear(_silu(gate) * up, p + "ffn_down.weight")
 
     def forward(self, tokens: list[int], cache: "KVCache", offset: int) -> np.ndarray:
         """Logits for the last token of `tokens`.
@@ -549,23 +631,51 @@ class Model:
 
 
 class KVCache:
-    """Keys and values for every layer, grown a token at a time."""
+    """Keys and values for every layer.
 
-    def __init__(self, n_layers: int):
+    Growing this with `np.concatenate` reallocates and recopies the entire
+    cache on every token, which turns a linear cost into a quadratic one and
+    is invisible until the context is long. Given a capacity up front it
+    allocates once and writes each token into place, returning a view.
+    Without one it still grows, in doubling steps rather than by one.
+    """
+
+    def __init__(self, n_layers: int, capacity: int | None = None):
         self.k = [None] * n_layers
         self.v = [None] * n_layers
+        self.capacity = capacity
+        self._used = 0
 
     def append(self, layer: int, k: np.ndarray, v: np.ndarray):
-        if self.k[layer] is None:
-            self.k[layer], self.v[layer] = k, v
+        n = k.shape[0]
+        buf_k, buf_v = self.k[layer], self.v[layer]
+
+        if buf_k is None:
+            size = max(self.capacity or 0, n)
+            buf_k = np.empty((size,) + k.shape[1:], dtype=np.float32)
+            buf_v = np.empty((size,) + v.shape[1:], dtype=np.float32)
+            self.k[layer], self.v[layer] = buf_k, buf_v
+            used = 0
         else:
-            self.k[layer] = np.concatenate([self.k[layer], k], axis=0)
-            self.v[layer] = np.concatenate([self.v[layer], v], axis=0)
-        return self.k[layer], self.v[layer]
+            used = self._used
+            if used + n > buf_k.shape[0]:
+                grown = max(buf_k.shape[0] * 2, used + n)
+                buf_k = np.resize(buf_k, (grown,) + k.shape[1:])
+                buf_v = np.resize(buf_v, (grown,) + v.shape[1:])
+                self.k[layer], self.v[layer] = buf_k, buf_v
+
+        buf_k[used:used + n] = k
+        buf_v[used:used + n] = v
+
+        # The counter advances once per token, not once per layer, so it is
+        # updated on the last layer only -- every layer sees the same span.
+        if layer == len(self.k) - 1:
+            self._used = used + n
+        return buf_k[:used + n], buf_v[:used + n]
 
     @property
     def length(self) -> int:
-        return 0 if self.k[0] is None else self.k[0].shape[0]
+        return self._used
 
 
 # ---------------------------------------------------------------- sampling
@@ -651,7 +761,7 @@ def generate(
             print(f"{len(tokens)} prompt tokens\n")
             print(text, end="", flush=True)
 
-        cache = KVCache(model.cfg.n_layers)
+        cache = KVCache(model.cfg.n_layers, capacity=len(tokens) + max_tokens)
 
         t0 = time.time()
         logits = model.forward(tokens, cache, offset=0)

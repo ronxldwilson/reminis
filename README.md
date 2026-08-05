@@ -161,22 +161,24 @@ The logit gap is the F16 the GGUF stores against the F32 torch loads, which is t
 
 ### Inference speed, against llama.cpp
 
-`reminis run` is numpy. It exists to show the database is a working model, not to be a fast runtime, so the honest thing is to measure it beside the tool people actually use. Same machine (M4, 4 performance + 6 efficiency cores), same F16 GGUFs, `llama-bench -p 512 -n 128`. Prompt processing (`pp`) and token generation (`tg`), in tokens per second:
+`reminis run` is numpy. It exists to show the database is a working model, not to be a fast runtime, so the honest thing is to measure it beside the tool people actually use.
+
+Apple M5, same F16 files for both, `llama-bench` for llama.cpp. The two were run **interleaved** — one round of each, alternating, medians reported — because the machine was not idle, and alternating makes shared load cancel instead of landing on whichever ran second. Prompt processing (`pp512`) and token generation (`tg128`), in tokens per second:
 
 | Model | reminis (numpy) | llama.cpp, CPU | llama.cpp, Metal |
 |---|---|---|---|
-| SmolLM-135M f16 | 912 pp / **69** tg | 545 pp / **97** tg | 11,513 pp / **169** tg |
-| Qwen2.5-0.5B f16 | 453 pp / **27** tg | 336 pp / **31** tg | 5,118 pp / **65** tg |
-| Llama-3.2-1B f16 | 208 pp / **11** tg | 150 pp / **13** tg | 1,766 pp / **30** tg |
+| SmolLM-135M f16 | 946 pp / **86** tg | 540 pp / **97** tg | 18,126 pp / **176** tg |
+| Qwen2.5-0.5B f16 | 502 pp / **27** tg | 330 pp / **30** tg | 5,272 pp / **69** tg |
+| Llama-3.2-1B f16 | 209 pp / **11** tg | 153 pp / **13** tg | 1,652 pp / **30** tg |
 
-Against llama.cpp **on the CPU**, numpy generates at 0.7–0.9× its speed and processes prompts around 1.4× faster. Both end up in Apple's Accelerate for the large matrix multiplies, and prompt processing is one big GEMM where that dominates. This was not the expected result — the first version of this section asserted an order of magnitude, from reasoning rather than measurement, and was wrong.
+Against llama.cpp **on the CPU**, numpy generates at **0.86–0.89×** its speed — strikingly consistent across three model sizes — and processes prompts 1.4–1.8× faster. Both end up in Apple's Accelerate for the large matrix multiplies, and prompt processing is one big GEMM where that dominates. This was not the expected result: the first version of this section asserted an order of magnitude, from reasoning rather than measurement, and was wrong.
 
-Against llama.cpp **on the GPU**, it is 2.5–3× slower at generation and 8–12× slower at prompt processing. That is the comparison that matters for choosing a runtime, and numpy has no answer to it.
+Against llama.cpp **on the GPU**, it is 2.6–2.8× slower at generation and 8–19× slower at prompt processing. That is the comparison that matters for choosing a runtime, and numpy has no answer to it.
 
-Two caveats point the other way, and both are structural rather than fixable by tuning:
+Two caveats point the other way, and neither is fixable by tuning:
 
 - reminis decodes every weight to F32 and keeps it there, so it holds **twice the F16 file** in memory where llama.cpp memory-maps the file as-is. Token generation is bandwidth-bound, so that accounts for much of the remaining gap by itself.
-- The comparison is confined to F16 because reminis cannot run quantized weights at all. The same SmolLM at Q4_K_M does 178 tg / 14,156 pp on Metal out of a 99 MB file — a model reminis can store, diff, merge and export losslessly, but not yet run.
+- The comparison is confined to F16 because reminis cannot run quantized weights at all. The same SmolLM at Q4_K_M does 178 tg on Metal out of a 99 MB file — a model reminis can store, diff, merge and export losslessly, but not yet run.
 
 Then there is the mode nothing else has:
 
@@ -184,7 +186,27 @@ Then there is the mode nothing else has:
 |---|---|---|
 | SmolLM-135M f16, `--stream` | 258 MB | 2.8 tok/s |
 
-With `--stream` nothing is cached, so eight tokens re-read **2,796 MB across 2,457 queries** out of a 258 MB file. Peak memory is one layer instead of one model, and 25× slower is what that costs.
+With `--stream` nothing is cached, so eight tokens re-read **2,796 MB across 2,457 queries** out of a 258 MB file. Peak memory is one layer instead of one model, and ~30× slower is what that costs.
+
+### What made it faster, and what didn't
+
+Profiling put 65% of decode time in the linear layers, so the changes went there. What worked:
+
+- **Stacking Q, K and V into one matrix per layer**, and gate with up — seven matrix products per layer become four, over contiguous memory. The originals are dropped as the fused copy is built, so it costs no extra RAM. Measured on the real shapes, fused QKV is a third faster than the three separate calls.
+- **Broadcasting for grouped-query attention** instead of `np.repeat`, which was copying the entire KV cache once per layer per token.
+- **Preallocating the KV cache.** Growing it with `np.concatenate` recopies everything on every token, turning a linear cost quadratic — invisible until the context is long.
+- **`PRAGMA mmap_size`.** Reading every weight out of a 258 MB database goes from 4.1 GB/s to 6.7 GB/s when SQLite maps the file instead of copying each blob through its own buffer.
+- Caching the rotary tables, which were recomputed once per layer — thirty times per token — and skipping the causal mask during single-token decode, where it masks nothing.
+
+Together those took SmolLM-135M from 0.71× llama.cpp's CPU speed to 0.89×. The larger models barely moved, because they are already bandwidth-bound rather than overhead-bound.
+
+Three ideas that seemed obvious and lost, all measured:
+
+- **Threading the matrix products** made it *slower*. Accelerate already reaches 70 GB/s single-threaded; splitting the work across 8 threads dropped it to 17 GB/s.
+- **Keeping weights in F16** to halve memory traffic was 34× slower. numpy's F16→F32 conversion runs at ~1.2 GB/s, far below the bandwidth it would save.
+- **Hand-written bit-twiddling** for that conversion was slower than numpy's, and wrong on subnormals.
+
+The remaining ceiling is DRAM bandwidth on F32 weights, and numpy has no way to read fewer bytes. One database-shaped answer is left on the table: the F16→F32 conversion costs 213 ms of a 274 ms load, so storing the F32 form alongside the F16 — a materialized view of the weights — cuts load time and makes `--stream` about 1.7× faster, for double the disk. That is on the roadmap rather than in the code.
 
 ### Quantization coverage
 
@@ -644,6 +666,7 @@ Note that GGUF and safetensors use different tensor names (`blk.0.attn_q.weight`
 - [x] Attention-free architectures in the viewer (Mamba / state space, RWKV, hybrids)
 - [x] Model merging via SQL operations (`reminis merge`: linear, slerp, task arithmetic, TIES)
 - [x] Inference from database-stored weights (`reminis run`, verified against transformers)
+- [ ] Storing the F32 form beside the F16 one, so loading skips the conversion
 - [ ] Running quantized models directly, without an F16 conversion first
 - [ ] Running attention-free architectures (Mamba / state space, RWKV)
 - [ ] Unsloth integration
