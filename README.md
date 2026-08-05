@@ -53,7 +53,7 @@ Where the small-machine story is real is *upstream* of inference: a 70B model ca
 
 reminis overlaps with several tools and replaces none of them. Being specific about that is more useful than a feature table.
 
-**llama.cpp / GGUF** — a runtime, and the one you should serve with. There is no competition here: reminis reads GGUF, gives you things to do with it, and writes it back out. `reminis run` exists to verify a database, not to replace a runtime, and loses badly to llama.cpp on the GPU and on anything quantized.
+**llama.cpp / GGUF** — a runtime, and the one you should serve with. There is no competition here: reminis reads GGUF, gives you things to do with it, and writes it back out. `reminis run` exists to verify a database, not to replace a runtime. On quantized weights llama.cpp is ahead — measured at 86% of it on Mistral-7B Q4_K_M — and the one place reminis leads is running an f16 file without converting it first.
 
 **safetensors** — a storage format, and a good one: memory-mapped, safe to load, fast. It stores *a* model. reminis stores models *and their relationships* — which one came from which, what changed, what it costs to store the difference. reminis reads and writes safetensors, including BF16 and sharded checkpoints.
 
@@ -285,9 +285,10 @@ The largest thing that fits here, measured rather than estimated. Mistral-7B-Ins
 
 | | Weights resident | Generation | vs llama.cpp |
 |---|---|---|---|
-| llama.cpp Metal | 4.07 GB | 12.7 tok/s | — |
-| `--pack` (bit-exact) | 5.49 GB | 8.3 tok/s | 65% |
-| **`--pack compact`** | **4.80 GB** | **13.1 tok/s** | **103%** |
+| llama.cpp Metal (`llama-bench`, tg64, r=3) | 4.07 GB | 28.4 ± 0.1 tok/s | — |
+| **`--pack compact`** | **4.80 GB** | **24.3 tok/s** (25.0 / 23.8 / 24.0) | **86%** |
+
+An earlier version of this table said 13.1 against 12.7 tok/s, and read that as reminis being 3% ahead. That is no longer true and was never as solid as it looked. Re-measuring both sides on the current homebrew build (ggml 0.18.1), llama.cpp went from 12.7 to 28.4 tok/s and reminis from 13.1 to 24.3 — both roughly doubled, and llama.cpp doubled harder. **reminis is at 86% of llama.cpp here, not 103%.** The lesson is about method rather than about either program: a ratio between two numbers measured months apart, against a dependency that ships optimizations continuously, is not a measurement.
 
 Everything above 7B on this machine is a question of arithmetic rather than capability: a 13B at Q4_K_M would land near 8.8 GB packed compact, which fits; a 30B would not.
 
@@ -301,6 +302,8 @@ The capital of France is Paris, but the largest city is Marseille.
 One caveat on that row: loading takes ~83 s, because the repack runs in numpy. It is one pass over the model and nothing has been done to speed it up.
 
 This closes most of the gap with llama.cpp on quantized weights — the values multiplied are now exactly the ones in the file — without closing it entirely: llama.cpp still reads the original blocks with no repack step and no float32 scale array beside them.
+
+Two other things came out of re-measuring. `PRAGMA mmap_size` is worth 7% here (25.1 against 23.5 tok/s), where on a database bigger than the machine it costs 3.7×, so reminis now maps a file only when it is at most half of physical memory — 4.4 GB and 22.9 GB being the two points either side of that line. And the 41 s prefill in these runs is the numpy repack, still unimproved, still a one-off.
 
 ### A 20B model in 3.65 GB, by only reading the experts it uses
 
@@ -360,6 +363,16 @@ The honest limits. A bigger cache is not better: at 1,400 experts it was *slower
 
 The thing that made this possible is the same thing the whole project is about. The expensive step was a deterministic function of stored bytes, and a database is where derived representations of stored bytes belong. A GGUF file has nowhere to put one.
 
+**There is no llama.cpp figure in that table, and it is not an oversight.** llama.cpp would not run gpt-oss-20b on this machine at all. Every configuration tried — full offload, `-ngl 20`, `-ngl 16`, and `-ncmoe 12`, which exists for exactly this case — failed the same way:
+
+```
+test_prompt: failed to decode prompt batch, res = -3
+```
+
+The cause is the wall reminis met too: `recommendedMaxWorkingSetSize = 12713 MB` against an 11.3 GB model, leaving nothing for the cache and compute buffers. It may also be a version problem rather than a memory one — this is the homebrew build, and gpt-oss needs recent MXFP4 and attention-sink support — which has not been chased down.
+
+So the claim here is about **fitting, not speed**: on a 16 GB machine, llama.cpp did not run this model in the configurations tried and reminis did. Reading it as "reminis is faster than llama.cpp on gpt-oss" would be wrong twice over, because the 37.3 tok/s is a 3-bit index against llama.cpp's MXFP4 and those are not the same model. Where the two can be compared precision-matched, on Mistral-7B above, llama.cpp is ahead.
+
 ### Compressing the key/value cache
 
 The weights are a fixed cost; the cache grows with every token. At long context it is the cache, not the model, that decides whether a prompt fits — so `--kv-bits` compresses it.
@@ -396,9 +409,11 @@ An f16 model can be packed as it loads, with no separate quantization step and n
 
 | Model | reminis f16 | reminis `--pack 8` | llama.cpp f16 | packed vs llama.cpp |
 |---|---|---|---|---|
-| SmolLM-135M | 270 | 343 | 337 | **102%** |
-| Qwen2.5-0.5B | 108 | 173 | 123 | **140%** |
-| Llama-3.2-1B | 48 | 87 | 52 | **168%** |
+| SmolLM-135M | 274 | 349 | 325 ± 19 | **107%** |
+| Qwen2.5-0.5B | 108 | 173 | 114 ± 8 | **152%** |
+| Llama-3.2-1B | 49 | 91 | 54 ± 0.3 | **170%** |
+
+These were re-measured against the current llama.cpp alongside the 7B above, and unlike that one they held: llama.cpp's f16 rates barely moved (337 → 325, 123 → 114, 52 → 54), because the work that has gone into it since is in the quantized kernels rather than the f16 path. That is the same reason the Q4_K_M comparison flipped and this one did not.
 
 `--pack 8` correlates with the unpacked model at **0.9996–0.9999** and produces identical greedy text, so this is not a quality trade in any sense that shows up in output — it is the same model reading half the bytes.
 
@@ -408,7 +423,7 @@ Three things make it work:
 - **The per-group scales are held in float16** rather than float32, which is what `compact` does: 5 bits per weight instead of 6 on a 4-bit tensor.
 - **The group size is chosen per tensor**, largest that divides the row. A bigger group carries fewer scales, so it is smaller *and* faster: on Qwen at 8 bits, a group of 128 gives 174 tok/s and 625 MB against 165 and 682 for a group of 32, for a correlation that falls only from 0.99989 to 0.99972. It has to divide the row length, which is why it is per tensor rather than global — 896 takes 128, 576 does not and takes 64. That one change was worth 74 → 87 tok/s on Llama-1B.
 
-Be clear about the boundary. Precision-matched, llama.cpp is still ahead: its **Q8_0** kernels beat this at 389 against 343 on SmolLM, and f16 against f16 it wins everywhere by 7–20%. The claim is narrower and still useful — *given an f16 file and no willingness to convert it*, reminis will run it faster than llama.cpp will.
+Be clear about the boundary. Precision-matched, llama.cpp is still ahead: its **Q8_0** kernels beat this at 395 ± 20 against 349 on SmolLM, and f16 against f16 it wins everywhere by 7–20%. The claim is narrower and still useful — *given an f16 file and no willingness to convert it*, reminis will run it faster than llama.cpp will.
 
 ### Against llama.cpp, generating tokens
 

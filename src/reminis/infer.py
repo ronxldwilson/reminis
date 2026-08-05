@@ -237,14 +237,17 @@ class WeightStore:
         mapped against 0.46 ms unmapped, which is 3.7x the wrong way.
 
         So this maps the file when it comfortably fits and does not when it
-        does not, rather than asking for 32 GB and hoping.
+        does not, rather than asking for 32 GB and hoping. Half of physical
+        memory is the line, which is where the two measured points fall
+        either side of: a 4.4 GB model on a 16 GB machine is 7% faster
+        mapped, and a 22.9 GB one is 3.7x slower.
         """
         try:
             size = os.path.getsize(db_path)
             available = os.sysconf("SC_PHYS_PAGES") * os.sysconf("SC_PAGE_SIZE")
         except (OSError, ValueError, AttributeError):
             return 0
-        return size if size * 4 <= available else 0
+        return size if size * 2 <= available else 0
 
     def has(self, name: str) -> bool:
         return name in self._shapes
