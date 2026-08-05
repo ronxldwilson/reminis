@@ -505,7 +505,7 @@ Both are round-to-nearest against a per-block scale taken from the block's large
 
 The block layouts are verified against the `gguf` package's own dequantizer rather than against reminis's, since agreeing with yourself proves nothing. Q8_0 lands inside half a step of its grid; Q4_0 inside a whole step, because its codes span −8..+7 and a weight opposite in sign to its block's extreme clips at 7/8 — that asymmetry is the format, not the quantizer.
 
-Note that `reminis export` currently drops array-valued metadata, so an exported GGUF loses its tokenizer and llama.cpp will not load it ([#12](https://github.com/ronxldwilson/reminis/issues/12)). That affects every export, not only quantized ones.
+Note that `reminis export` currently drops array-valued metadata, so an exported GGUF loses its tokenizer and llama.cpp will not load it ([#11](https://github.com/ronxldwilson/reminis/issues/11)). That affects every export, not only quantized ones.
 
 ### Quantization coverage
 
