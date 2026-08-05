@@ -1,6 +1,6 @@
 [project]
 name = "reminis"
-version = "0.15.0"
+version = "0.16.0"
 description = "Store LLM weights in a SQLite database. Convert GGUF and safetensors losslessly, query, diff, and package fine-tunes as delta packs."
 readme = "README.md"
 requires-python = ">=3.10"

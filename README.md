@@ -283,7 +283,14 @@ The largest thing that fits here, measured rather than estimated. Mistral-7B-Ins
 
 Everything above 7B on this machine is a question of arithmetic rather than capability: a 13B at Q4_K_M would land near 8.8 GB packed compact, which fits; a 30B would not.
 
-Two caveats on that row. Loading takes ~83 s, because the repack runs in numpy — it is one pass over the model and nothing has been done to speed it up. And Mistral v0.3 ships a SentencePiece tokenizer, which `reminis run` does not implement, so that measurement drives the forward pass with token ids directly. A 7B with a byte-level BPE tokenizer — Llama 3, Qwen 2.5 — runs end to end.
+Mistral-7B runs end to end now that SentencePiece is implemented:
+
+```
+$ reminis run models/mistral7b.db "The capital of France is" -n 24 --temp 0 --pack compact
+The capital of France is Paris, but the largest city is Marseille.
+```
+
+One caveat on that row: loading takes ~83 s, because the repack runs in numpy. It is one pass over the model and nothing has been done to speed it up.
 
 This closes most of the gap with llama.cpp on quantized weights — the values multiplied are now exactly the ones in the file — without closing it entirely: llama.cpp still reads the original blocks with no repack step and no float32 scale array beside them.
 
@@ -680,7 +687,7 @@ Implemented, and enforced rather than assumed:
 - **Attention sinks** — a learned per-head logit that joins the softmax denominator without contributing a value, letting a head attend to nothing in particular.
 - **Sliding-window attention** — layers that see only the most recent N keys, alternating with full-attention layers on whatever pattern the metadata records.
 - **Float weights** — F32, F16, BF16.
-- **Byte-level BPE**, rebuilt from the vocabulary and merge list in the database, matching `transformers` exactly across three tokenizer families.
+- **Two tokenizer families**, both rebuilt from the database. Byte-level BPE (`gpt2`) matches `transformers` exactly across three vocabularies. SentencePiece (`llama`) matches llama.cpp exactly on 14 strings including special tokens, byte fallback and whitespace edges — it has no merge list at all, merging instead by a score attached to each token, so the vocabulary itself encodes the merge order.
 
 Anything else raises. A state-space model is refused by name; a quantized tensor is refused before it can be decoded as though its blocks were floats. A forward pass that guesses produces fluent nonsense, which is worse than an error.
 
@@ -851,7 +858,7 @@ Note that GGUF and safetensors use different tensor names (`blk.0.attn_q.weight`
 - [x] Multiplying GGML's blocks with no second rounding, for the affine types (`--pack`)
 - [x] The remaining quant types re-quantized to the nearest width rather than left as float16
 - [x] Mixture-of-experts models: router, stacked experts, packed and gathered
-- [ ] SentencePiece tokenizers, so Mistral and Llama 2 run end to end
+- [x] SentencePiece tokenizers, verified against llama.cpp token for token
 - [ ] Faster repacking at load: 83 s for a 7B, all of it numpy
 - [ ] Running attention-free architectures (Mamba / state space, RWKV)
 - [ ] Unsloth integration

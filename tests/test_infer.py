@@ -443,6 +443,82 @@ def _resident_mb(backend):
         return resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024 ** 2
 
 
+SPM_CASES = [
+    "The capital of France is",
+    "Hello, world!",
+    "It's 2026 and I've got 1234 apples—don't you?",
+    "naïve café résumé 東京 \U0001F680",
+    "[INST] hi [/INST]",
+    "[INST]hi",
+    "x[INST]y",
+    "  leading spaces",
+    "snake_case_name = x_1 + _p",
+    "math: 2+2=4, 3*3=9",
+    "https://example.com/a?b=1",
+    "Dr. Smith went to St. Louis.",
+    "tabs\tand  spaces",
+    'JSON: {"k": [1, 2.5, null]}',
+]
+
+
+def test_sentencepiece_tokenizer():
+    """SentencePiece ids against llama.cpp's, on the same file.
+
+    SentencePiece has no merge list: it merges whichever adjacent pair forms
+    the highest-scoring token in the vocabulary, so the vocabulary encodes
+    the merge order. Small differences in that ordering, or in where the
+    leading space goes, produce ids that still decode to the right text and
+    still generate fluent output -- which is why this compares against the
+    reference implementation rather than checking a round-trip.
+    """
+    print("\nSentencePiece against llama.cpp")
+    model_db = MODELS_DIR / "mistral7b.db"
+    gguf = MODELS_DIR / "Mistral-7B-Instruct-v0.3-Q4_K_M.gguf"
+    if not model_db.exists():
+        print("  skip  no SentencePiece model present")
+        return
+
+    import shutil
+    import sqlite3 as sq
+
+    from reminis.infer import build_tokenizer
+
+    meta = dict(sq.connect(str(model_db)).execute("SELECT key, value FROM model_meta"))
+    tok = build_tokenizer(meta)
+    check("the SentencePiece tokenizer was chosen",
+          type(tok).__name__ == "SPMTokenizer", type(tok).__name__)
+    check("all 256 byte-fallback tokens were found", len(tok.byte_ids) == 256,
+          str(len(tok.byte_ids)))
+
+    if not (shutil.which("llama-tokenize") and gguf.exists()):
+        print("  skip  llama-tokenize or the GGUF is not available for comparison")
+        # Without the reference, at least check that nothing encodes to nothing.
+        check("every case encodes to something",
+              all(tok.encode(c) for c in SPM_CASES))
+        return
+
+    import re
+    import subprocess
+
+    matched, total = 0, 0
+    for case in SPM_CASES:
+        out = subprocess.run(
+            ["llama-tokenize", "-m", str(gguf), "-p", case, "--ids"],
+            capture_output=True, text=True,
+        ).stdout
+        found = re.search(r"\[([\d,\s]+)\]", out)
+        if not found:
+            continue
+        total += 1
+        reference = [int(x) for x in found.group(1).split(",")]
+        if tok.encode(case) == reference:
+            matched += 1
+        else:
+            print(f"        differed on {case!r}")
+    check(f"ids match llama.cpp on all {total} strings", matched == total,
+          f"{matched}/{total}")
+
+
 def test_mixture_of_experts():
     """A router picking experts per token, against the dense path's rules.
 
@@ -551,6 +627,7 @@ def main():
     test_refusals()
     test_quantized_models()
     test_packed_weights()
+    test_sentencepiece_tokenizer()
     test_mixture_of_experts()
     test_merged_model_runs()
 

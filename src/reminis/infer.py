@@ -41,6 +41,7 @@ guesses produces fluent-looking nonsense, which is worse than an error.
 """
 
 import ast
+import heapq
 import math
 import sqlite3
 import sys
@@ -422,19 +423,205 @@ _PRETOKENIZERS["smollm"] = _PRETOKENIZERS["default"]
 _PRETOKENIZERS["gpt-2"] = _PRETOKENIZERS["default"]
 
 
-class Tokenizer:
+def build_tokenizer(meta: dict):
+    """The tokenizer this model was trained with, rebuilt from the database.
+
+    Two families cover everything reminis runs. ``gpt2`` is byte-level BPE,
+    driven by an ordered merge list. ``llama`` is SentencePiece, which has no
+    merge list at all -- it merges by a score attached to each token, so the
+    two share almost no machinery despite both being called BPE.
+    """
+    model = meta.get("tokenizer.ggml.model")
+    if model == "gpt2":
+        return BPETokenizer(meta)
+    if model in ("llama", "spm"):
+        return SPMTokenizer(meta)
+    raise UnsupportedModel(
+        f"This model's tokenizer is '{model or 'missing'}'. reminis run "
+        f"implements byte-level BPE ('gpt2') and SentencePiece ('llama')."
+    )
+
+
+def _numeric_array(meta: dict, key: str) -> list:
+    """A GGUF numeric array, which arrives as one-element lists per entry."""
+    return [
+        v[0] if isinstance(v, (list, tuple)) else v
+        for v in _parse_array(meta, key)
+    ]
+
+
+class SPMTokenizer:
+    """SentencePiece, as llama.cpp implements it.
+
+    There is no merge list. Every token carries a score, and the algorithm
+    repeatedly merges whichever adjacent pair forms the highest-scoring token
+    in the vocabulary -- so the vocabulary itself encodes the merge order.
+    Text is pre-escaped by replacing spaces with U+2581, which is why a
+    leading space appears in almost every token.
+
+    Anything with no token at all falls back to one token per *byte*, which
+    is why the vocabulary contains 256 entries named `<0x00>` through
+    `<0xFF>`.
+    """
+
+    SPACE = "\u2581"
+
+    def __init__(self, meta: dict):
+        self.tokens = _parse_array(meta, "tokenizer.ggml.tokens")
+        self.scores = _numeric_array(meta, "tokenizer.ggml.scores")
+        types = _numeric_array(meta, "tokenizer.ggml.token_type")
+        if not self.tokens or not self.scores:
+            raise UnsupportedModel(
+                "The database has no SentencePiece vocabulary in it."
+            )
+
+        self.ids = {t: i for i, t in enumerate(self.tokens)}
+        # Type 6 is BYTE: the fallback for text with no token of its own.
+        self.byte_ids = {}
+        for i, t in enumerate(types):
+            if int(t) == 6:
+                text = self.tokens[i]
+                if len(text) == 6 and text.startswith("<0x"):
+                    self.byte_ids[int(text[3:5], 16)] = i
+        self.id_to_byte = {i: b for b, i in self.byte_ids.items()}
+
+        self.specials = sorted(
+            (self.tokens[i] for i, t in enumerate(types) if int(t) in (3, 4)),
+            key=len, reverse=True,
+        )
+        import re
+
+        self._re = re
+        self._special_pattern = (
+            re.compile("(" + "|".join(re.escape(s) for s in self.specials) + ")")
+            if self.specials else None
+        )
+
+        self.bos_id = _int_or_none(meta.get("tokenizer.ggml.bos_token_id"))
+        self.eos_id = _int_or_none(meta.get("tokenizer.ggml.eos_token_id"))
+        # SentencePiece models add the beginning-of-text token by default,
+        # and prepend a space so the first word looks like any other.
+        self.add_bos = str(
+            meta.get("tokenizer.ggml.add_bos_token", "True")
+        ).lower() == "true"
+        self.add_space_prefix = str(
+            meta.get("tokenizer.ggml.add_space_prefix", "True")
+        ).lower() == "true"
+        self.chat_template = meta.get("tokenizer.chat_template", "")
+
+    def encode(self, text: str, add_special: bool = True) -> list[int]:
+        ids = []
+        if add_special and self.add_bos and self.bos_id is not None:
+            ids.append(self.bos_id)
+
+        chunks = self._special_pattern.split(text) if self._special_pattern else [text]
+        for chunk in chunks:
+            if not chunk:
+                continue
+            if chunk in self.ids and chunk in self.specials:
+                ids.append(self.ids[chunk])
+                continue
+            ids.extend(self._encode_piece(chunk))
+        return ids
+
+    def _encode_piece(self, text: str) -> list[int]:
+        # Every stretch of ordinary text gets the leading space, not just the
+        # first: "x[INST]y" encodes its "y" as "_y", the same as its "x".
+        # Checked against llama.cpp, which does the same.
+        if self.add_space_prefix:
+            text = " " + text
+        text = text.replace(" ", self.SPACE)
+        if not text:
+            return []
+
+        chars = list(text)
+        n = len(chars)
+        # A doubly linked list over the characters, so merging is a pointer
+        # update rather than a rebuild of the sequence.
+        length = [1] * n
+        prev = list(range(-1, n - 1))
+        nxt = list(range(1, n + 1))
+        nxt[-1] = -1
+
+        heap = []
+
+        def consider(left, right):
+            if left == -1 or right == -1:
+                return
+            piece = "".join(chars[left:left + length[left] + length[right]])
+            token = self.ids.get(piece)
+            if token is None:
+                return
+            # A min-heap over (-score, left) is a max-heap over score that
+            # breaks ties toward the earlier position, which is the order
+            # llama.cpp's priority queue produces.
+            heapq.heappush(heap, (-self.scores[token], left, right, len(piece)))
+
+        for i in range(1, n):
+            consider(i - 1, i)
+
+        while heap:
+            _, left, right, size = heapq.heappop(heap)
+            if length[left] == 0 or length[right] == 0:
+                continue
+            if length[left] + length[right] != size:
+                continue
+
+            length[left] += length[right]
+            length[right] = 0
+            nxt[left] = nxt[right]
+            if nxt[right] != -1:
+                prev[nxt[right]] = left
+
+            consider(prev[left], left)
+            consider(left, nxt[left])
+
+        out = []
+        i = 0
+        while i != -1:
+            self._emit("".join(chars[i:i + length[i]]), out)
+            i = nxt[i]
+        return out
+
+    def _emit(self, piece, out):
+        """One surviving run to ids, or to its raw bytes if it has no token.
+
+        A run only ever grew by merging into a string the vocabulary
+        contains, so anything left without a token is a single character the
+        model has never seen -- and those become one token per UTF-8 byte.
+        """
+        token = self.ids.get(piece)
+        if token is not None:
+            out.append(token)
+            return
+        for byte in piece.encode("utf-8"):
+            if byte in self.byte_ids:
+                out.append(self.byte_ids[byte])
+
+    def decode(self, ids: list[int]) -> str:
+        out = bytearray()
+        for i in ids:
+            if i in self.id_to_byte:
+                out.append(self.id_to_byte[i])
+                continue
+            if 0 <= i < len(self.tokens):
+                out += self.tokens[i].replace(self.SPACE, " ").encode("utf-8")
+        text = out.decode("utf-8", errors="replace")
+        return text[1:] if self.add_space_prefix and text.startswith(" ") else text
+
+    def decode_one(self, token_id: int) -> str:
+        if token_id in self.id_to_byte:
+            return bytes([self.id_to_byte[token_id]]).decode("utf-8", errors="replace")
+        if 0 <= token_id < len(self.tokens):
+            return self.tokens[token_id].replace(self.SPACE, " ")
+        return ""
+
+
+class BPETokenizer:
     """Byte-level BPE, rebuilt from the vocabulary and merges in the database."""
 
     def __init__(self, meta: dict):
         import re
-
-        model = meta.get("tokenizer.ggml.model")
-        if model != "gpt2":
-            raise UnsupportedModel(
-                f"This model's tokenizer is '{model or 'missing'}'. reminis run "
-                f"implements byte-level BPE (the 'gpt2' tokenizer), which is "
-                f"what llama, qwen2 and smollm use."
-            )
 
         self.tokens = _parse_array(meta, "tokenizer.ggml.tokens")
         merges = _parse_array(meta, "tokenizer.ggml.merges")
@@ -576,7 +763,7 @@ class Model:
         meta = dict(self.store.conn.execute("SELECT key, value FROM model_meta"))
         self.meta = meta
         self.cfg = Config(meta, self.store)
-        self.tokenizer = Tokenizer(meta)
+        self.tokenizer = build_tokenizer(meta)
         self._layer_cache: dict[int, tuple] = {}
         self._rope_cache: tuple | None = None
         self._mask_cache: dict = {}
@@ -1130,7 +1317,7 @@ def generate(
         model.close()
 
 
-def _apply_chat_template(prompt: str, tok: Tokenizer) -> str:
+def _apply_chat_template(prompt: str, tok) -> str:
     """Wrap a prompt as a chat turn, for models that use ChatML.
 
     The stored template is Jinja, and rendering Jinja to run one prompt is
