@@ -46,6 +46,7 @@ import math
 import sqlite3
 import sys
 import time
+from collections import OrderedDict
 from functools import lru_cache
 from pathlib import Path
 
@@ -56,6 +57,7 @@ from reminis.dtypes import (
     dequantize_to_float32,
     is_float_dtype,
     is_quantized_dtype,
+    to_float32_any,
 )
 from reminis.ggml_affine import AFFINE_GROUP, can_repack, nearest_bits
 from reminis.ggml_affine import repack as ggml_repack
@@ -67,6 +69,7 @@ from reminis.ggml_affine import repack as ggml_repack
 #   "norm" rotates adjacent pairs (0,1), (2,3), ...   -- llama, mistral
 #   "neox" rotates halves,  i with i + head_dim/2     -- qwen2
 SUPPORTED_ARCHS = {
+    "gpt-oss": "neox",
     "llama": "norm",
     "mistral": "norm",
     "granite": "norm",
@@ -120,6 +123,15 @@ class WeightStore:
         self.pack_group = pack_group
         self.packed = 0
         self.packed_native = 0
+        # Routing-aware expert loading: how many decoded experts to keep, and
+        # at what width. Off unless asked for.
+        self.expert_cache_size = 0
+        self.expert_bits = None
+        self._expert_cache = OrderedDict()
+        self._expert_shapes = {}
+        self._blobs = {}
+        self._expert_hits = 0
+        self._expert_misses = 0
         self.conn = sqlite3.connect(db_path)
         self.conn.execute("PRAGMA query_only = 1")
         # Memory-map the file rather than copying each blob through SQLite's
@@ -256,6 +268,72 @@ class WeightStore:
         return self.backend.adopt_packed(words, scales, biases, bits,
                                          AFFINE_GROUP, dims, self.pack_compact)
 
+    def expert(self, name: str, index: int):
+        """One expert out of a stacked tensor, read on its own.
+
+        A mixture of experts stores all of them in a single 3-D tensor, and
+        a token uses a handful. Loading the whole stack to use four of
+        thirty-two reads eight times more than the forward pass needs --
+        which is fine when the model fits in memory and ruinous when it does
+        not.
+
+        Each expert is a contiguous run of that blob, so reading one is a
+        byte range: incremental blob I/O rather than fetching the tensor and
+        throwing most of it away. Recently used experts are kept, because
+        routing is stable enough across tokens for that to pay.
+        """
+        key = (name, index)
+        cached = self._expert_cache.get(key)
+        if cached is not None:
+            self._expert_cache.move_to_end(key)
+            self._expert_hits += 1
+            return cached
+
+        rowid, dtype, shape, n_bytes = self._expert_meta(name)
+        dims = tuple(ast.literal_eval(shape))[::-1]
+        n_experts = dims[0]
+        stride = n_bytes // n_experts
+
+        handle = self._blobs.get(name)
+        if handle is None:
+            handle = self.conn.blobopen("tensors", "data", rowid, readonly=True)
+            self._blobs[name] = handle
+        raw = handle[index * stride:(index + 1) * stride]
+
+        self.bytes_read += len(raw)
+        self.reads += 1
+        self._expert_misses += 1
+
+        # Let the backend unpack the block format itself where it can: that
+        # uploads the bytes the file holds rather than a float32 expansion
+        # of them, and does the arithmetic on the device.
+        native = getattr(self.backend, f"dequantize_{dtype.lower()}", None)
+        if native is not None:
+            arr = native(raw, dims[1:])
+        else:
+            arr = self.backend.from_numpy(
+                to_float32_any(raw, dtype).reshape(dims[1:])
+            )
+        if self.expert_bits:
+            arr = self.backend.pack(arr, self.expert_bits,
+                                    _best_group(dims[-1]), True)
+        self.backend.eval(arr if not hasattr(arr, "q") else arr.q)
+
+        self._expert_cache[key] = arr
+        while len(self._expert_cache) > self.expert_cache_size:
+            self._expert_cache.popitem(last=False)
+        return arr
+
+    def _expert_meta(self, name: str):
+        meta = self._expert_shapes.get(name)
+        if meta is None:
+            meta = self.conn.execute(
+                "SELECT id, dtype, shape, n_bytes FROM tensors WHERE name = ?",
+                (name,),
+            ).fetchone()
+            self._expert_shapes[name] = meta
+        return meta
+
     def get_numpy(self, name: str) -> np.ndarray:
         """A tensor as plain float32 numpy, whatever the backend is.
 
@@ -276,7 +354,17 @@ class WeightStore:
         """Forget a cached tensor, once something else stands in for it."""
         self._cache.pop(name, None)
 
+    def can_stream_experts(self) -> bool:
+        """Whether byte-range reads are available for expert loading."""
+        return hasattr(self.conn, "blobopen")
+
     def close(self):
+        for handle in self._blobs.values():
+            try:
+                handle.close()
+            except Exception:
+                pass
+        self._blobs.clear()
         self.conn.close()
 
 
@@ -294,6 +382,42 @@ def _best_group(row_length: int, limit: int = 128) -> int:
         if group <= limit and row_length % group == 0:
             return group
     return 32
+
+
+def _yarn_periods(dim, base, scale, orig_context, beta_fast, beta_slow):
+    """Rotary periods under YaRN, which stretches long contexts unevenly.
+
+    Simple position interpolation divides every frequency by the same
+    factor, which preserves long-range structure and destroys the
+    high-frequency detail nearby tokens depend on. YaRN interpolates only
+    the slow dimensions, leaves the fast ones alone, and ramps between the
+    two -- so `beta_fast` and `beta_slow` name the wavelengths where that
+    ramp starts and ends.
+
+    Returned as periods rather than frequencies, since that is what the
+    rotary kernels take.
+    """
+    half = dim // 2
+    periods = base ** (np.arange(half, dtype=np.float64) * 2.0 / dim)
+    if not orig_context:
+        return (periods * scale).astype(np.float32)
+
+    def correction(rotations):
+        return (dim * math.log(orig_context / (rotations * 2 * math.pi))
+                / (2 * math.log(base)))
+
+    low = math.floor(correction(beta_fast))
+    high = math.ceil(correction(beta_slow))
+    low, high = max(low, 0), min(high, half - 1)
+    if high <= low:
+        high = low + 0.001
+
+    # 1 where a dimension is left alone, 0 where it is fully interpolated.
+    keep = 1.0 - np.clip(
+        (np.arange(half, dtype=np.float64) - low) / (high - low), 0, 1
+    )
+    inv_freq = (1.0 / (periods * scale)) * (1 - keep) + (1.0 / periods) * keep
+    return (1.0 / inv_freq).astype(np.float32)
 
 
 class Config:
@@ -344,8 +468,19 @@ class Config:
         # Llama 3 divides each rotary frequency by a stored factor. Folding
         # that in once here means the kernels take plain frequencies and
         # neither backend needs to know the model does anything unusual.
+        self.rope_scaling = str(meta.get(f"{a}.rope.scaling.type", "")).lower()
+        self.rope_scale_factor = float(num("rope.scaling.factor", 1.0))
+        self.rope_orig_context = int(num("rope.scaling.original_context_length", 0))
+        self.yarn_beta_fast = float(num("rope.scaling.yarn_beta_fast", 32.0))
+        self.yarn_beta_slow = float(num("rope.scaling.yarn_beta_slow", 1.0))
+
         half = self.rope_dim // 2
-        if self.rope_factors is not None:
+        if self.rope_scaling == "yarn" and self.rope_scale_factor > 1:
+            self.rope_freqs = _yarn_periods(
+                self.rope_dim, self.rope_base, self.rope_scale_factor,
+                self.rope_orig_context, self.yarn_beta_fast, self.yarn_beta_slow,
+            )
+        elif self.rope_factors is not None:
             base_freqs = 1.0 / (
                 self.rope_base ** (np.arange(half, dtype=np.float32) * 2.0 / self.rope_dim)
             )
@@ -371,7 +506,20 @@ class Config:
         # that use one usually alternate: some layers see everything, the
         # rest see a window, which is how they keep long contexts affordable.
         self.sliding_window = int(num("attention.sliding_window", 0))
-        self.swa_pattern = int(num("attention.sliding_window_pattern", 0))
+        # Models that alternate rarely record the pattern; two -- one
+        # windowed layer for each full one -- is what the metadata omits.
+        self.swa_pattern = int(num("attention.sliding_window_pattern", 0)) or (
+            2 if self.sliding_window else 0
+        )
+
+        # gpt-oss's gated feed-forward is not the usual SwiGLU. It clamps
+        # both projections, uses sigmoid(1.702 * gate) rather than the plain
+        # sigmoid of SiLU, and multiplies by (up + 1) rather than up. Using
+        # the standard form instead produces grammatical text that answers
+        # nothing, which is the worst way for this to be wrong.
+        self.glu_alpha = 1.702 if self.arch == "gpt-oss" else 1.0
+        self.glu_limit = 7.0 if self.arch == "gpt-oss" else 0.0
+        self.glu_up_offset = 1.0 if self.arch == "gpt-oss" else 0.0
 
         self.embedding_scale = float(num("embedding_scale", 1.0))
         self.residual_scale = float(num("residual_scale", 1.0))
@@ -446,6 +594,24 @@ _PRETOKENIZERS = {
         r"|\s+"
     ),
 }
+# gpt-4o's splitter needs Unicode case categories -- an uppercase run
+# followed by a lowercase run, with a contraction attached to the word
+# rather than split from it, so "It's" is one piece and not two. Python's
+# `re` has no \p{Lu}, so this one is only available when the `regex`
+# module is installed, and the tokenizer says so rather than quietly
+# splitting differently from every other implementation.
+_GPT4O_PATTERN = (
+    r"[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]*"
+    r"[\p{Ll}\p{Lm}\p{Lo}\p{M}]+(?i:'s|'t|'re|'ve|'m|'ll|'d)?"
+    r"|[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]+"
+    r"[\p{Ll}\p{Lm}\p{Lo}\p{M}]*(?i:'s|'t|'re|'ve|'m|'ll|'d)?"
+    r"|\p{N}{1,3}"
+    r"| ?[^\s\p{L}\p{N}]+[\r\n/]*"
+    r"|\s*[\r\n]+"
+    r"|\s+(?!\S)"
+    r"|\s+"
+)
+
 _PRETOKENIZERS["qwen2"] = _PRETOKENIZERS["llama-bpe"]
 _PRETOKENIZERS["smollm"] = _PRETOKENIZERS["default"]
 _PRETOKENIZERS["gpt-2"] = _PRETOKENIZERS["default"]
@@ -676,7 +842,20 @@ class BPETokenizer:
         )
 
         pre = meta.get("tokenizer.ggml.pre", "default")
-        self.pattern = re.compile(_PRETOKENIZERS.get(pre, _PRETOKENIZERS["default"]))
+        if pre == "gpt-4o":
+            try:
+                import regex
+            except ImportError:
+                raise UnsupportedModel(
+                    "This model uses the gpt-4o pre-tokenizer, which needs "
+                    "Unicode case classes that Python's `re` does not have.\n"
+                    "  pip install regex"
+                )
+            self.pattern = regex.compile(_GPT4O_PATTERN)
+        else:
+            self.pattern = re.compile(
+                _PRETOKENIZERS.get(pre, _PRETOKENIZERS["default"])
+            )
         self._special_pattern = (
             re.compile("(" + "|".join(re.escape(s) for s in self.specials) + ")")
             if self.specials else None
@@ -784,10 +963,20 @@ class Model:
     """
 
     def __init__(self, db_path: str, stream: bool = False, backend=None,
-                 pack_bits=None, pack_group: int = 128):
+                 pack_bits=None, pack_group: int = 128,
+                 expert_cache: int = 0, expert_bits=None):
         self.backend = backend or select_backend("inference")
         self.store = WeightStore(db_path, stream=stream, backend=self.backend,
                                  pack_bits=pack_bits, pack_group=pack_group)
+        if expert_cache:
+            if not self.store.can_stream_experts():
+                raise UnsupportedModel(
+                    "Loading experts on demand needs incremental blob reads, "
+                    "which arrived in Python 3.11. On 3.10 the whole expert "
+                    "stack has to be read at once."
+                )
+            self.store.expert_cache_size = expert_cache
+            self.store.expert_bits = expert_bits
         meta = dict(self.store.conn.execute("SELECT key, value FROM model_meta"))
         self.meta = meta
         self.cfg = Config(meta, self.store)
@@ -951,9 +1140,14 @@ class Model:
             return cached
 
         p = f"blk.{layer}."
+        # Some models call the norm before the feed-forward "ffn_norm" and
+        # others "post_attention_norm" -- the same position in the block,
+        # named for what comes before it rather than after.
+        ffn_norm_name = (p + "ffn_norm.weight" if self.store.has(p + "ffn_norm.weight")
+                         else p + "post_attention_norm.weight")
         entry = (
             self.store.get(p + "attn_norm.weight").reshape(-1),
-            self.store.get(p + "ffn_norm.weight").reshape(-1),
+            self.store.get(ffn_norm_name).reshape(-1),
             p,
         )
         if not self.store.stream:
@@ -1025,6 +1219,79 @@ class Model:
         return b.fused_ffn(x, ffn_norm, gate_up,
                            self.store.get(p + "ffn_down.weight"), cfg.rms_eps)
 
+    def _expert_proj(self, x, prefix, name, idx, k, n_rows):
+        """One projection through the experts chosen for each row.
+
+        Some mixtures carry a bias per expert as well as a weight, and it
+        has to be gathered alongside -- each row takes the bias of the
+        expert it was routed to, not a shared one.
+        """
+        b = self.backend
+        out = b.gather_matmul(x, self.store.get(f"{prefix}{name}.weight"), idx, k)
+        bias_name = f"{prefix}{name}.bias"
+        if self.store.has(bias_name):
+            bias = self.store.get(bias_name)
+            out = out + b.xp.take(bias, idx.reshape(-1), axis=0).reshape(
+                n_rows, k, -1
+            )
+        return out
+
+    def _moe_on_demand(self, h, prefix, idx, k, n_tokens):
+        """Run the chosen experts, fetching each from the database as needed.
+
+        One expert at a time, so what has to be resident is a few matrices
+        rather than the whole stack. That is the trade the database makes
+        available and a memory-mapped file does not: the router says which
+        rows are wanted before any of them are read.
+        """
+        b = self.backend
+        chosen = np.asarray(b.to_numpy(idx)).astype(int).reshape(n_tokens, k)
+        results = []
+        for token in range(n_tokens):
+            row = h[token:token + 1]
+            total = None
+            for slot in range(k):
+                expert = int(chosen[token, slot])
+                gate = self._one_expert(row, prefix, "ffn_gate_exps", expert)
+                up = self._one_expert(row, prefix, "ffn_up_exps", expert)
+                piece = self._one_expert(
+                    self._glu(gate, up), prefix, "ffn_down_exps", expert)
+                total = piece if total is None else b.xp.concatenate(
+                    [total, piece], axis=0)
+            results.append(total)
+        return b.xp.stack(results, axis=0)
+
+    def _glu(self, gate, up):
+        """The gated activation, in whichever form this model was trained on.
+
+        Everything here is SwiGLU -- gate * sigmoid(gate) * up -- except
+        gpt-oss, which clamps both sides, scales the sigmoid's input, and
+        offsets the up projection by one.
+        """
+        b = self.backend
+        cfg = self.cfg
+        if not cfg.glu_limit:
+            return b.silu(gate) * up
+        xp = b.xp
+        gate = xp.minimum(gate, cfg.glu_limit)
+        up = xp.clip(up, -cfg.glu_limit, cfg.glu_limit)
+        activated = gate * b.sigmoid(gate * cfg.glu_alpha)
+        return (up + cfg.glu_up_offset) * activated
+
+    def _one_expert(self, x, prefix, name, expert: int):
+        """One projection through one expert, weight and bias alike.
+
+        The bias tensors are small enough to hold whole -- one value per
+        output, against a matrix per expert -- so only the weight is worth
+        fetching a row at a time.
+        """
+        b = self.backend
+        out = b.matmul_weight(x, self.store.expert(f"{prefix}{name}.weight", expert))
+        bias_name = f"{prefix}{name}.bias"
+        if self.store.has(bias_name):
+            out = out + self.store.get(bias_name)[expert]
+        return out
+
     def _moe_ffn(self, h, p: str):
         """A router picks a few experts per token; their outputs are summed.
 
@@ -1041,20 +1308,26 @@ class Model:
         n_tokens = h.shape[0]
 
         router = self.store.get(p + "ffn_gate_inp.weight")
-        probs = b.softmax(b.to_compute32(h @ router.T))
+        logits = h @ router.T
+        if self.store.has(p + "ffn_gate_inp.bias"):
+            logits = logits + self.store.get(p + "ffn_gate_inp.bias").reshape(-1)
+        probs = b.softmax(b.to_compute32(logits))
 
         # The k largest, then renormalised so the chosen weights sum to one.
         idx = xp.argpartition(-probs, k - 1, axis=-1)[:, :k]
         weight = xp.take_along_axis(probs, idx, axis=-1)
         weight = weight / xp.sum(weight, axis=-1, keepdims=True)
 
-        gate = b.gather_matmul(h, self.store.get(p + "ffn_gate_exps.weight"), idx, k)
-        up = b.gather_matmul(h, self.store.get(p + "ffn_up_exps.weight"), idx, k)
-        hidden = (b.silu(gate) * up).reshape(n_tokens * k, -1)
-        out = b.gather_matmul(
-            hidden, self.store.get(p + "ffn_down_exps.weight"),
-            idx.reshape(-1)[:, None], 1,
-        ).reshape(n_tokens, k, -1)
+        if self.store.expert_cache_size:
+            out = self._moe_on_demand(h, p, idx, k, n_tokens)
+        else:
+            gate = self._expert_proj(h, p, "ffn_gate_exps", idx, k, n_tokens)
+            up = self._expert_proj(h, p, "ffn_up_exps", idx, k, n_tokens)
+            hidden = (b.silu(gate) * up).reshape(n_tokens * k, -1)
+            out = self._expert_proj(
+                hidden, p, "ffn_down_exps", idx.reshape(-1)[:, None], 1,
+                n_tokens * k,
+            ).reshape(n_tokens, k, -1)
         return xp.sum(out * weight.astype(out.dtype)[..., None], axis=1)
 
     def _layer_slides(self, layer: int) -> bool:

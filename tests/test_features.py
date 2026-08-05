@@ -360,12 +360,173 @@ def test_cli_rejects_registry():
         shutil.rmtree(tmp, ignore_errors=True)
 
 
+GPTOSS = MODELS_DIR / "gptoss20b.db"
+
+
+def test_yarn():
+    """YaRN must stretch the slow dimensions and leave the fast ones alone.
+
+    That asymmetry is the whole idea: interpolating every frequency equally
+    preserves long-range structure and destroys the detail nearby tokens
+    depend on. A wrong implementation still produces a plausible-looking
+    array of numbers, so the shape is what gets checked.
+    """
+    print("\nYaRN rotary scaling")
+    from reminis.infer import _yarn_periods
+
+    dim, base, scale = 64, 150000.0, 32.0
+    periods = _yarn_periods(dim, base, scale, 4096, 32.0, 1.0)
+    plain = base ** (np.arange(dim // 2) * 2.0 / dim)
+    ratio = periods / plain
+
+    check("the fastest dimensions are left untouched",
+          abs(ratio[0] - 1.0) < 0.01, f"ratio {ratio[0]:.4f}")
+    check("the slowest dimensions are stretched by the full factor",
+          abs(ratio[-1] - scale) < 0.01, f"ratio {ratio[-1]:.4f}")
+    # The periods are float32, so the flat stretches wobble by an ulp --
+    # at a ratio of 32 that is around 4e-06, which is not a fall in the ramp.
+    wobble = np.finfo(np.float32).eps * scale * 4
+    check("the ramp between them never decreases",
+          bool(np.all(np.diff(ratio) >= -wobble)),
+          f"largest fall {np.diff(ratio).min():.2e} against tolerance {wobble:.2e}")
+    check("nothing is stretched beyond the factor",
+          bool(np.all(ratio <= scale + 1e-3)))
+
+    # With no original context recorded there is no ramp to compute, and
+    # every frequency is interpolated equally.
+    plainly = _yarn_periods(dim, base, scale, 0, 32.0, 1.0)
+    check("without an original context length it is plain interpolation",
+          np.allclose(plainly / plain, scale, rtol=1e-5))
+
+
+def test_gptoss_activation():
+    """gpt-oss's gated activation is not SwiGLU, and must not be treated as it."""
+    print("\ngpt-oss gated activation")
+    if not SMOL.exists():
+        print("  skip  need a model to borrow a backend from")
+        return
+
+    model = Model(str(SMOL))
+    try:
+        b = model.backend
+        gate = b.from_numpy(np.array([[-2.0, 0.5, 9.0, 3.0]], dtype=np.float32))
+        up = b.from_numpy(np.array([[1.0, -9.0, 2.0, 0.0]], dtype=np.float32))
+
+        standard = b.to_numpy(model._glu(gate, up))
+        want_standard = b.to_numpy(b.silu(gate) * up)
+        check("a normal model gets plain SwiGLU",
+              np.allclose(standard, want_standard, atol=1e-3))
+
+        model.cfg.glu_alpha, model.cfg.glu_limit = 1.702, 7.0
+        model.cfg.glu_up_offset = 1.0
+        got = b.to_numpy(model._glu(gate, up))
+
+        g = np.minimum(np.array([[-2.0, 0.5, 9.0, 3.0]]), 7.0)
+        u = np.clip(np.array([[1.0, -9.0, 2.0, 0.0]]), -7.0, 7.0)
+        want = (u + 1.0) * (g / (1.0 + np.exp(-1.702 * g)))
+        check("gpt-oss clamps, scales the sigmoid, and offsets up by one",
+              np.allclose(got, want, atol=2e-2),
+              f"got {got.round(3)}, want {want.round(3)}")
+        check("...and that is not what SwiGLU gives",
+              not np.allclose(got, want_standard, atol=1e-2))
+    finally:
+        model.cfg.glu_limit = 0.0
+        model.close()
+
+
+def test_mxfp4_on_device():
+    """Unpacking MXFP4 on the GPU must match unpacking it in numpy exactly."""
+    print("\nMXFP4 unpacked on the device")
+    if not GPTOSS.exists():
+        print("  skip  no MXFP4 model present")
+        return
+    backend = select("inference")
+    if not hasattr(backend, "dequantize_mxfp4"):
+        print(f"  skip  {backend.name} has no device-side MXFP4")
+        return
+
+    import ast as _ast
+
+    from reminis.dtypes import to_float32_any
+
+    conn = sqlite3.connect(str(GPTOSS))
+    row = conn.execute(
+        "SELECT id, dtype, shape, n_bytes FROM tensors "
+        "WHERE dtype = 'MXFP4' LIMIT 1"
+    ).fetchone()
+    if row is None:
+        print("  skip  no MXFP4 tensors")
+        conn.close()
+        return
+    rowid, dtype, shape, n_bytes = row
+    dims = tuple(_ast.literal_eval(shape))[::-1]
+    stride = n_bytes // dims[0]
+    handle = conn.blobopen("tensors", "data", rowid, readonly=True)
+    raw = handle[:stride]
+    handle.close()
+    conn.close()
+
+    want = to_float32_any(raw, dtype).reshape(dims[1:])
+    got = backend.to_numpy(backend.dequantize_mxfp4(raw, dims[1:]))
+    check("device-side MXFP4 is bit-identical to the reference",
+          np.array_equal(got, want),
+          f"max diff {np.abs(got - want).max():.3e}")
+    check("the values look like weights, not noise",
+          abs(float(want.mean())) < 0.01 and 0.001 < float(want.std()) < 1.0,
+          f"mean {want.mean():.5f} std {want.std():.5f}")
+
+
+def test_experts_on_demand():
+    """Loading experts by routing must give what loading them all gives."""
+    print("\nExperts loaded on demand")
+    if not MOE.exists():
+        print("  skip  no mixture-of-experts model present")
+        return
+    store_capable = Model(str(MOE))
+    capable = store_capable.store.can_stream_experts()
+    store_capable.close()
+    if not capable:
+        print("  skip  incremental blob reads need Python 3.11+")
+        return
+
+    texts = {}
+    for cache in (0, 64):
+        model = Model(str(MOE), expert_cache=cache)
+        try:
+            ids = model.tokenizer.encode("The capital of France is",
+                                         add_special=False)
+            kv = KVCache(model.cfg.n_layers, capacity=64, backend=model.backend)
+            logits = model.forward(ids, kv, 0)
+            out = []
+            for _ in range(8):
+                token = int(np.argmax(logits))
+                out.append(token)
+                logits = model.forward([token], kv, kv.length)
+            texts[cache] = model.tokenizer.decode(out)
+            if cache:
+                check("fetching experts by routing actually happened",
+                      model.store._expert_misses > 0,
+                      f"{model.store._expert_misses} fetches")
+                check("the cache is used, not merely filled",
+                      model.store._expert_hits > 0,
+                      f"{model.store._expert_hits} hits")
+        finally:
+            model.close()
+
+    check("on-demand experts give the same text as resident ones",
+          texts[0] == texts[64], f"{texts[0]!r} vs {texts[64]!r}")
+
+
 def main():
     print("=" * 70)
     print("FEATURE AND CLI TESTS")
     print("=" * 70)
 
     test_group_selection()
+    test_yarn()
+    test_gptoss_activation()
+    test_mxfp4_on_device()
+    test_experts_on_demand()
     test_nearest_bits()
     test_embedding_packing()
     test_sliding_window()

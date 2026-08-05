@@ -199,6 +199,9 @@ class Backend:
     def silu(self, x):
         raise NotImplementedError
 
+    def sigmoid(self, x):
+        return 1.0 / (1.0 + self.xp.exp(-x))
+
     def to_compute32(self, x):
         """Widen to float32, for a reduction half precision would spoil.
 
@@ -496,6 +499,35 @@ class MLXBackend(Backend):
     def to_compute32(self, x):
         return x.astype(self.mx.float32)
 
+    # MXFP4 packs 32 weights into 17 bytes: one E8M0 exponent, then 32
+    # four-bit codes indexing a fixed table of levels. Unpacking it in numpy
+    # measured 54 ms for a single expert and then wanted a 33 MB float32
+    # upload; doing it here means uploading the 4.2 MB the file actually
+    # holds and expanding it on the device.
+    _MXFP4_LEVELS = (0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12)
+
+    def dequantize_mxfp4(self, raw, shape):
+        mx = self.mx
+        blocks = mx.array(np.frombuffer(raw, dtype=np.uint8)).reshape(-1, 17)
+        exponent = blocks[:, :1].astype(mx.uint32)
+        codes = blocks[:, 1:]
+
+        # E8M0 to float: the two smallest exponents are denormal cases the
+        # shift below would get wrong, so they are built separately.
+        bits = mx.where(exponent < 2,
+                        mx.array(0x00200000, mx.uint32) << exponent,
+                        (exponent - 1) << mx.array(23, mx.uint32))
+        scale = bits.view(mx.float32)
+
+        # Low nibbles hold the first sixteen weights, high nibbles the rest.
+        low = codes & mx.array(0x0F, mx.uint8)
+        high = codes >> mx.array(4, mx.uint8)
+        table = mx.array(np.array(self._MXFP4_LEVELS, dtype=np.float32))
+        values = mx.take(
+            table, mx.concatenate([low, high], axis=-1).astype(mx.int32)
+        )
+        return (scale * values).reshape(shape).astype(self.compute_dtype)
+
     def quantize_kv(self, x, bits, group_size):
         mx = self.mx
         q, scales, biases = mx.quantize(x, group_size=group_size, bits=bits)
@@ -584,6 +616,9 @@ class MLXBackend(Backend):
         import mlx.nn as nn
 
         return nn.silu(x)
+
+    def sigmoid(self, x):
+        return self.mx.sigmoid(x)
 
 
 class CupyBackend(Backend):

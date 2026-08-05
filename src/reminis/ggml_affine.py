@@ -60,6 +60,9 @@ NEAREST_BITS = {
     "Q6_K": 6,
     "IQ1_S": 2, "IQ1_M": 2, "IQ2_XXS": 2, "IQ2_XS": 3, "IQ2_S": 3,
     "IQ3_XXS": 4, "IQ3_S": 4, "IQ3_M": 4, "IQ4_NL": 4, "IQ4_XS": 4,
+    # MXFP4 shares an exponent across 32 values and stores each as a tiny
+    # float, so its levels are not evenly spaced and no affine form exists.
+    "MXFP4": 4, "NVFP4": 4,
 }
 
 

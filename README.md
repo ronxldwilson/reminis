@@ -302,6 +302,25 @@ One caveat on that row: loading takes ~83 s, because the repack runs in numpy. I
 
 This closes most of the gap with llama.cpp on quantized weights — the values multiplied are now exactly the ones in the file — without closing it entirely: llama.cpp still reads the original blocks with no repack step and no float32 scale array beside them.
 
+### A 20B model in 3.65 GB, by only reading the experts it uses
+
+gpt-oss-20b is 11.27 GB and will not fit alongside anything else on a 16 GB machine. But **84% of it is experts, and a token routes to 4 of 32** — so loading all of them to use an eighth is the waste, and the router says which are wanted *before* any are read.
+
+`--expert-cache` reads each chosen expert as a byte range and keeps the recently used ones:
+
+| | |
+|---|---|
+| Model on disk | 11.27 GB |
+| Read per token | 1.18 GB, not 9.46 |
+| **Resident** | **3.65 GB** |
+| Generation | 0.71 tok/s |
+
+Slow, and it runs at all — which it does not otherwise. This is the one thing the database buys that a memory-mapped file cannot: a deliberate read of the rows the routing selected, rather than the OS guessing from access patterns after the fact.
+
+Two things made it usable rather than merely possible. Profiling showed the database read was **1.1 ms** and irrelevant; the cost was 54 ms unpacking MXFP4 in numpy and 38 ms uploading a 33 MB float32 expansion of a 4.2 MB block. Unpacking on the GPU instead uploads the bytes the file actually holds — **12.5× faster, and bit-identical** to numpy's. That took 0.05 tok/s to 0.71.
+
+Incremental blob reads arrived in Python 3.11, so this needs 3.11 or newer. On 3.10 the whole expert stack is read at once, and `reminis run` says so.
+
 ### Compressing the key/value cache
 
 The weights are a fixed cost; the cache grows with every token. At long context it is the cache, not the model, that decides whether a prompt fits — so `--kv-bits` compresses it.
@@ -728,6 +747,7 @@ Implemented, and enforced rather than assumed:
 
 - **llama-family, qwen2 and Granite architectures** — RMSNorm, SwiGLU, grouped-query attention, rotary embeddings. That covers llama, llama 3 (including its per-dimension rotary scaling, which is stored as a tensor rather than as metadata), mistral, qwen2 (which uses the other rotary layout and has QKV biases), smollm, and Granite (which scales embeddings, residuals, logits and attention by its own constants — `attention.scale` is 1/head_dim where everyone else uses 1/sqrt(head_dim)).
 - **Mixture of experts** — a router picks the top-k of many stacked feed-forward networks per token. The experts are one 3-D tensor per projection, so selecting them is a gather rather than a Python loop, and they pack like any other weight.
+- **gpt-oss**, which needs all of the above plus YaRN rotary scaling, per-expert biases, and its own gated activation — it clamps both projections, uses `sigmoid(1.702·gate)`, and multiplies by `(up + 1)` rather than `up`.
 - **Attention sinks** — a learned per-head logit that joins the softmax denominator without contributing a value, letting a head attend to nothing in particular.
 - **Sliding-window attention** — layers that see only the most recent N keys, alternating with full-attention layers on whatever pattern the metadata records.
 - **Float weights** — F32, F16, BF16.
