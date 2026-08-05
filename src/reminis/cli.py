@@ -80,6 +80,56 @@ def main():
     )
     p_diff.add_argument("-q", "--quiet", action="store_true", help="Suppress progress output")
 
+    # registry: many models in one database
+    p_reg = sub.add_parser(
+        "registry",
+        help="Keep many related models in one database, derived ones as deltas",
+    )
+    reg_sub = p_reg.add_subparsers(dest="registry_command")
+
+    r_add = reg_sub.add_parser("add", help="Add a model to a registry")
+    r_add.add_argument("registry", help="Path to the registry database (created if new)")
+    r_add.add_argument("source", help="A .gguf, .safetensors, model directory, or .db")
+    r_add.add_argument("--name", required=True, help="Name to store it under")
+    r_add.add_argument(
+        "--parent",
+        help="Store only the difference from this already-registered model. "
+             "Without it, the model is stored in full as a new base.",
+    )
+    r_add.add_argument(
+        "--lossy", nargs="?", const=0.01, type=float, metavar="TOL",
+        help="With --parent, allow low-rank encoding within TOL relative error",
+    )
+    r_add.add_argument("--notes", help="Free-text note stored alongside the model")
+    r_add.add_argument("-q", "--quiet", action="store_true")
+
+    r_lora = reg_sub.add_parser(
+        "add-lora", help="Add a peft LoRA adapter as a derived model"
+    )
+    r_lora.add_argument("registry", help="Path to the registry database")
+    r_lora.add_argument("adapter", help="adapter_model.safetensors, or its directory")
+    r_lora.add_argument("--name", required=True, help="Name to store it under")
+    r_lora.add_argument("--parent", required=True, help="The base it was trained on")
+    r_lora.add_argument("--notes", help="Free-text note stored alongside the model")
+    r_lora.add_argument("-q", "--quiet", action="store_true")
+
+    r_ls = reg_sub.add_parser("ls", help="List the models in a registry")
+    r_ls.add_argument("registry", help="Path to the registry database")
+
+    r_export = reg_sub.add_parser("export", help="Get a model back out of a registry")
+    r_export.add_argument("registry", help="Path to the registry database")
+    r_export.add_argument("--name", required=True, help="Model to export")
+    r_export.add_argument(
+        "-o", "--output", required=True,
+        help="Output path. A .db writes a single-model database; .gguf or "
+             ".safetensors writes that format.",
+    )
+    r_export.add_argument("-q", "--quiet", action="store_true")
+
+    r_rm = reg_sub.add_parser("rm", help="Remove a model from a registry")
+    r_rm.add_argument("registry", help="Path to the registry database")
+    r_rm.add_argument("--name", required=True, help="Model to remove")
+
     # log: inspect a training log
     p_log = sub.add_parser("log", help="Inspect a training log written by reminis.track")
     p_log.add_argument("input", help="Path to the training log database")
@@ -133,9 +183,11 @@ def main():
         )
 
     elif args.command == "info":
+        _reject_registry(args.input, "info")
         _show_info(args.input)
 
     elif args.command == "view":
+        _reject_registry(args.input, "view")
         import webbrowser
         from reminis.viewer import generate_viewer
         html_path = generate_viewer(args.input, args.output)
@@ -150,6 +202,12 @@ def main():
             args.base, args.target, args.output,
             verbose=not args.quiet, lossy_tolerance=args.lossy,
         )
+
+    elif args.command == "registry":
+        if args.registry_command is None:
+            p_reg.print_help()
+            sys.exit(1)
+        _run_registry(args, p_reg)
 
     elif args.command == "log":
         _show_log(args.input, step=args.step, spikes_only=args.spikes)
@@ -199,6 +257,139 @@ def _source_format(db_path: str) -> str:
     finally:
         conn.close()
     return row[0] if row else "gguf"
+
+
+def _is_registry(db_path: str) -> bool:
+    """True if this database holds many models rather than one."""
+    import sqlite3
+
+    if not Path(db_path).exists():
+        return False
+    conn = sqlite3.connect(db_path)
+    try:
+        return conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='models'"
+        ).fetchone() is not None
+    except sqlite3.DatabaseError:
+        return False
+    finally:
+        conn.close()
+
+
+def _reject_registry(db_path: str, command: str):
+    """Single-model commands must not silently aggregate a whole registry.
+
+    `SELECT COUNT(*) FROM tensors` on a registry returns every model's tensors
+    added together, which looks like an answer and is not one.
+    """
+    if _is_registry(db_path):
+        print(
+            f"Error: {db_path} is a registry holding several models, and "
+            f"`reminis {command}` works on one model.\n"
+            f"  List what is inside:   reminis registry ls {db_path}\n"
+            f"  Get one model out:     reminis registry export {db_path} "
+            f"--name <name> -o model.db"
+        )
+        sys.exit(1)
+
+
+def _run_registry(args, parser):
+    from reminis.registry import Registry
+
+    command = args.registry_command
+    # Only `add` may create a registry; the rest operating on a missing path is
+    # a typo, and silently making an empty one would hide it.
+    registry = Registry(args.registry, create=command in ("add", "add-lora"))
+
+    try:
+        if command == "add":
+            if args.lossy is not None and not args.parent:
+                parser.error("--lossy only applies with --parent")
+            verbose = not args.quiet
+            if args.parent:
+                registry.add_derived(
+                    args.source, args.name, args.parent,
+                    lossy_tolerance=args.lossy, notes=args.notes, verbose=verbose,
+                )
+            else:
+                registry.add_base(
+                    args.source, args.name, notes=args.notes, verbose=verbose
+                )
+            if verbose:
+                _print_registry_summary(registry)
+
+        elif command == "add-lora":
+            registry.add_lora(
+                args.adapter, args.name, args.parent,
+                notes=args.notes, verbose=not args.quiet,
+            )
+            if not args.quiet:
+                _print_registry_summary(registry)
+
+        elif command == "ls":
+            _list_registry(registry)
+
+        elif command == "export":
+            out = Path(args.output)
+            if out.suffix == ".db":
+                registry.materialize(args.name, args.output, verbose=not args.quiet)
+            else:
+                registry.export(args.name, args.output, verbose=not args.quiet)
+
+        elif command == "rm":
+            registry.remove(args.name)
+            _print_registry_summary(registry)
+    finally:
+        registry.close()
+
+
+def _list_registry(registry):
+    models = registry.list_models()
+    if not models:
+        print(f"{registry.path} has no models yet.")
+        print("Add one with: reminis registry add <registry.db> <model> --name <name>")
+        return
+
+    print(f"Registry: {registry.path}\n")
+    print(f"  {'NAME':<28} {'KIND':<8} {'PARENT':<20} {'TENSORS':>8} "
+          f"{'FULL SIZE':>11} {'STORED':>11} {'':>7}")
+    print("  " + "-" * 96)
+
+    by_parent = {}
+    for m in models:
+        by_parent.setdefault(m["parent"], []).append(m)
+
+    def emit(parent, depth):
+        for m in by_parent.get(parent, []):
+            indent = "  " * depth
+            label = indent + m["name"]
+            pct = (
+                f"{m['stored_bytes'] / m['logical_bytes'] * 100:.1f}%"
+                if m["logical_bytes"] else ""
+            )
+            flag = " lossy" if m["lossy"] else ""
+            print(f"  {label:<28} {m['kind']:<8} {(m['parent'] or '-'):<20} "
+                  f"{m['n_tensors']:>8} {_fmt(m['logical_bytes']):>11} "
+                  f"{_fmt(m['stored_bytes']):>11} {pct:>7}{flag}")
+            emit(m["name"], depth + 1)
+
+    emit(None, 0)
+
+    s = registry.stats()
+    print("  " + "-" * 96)
+    print(f"\n  {s['models']} models ({s['bases']} base, {s['derived']} derived)")
+    print(f"  Stored separately, these would be: {_fmt(s['logical_bytes'])}")
+    print(f"  This registry file is:             {_fmt(s['file_bytes'])}")
+    if s["savings"] > 0:
+        print(f"  Saved: {s['savings'] * 100:.1f}%  "
+              f"({_fmt(s['logical_bytes'] - s['file_bytes'])})")
+
+
+def _print_registry_summary(registry):
+    s = registry.stats()
+    print(f"\n  Registry now holds {s['models']} models, "
+          f"{_fmt(s['file_bytes'])} on disk "
+          f"(vs {_fmt(s['logical_bytes'])} stored separately)")
 
 
 def _show_log(log_path: str, step: int | None = None, spikes_only: bool = False):

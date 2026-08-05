@@ -29,6 +29,11 @@ reminis convert ./Llama-3.2-1B/
 # Turn a peft LoRA adapter into a delta pack against its base
 reminis lora ./my-adapter/ base.db -o capability.pack.db
 
+# Keep a base and everything fine-tuned from it in ONE database
+reminis registry add      models.db ./Llama-3.2-1B/ --name llama-1b
+reminis registry add-lora models.db ./my-adapter/   --name llama-1b-sql --parent llama-1b
+reminis registry ls models.db
+
 # Inspect what's inside
 reminis info model.db
 
@@ -264,6 +269,72 @@ Verified against peft itself: the applied result is compared tensor-by-tensor ag
 
 `modules_to_save` tensors — ones peft trained outright rather than through a factor pair — are carried in the pack in full. Embedding LoRA (`lora_embedding_A/B`) is not handled yet, and reminis refuses such an adapter rather than writing a pack that quietly omits part of it.
 
+## Many models in one database
+
+A base model and everything fine-tuned from it can live in a single file. Base models store their weights outright; anything derived stores **only what differs**, using the same verified delta encodings as `reminis diff`.
+
+```bash
+# A base, then two peft LoRA fine-tunes of it
+reminis registry add      models.db ./SmolLM2-135M/  --name smollm2-135m
+reminis registry add-lora models.db ./sql-adapter/   --name smollm2-sql  --parent smollm2-135m
+reminis registry add-lora models.db ./chat-adapter/  --name smollm2-chat --parent smollm2-135m
+
+reminis registry ls models.db
+```
+
+```
+  NAME                    KIND     PARENT           TENSORS   FULL SIZE      STORED
+  ------------------------------------------------------------------------------------
+  smollm2-135m            base     -                    272    256.6 MB    256.6 MB  100.0%
+    smollm2-sql           lora     smollm2-135m         272    256.6 MB      3.3 MB    1.3%
+    smollm2-chat          lora     smollm2-135m         272    256.6 MB      3.3 MB    1.3%
+  ------------------------------------------------------------------------------------
+
+  3 models (1 base, 2 derived)
+  Stored separately, these would be: 769.7 MB
+  This registry file is:             263.6 MB
+  Saved: 65.8%  (506.1 MB)
+```
+
+Each fine-tune costs **1.3%** of a full copy. Get any of them back as a real model:
+
+```bash
+reminis registry export models.db --name smollm2-sql -o sql.db
+reminis registry export models.db --name smollm2-sql -o sql.safetensors
+reminis registry export models.db --name smollm2-sql -o sql.gguf
+```
+
+Verified: a model exported from a registry is **byte-identical to peft's own `merge_and_unload()`** — all 272 tensors, same SHA256.
+
+Full fine-tunes work too, they just cost more, because that is genuinely how much they differ:
+
+| Model | Stored |
+|---|---|
+| base (SmolLM-135M) | 256.6 MB — 100% |
+| LoRA-shaped fine-tune | 38.3 MB — 14.9% |
+| LoRA-shaped fine-tune, `--lossy` | ~3 MB — ~1.3% |
+| SmolLM-135M-Instruct (full fine-tune) | 149.5 MB — 58.3% |
+
+Notes on the design:
+
+- Models form a **tree**. A fine-tune of a fine-tune is stored against its immediate parent, and resolving a tensor walks the chain. Tested two levels deep.
+- Every model records the SHA256 of its own weights when added, and that hash is **checked at add time** — if storing a model would not reproduce it, nothing is added. It is checked again on export.
+- Removing a model that others derive from is refused, rather than leaving them unresolvable.
+- Single-model `.db` files are unchanged. A registry is a separate format; `convert` and `export` still produce ordinary one-model files, and a registry ingests or emits them. Pointing `reminis info` at a registry says so instead of silently summing every model together.
+
+```python
+from reminis import Registry
+
+with Registry("models.db") as reg:
+    reg.add_base("./SmolLM2-135M/", "smollm2-135m")
+    reg.add_lora("./sql-adapter/", "smollm2-sql", parent="smollm2-135m")
+
+    for m in reg.list_models():
+        print(m["name"], m["stored_bytes"])
+
+    reg.materialize("smollm2-sql", "sql.db")     # back to a normal database
+```
+
 ## Tracking a training run
 
 `reminis` can record what training did to a model as it happens, so a bad step can be found later with a query rather than a guess.
@@ -407,6 +478,7 @@ Note that GGUF and safetensors use different tensor names (`blk.0.attn_q.weight`
 - [x] Fine-tune tracking with edit logs (`reminis log`)
 - [x] Hash-verified rewind to a snapshot (`reminis rollback`)
 - [x] Measured why *surgical* rollback of a mid-run step does not work
+- [x] Many models in one database, derived ones stored as deltas (`reminis registry`)
 - [ ] Model merging via SQL operations
 - [ ] Inference from database-stored weights
 - [ ] Unsloth integration

@@ -1,10 +1,11 @@
 """reminis - Your model's weights are just data. Store them in a database."""
 
-__version__ = "0.5.0"
+__version__ = "0.6.0"
 
 from reminis.converter import gguf_to_sqlite, sqlite_to_gguf
 from reminis.diff import apply_delta, diff_models
 from reminis.lora import lora_to_delta_pack
+from reminis.registry import Registry
 from reminis.safetensors_io import safetensors_to_sqlite, sqlite_to_safetensors
 from reminis.track import TrainingLog, rollback_to_step, state_dict_to_sqlite
 
@@ -16,6 +17,7 @@ __all__ = [
     "diff_models",
     "apply_delta",
     "lora_to_delta_pack",
+    "Registry",
     "TrainingLog",
     "rollback_to_step",
     "state_dict_to_sqlite",
