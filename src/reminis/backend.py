@@ -36,6 +36,24 @@ from dataclasses import dataclass
 import numpy as np
 
 
+# Group sizes the backends implement, largest first. A larger group carries
+# fewer scales, so it is both smaller and faster -- measured on Qwen2.5-0.5B
+# at 8 bits, 128 gives 174 tok/s against 165 for 32, and 625 MB against 682,
+# for a correlation that falls only from 0.99989 to 0.99972. It has to divide
+# the row length, though, which is why this picks per tensor rather than
+# globally: 896 takes 128, 576 does not and takes 64, and gpt-oss-20b's 2880
+# takes 64 as well.
+GROUP_SIZES = (128, 64, 32)
+
+
+def best_group(row_length: int, limit: int = 128) -> int:
+    """The largest supported group size that divides a row of this length."""
+    for group in GROUP_SIZES:
+        if group <= limit and row_length % group == 0:
+            return group
+    return 32
+
+
 @dataclass
 class QuantizedWeight:
     """A weight matrix kept packed, for a backend that multiplies it packed.
@@ -115,12 +133,39 @@ class Backend:
     def to_numpy(self, x) -> np.ndarray:
         raise NotImplementedError
 
+    def to_host(self, x) -> np.ndarray:
+        """The same array in host memory, in the dtype it already has.
+
+        Unlike `to_numpy`, which widens to float32 so that everything
+        downstream can assume one dtype, this preserves what is there --
+        which matters for packed integer codes, where widening would be
+        both wrong and eight times the bytes.
+        """
+        return np.asarray(x)
+
     def to_bytes(self, x, dtype: str) -> bytes:
         """An array back to raw stored bytes of the named dtype."""
         raise NotImplementedError
 
     def eval(self, *arrays):
         """Force evaluation, for backends that are lazy. A no-op otherwise."""
+
+    def reserve(self, n_bytes: int) -> int:
+        """Ask that this much of our memory stay put. Returns the old limit.
+
+        Only meaningful where the compute device shares memory with the
+        operating system, which is to say Apple silicon. A no-op elsewhere.
+        """
+        return 0
+
+    def memory_budget(self) -> int:
+        """How many bytes of arrays this device will hold, or 0 if unknown.
+
+        A ceiling rather than a promise. Exceeding it does not raise: the
+        work gets slower, and past some point wrong, which is why anything
+        that means to fill memory should ask first.
+        """
+        return 0
 
     @property
     def xp(self):
@@ -435,6 +480,14 @@ class MLXBackend(Backend):
     def to_numpy(self, x) -> np.ndarray:
         return np.array(x.astype(self.mx.float32))
 
+    def to_host(self, x) -> np.ndarray:
+        mx = self.mx
+        # bfloat16 has no numpy equivalent, so it is the one dtype that
+        # cannot come across as itself.
+        if x.dtype == mx.bfloat16:
+            x = x.astype(mx.float32)
+        return np.array(x, copy=False)
+
     def to_bytes(self, x, dtype: str) -> bytes:
         mx = self.mx
         # Narrowing happens on the device, which is the point: numpy encodes
@@ -453,6 +506,35 @@ class MLXBackend(Backend):
 
     def eval(self, *arrays):
         self.mx.eval(*arrays)
+
+    def reserve(self, n_bytes: int) -> int:
+        """Wire this much memory, so the system cannot page or compress it.
+
+        Unified memory means an array here is ordinary system memory, and
+        the system is free to compress it under pressure -- which it does,
+        silently, and then the GPU stalls faulting it back in. Measured on
+        gpt-oss-20b with 8.4 GB of experts resident on a 16 GB machine,
+        leaving that to the system's judgement gave a decode rate that
+        wandered between 4.6 and 33 tok/s from one ten-token window to the
+        next. Wiring the same memory gave a flat 41 tok/s.
+
+        Asking for more than the device can hold is refused by the runtime
+        rather than honoured, so this clamps to what it recommends.
+        """
+        limit = self.memory_budget()
+        if not limit:
+            return 0
+        try:
+            return self.mx.set_wired_limit(int(min(n_bytes, limit)))
+        except Exception:
+            # Older runtimes, or a device with no such notion.
+            return 0
+
+    def memory_budget(self) -> int:
+        try:
+            return int(self.mx.device_info()["max_recommended_working_set_size"])
+        except Exception:
+            return 0
 
     @property
     def xp(self):
@@ -690,6 +772,9 @@ class CupyBackend(Backend):
 
     def to_numpy(self, x) -> np.ndarray:
         return self.cp.asnumpy(x.astype(self.cp.float32))
+
+    def to_host(self, x) -> np.ndarray:
+        return self.cp.asnumpy(x)
 
     def to_bytes(self, x, dtype: str) -> bytes:
         cp = self.cp

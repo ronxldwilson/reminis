@@ -133,6 +133,15 @@ def main():
              "slowdown and no visible change in output, 4 bits thirds it "
              "and starts to show. It costs speed rather than saving it.",
     )
+    p_run.add_argument(
+        "--experts", metavar="N",
+        help="For a mixture-of-experts model with an index built by "
+             "`reminis prepare`: how many experts to keep in memory. A "
+             "number, or 'all' to hold the whole index and pin it there. "
+             "Holding all of gpt-oss-20b's is 8.4 GB and takes it from 0.7 "
+             "to 41 tok/s; a number smaller than the model runs it in less "
+             "memory than it would otherwise need, more slowly.",
+    )
     p_run.add_argument("-q", "--quiet", action="store_true", help="Suppress progress output")
 
     # merge: combine several models into one
@@ -246,6 +255,25 @@ def main():
     p_rollback.add_argument("step", type=int, help="Snapshot step to restore")
     p_rollback.add_argument("-o", "--output", required=True, help="Output database path")
 
+    # prepare: build the materialized expert index
+    p_prepare = sub.add_parser(
+        "prepare",
+        help="Build a materialized index over a mixture-of-experts model's "
+             "expert weights, so that running it is a seek rather than a "
+             "decode",
+    )
+    p_prepare.add_argument("database", help="Path to the model database")
+    p_prepare.add_argument(
+        "--bits", type=int, default=4, choices=(3, 4, 6, 8),
+        help="Width to store the indexed experts at (default 4)",
+    )
+    p_prepare.add_argument(
+        "--group", type=int, default=128, choices=(32, 64, 128),
+        help="Weights per scale in the index (default 128)",
+    )
+    p_prepare.add_argument("--drop", action="store_true",
+                           help="Delete the index and reclaim its space")
+
     # apply: apply a delta pack to a base model
     p_apply = sub.add_parser("apply", help="Apply a delta pack to a base model")
     p_apply.add_argument("base", help="Path to the base model database")
@@ -316,6 +344,10 @@ def main():
                 parser.error(
                     "--pack takes no value (bit-exact), 'compact', or 4, 6 or 8"
                 )
+        if args.experts is not None and args.experts != "all":
+            if not args.experts.isdigit() or int(args.experts) < 1:
+                parser.error("--experts takes a positive number, or 'all'")
+            args.experts = int(args.experts)
         from reminis.infer import run_cli
         run_cli(args)
 
@@ -356,12 +388,49 @@ def main():
         finally:
             log.close()
 
+    elif args.command == "prepare":
+        _prepare(args, parser)
+
     elif args.command == "apply":
         from reminis.diff import apply_delta
         apply_delta(
             args.base, args.delta, args.output,
             verify=not args.no_verify, verbose=not args.quiet,
         )
+
+
+def _prepare(args, parser):
+    """Build or drop the materialized expert index."""
+    from reminis import expert_index
+
+    if not Path(args.database).exists():
+        parser.error(f"Database not found: {args.database}")
+
+    if args.drop:
+        before = Path(args.database).stat().st_size
+        if not expert_index.drop(args.database):
+            print("There was no expert index to drop.")
+            return
+        after = Path(args.database).stat().st_size
+        print(f"Dropped the expert index and reclaimed "
+              f"{(before - after) / 1e9:.2f} GB.")
+        return
+
+    def progress(done, total, name, experts, written, elapsed):
+        rate = written / elapsed / 1e9 if elapsed else 0
+        print(f"\r  [{done:>3}/{total}] {name:<32} {experts:>5} experts, "
+              f"{written / 1e9:5.2f} GB, {rate:.2f} GB/s",
+              end="", flush=True)
+
+    print(f"Indexing the expert weights of {args.database}")
+    summary = expert_index.build(args.database, bits=args.bits,
+                                 group_size=args.group, progress=progress)
+    print()
+    print(f"Wrote {summary['experts']:,} experts from "
+          f"{summary['tensors']} tensors, {summary['bytes'] / 1e9:.2f} GB at "
+          f"{summary['bits']} bits, in {summary['seconds']:.0f}s.")
+    print("`reminis run` will now read experts straight out of it. "
+          "`reminis prepare --drop` undoes this.")
 
 
 def _detect_input_format(path: str) -> str:

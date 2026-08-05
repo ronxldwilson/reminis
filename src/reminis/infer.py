@@ -43,8 +43,10 @@ guesses produces fluent-looking nonsense, which is worse than an error.
 import ast
 import heapq
 import math
+import os
 import sqlite3
 import sys
+import threading
 import time
 from collections import OrderedDict
 from functools import lru_cache
@@ -52,6 +54,7 @@ from pathlib import Path
 
 import numpy as np
 
+from reminis.backend import best_group as _best_group
 from reminis.backend import select as select_backend
 from reminis.dtypes import (
     dequantize_to_float32,
@@ -59,6 +62,7 @@ from reminis.dtypes import (
     is_quantized_dtype,
     to_float32_any,
 )
+from reminis.expert_index import read_layouts as read_expert_layouts
 from reminis.ggml_affine import AFFINE_GROUP, can_repack, nearest_bits
 from reminis.ggml_affine import repack as ggml_repack
 
@@ -84,6 +88,66 @@ class UnsupportedModel(Exception):
 
 
 # ---------------------------------------------------------------- weights
+
+
+class _IndexReader:
+    """Reads blocks out of the expert index on threads of its own.
+
+    One connection per thread, because a sqlite connection is not something
+    to share, and read-only because these never write. The point is not
+    parallel decoding -- there is no decoding left to do -- but parallel
+    waiting: several reads in flight at once keep the disk's queue full,
+    and none of them hold the interpreter lock while they wait.
+    """
+
+    def __init__(self, db_path: str, workers: int = 4, mmap_size: int = 0):
+        from concurrent.futures import ThreadPoolExecutor
+
+        self.path = db_path
+        self.mmap_size = mmap_size
+        self._local = threading.local()
+        self._pool = ThreadPoolExecutor(max_workers=workers,
+                                        thread_name_prefix="reminis-expert")
+        self._pending = {}
+        self.prefetched = 0
+        self.waited = 0
+
+    def _conn(self):
+        conn = getattr(self._local, "conn", None)
+        if conn is None:
+            conn = sqlite3.connect(self.path, check_same_thread=False)
+            conn.execute("PRAGMA query_only = 1")
+            conn.execute(f"PRAGMA mmap_size = {self.mmap_size}")
+            self._local.conn = conn
+        return conn
+
+    def _read(self, rowid: int) -> bytes:
+        with self._conn().blobopen("expert_index", "block", rowid,
+                                   readonly=True) as handle:
+            return handle.read()
+
+    def submit(self, key, rowid: int):
+        if key not in self._pending:
+            self._pending[key] = self._pool.submit(self._read, rowid)
+
+    def take(self, key, rowid: int) -> bytes:
+        """The bytes for one block, waiting for a prefetch if one is running."""
+        future = self._pending.pop(key, None)
+        if future is None:
+            self.waited += 1
+            return self._read(rowid)
+        self.prefetched += 1
+        return future.result()
+
+    def close(self):
+        for future in self._pending.values():
+            future.cancel()
+        self._pending.clear()
+        self._pool.shutdown(wait=True)
+        conn = getattr(self._local, "conn", None)
+        if conn is not None:
+            conn.close()
+            self._local.conn = None
 
 
 class WeightStore:
@@ -114,7 +178,8 @@ class WeightStore:
     _PACKABLE_EMBED = ("token_embd.weight", "output.weight")
 
     def __init__(self, db_path: str, stream: bool = False, backend=None,
-                 pack_bits=None, pack_group: int = 128):
+                 pack_bits=None, pack_group: int = 128,
+                 reader_threads: int = 0):
         self.path = db_path
         self.stream = stream
         self.backend = backend or select_backend("inference")
@@ -130,16 +195,13 @@ class WeightStore:
         self._expert_cache = OrderedDict()
         self._expert_shapes = {}
         self._blobs = {}
+        self._reader = None
+        self._expert_layouts = {}
         self._expert_hits = 0
         self._expert_misses = 0
         self.conn = sqlite3.connect(db_path)
         self.conn.execute("PRAGMA query_only = 1")
-        # Memory-map the file rather than copying each blob through SQLite's
-        # own buffer. Measured on a 258 MB model, reading every weight goes
-        # from 4.1 GB/s to 6.7 GB/s, which shows up in load time and in every
-        # single read that streaming mode does. The size is a ceiling, not an
-        # allocation: SQLite maps what the file actually needs.
-        self.conn.execute("PRAGMA mmap_size = 34359738368")
+        self.conn.execute(f"PRAGMA mmap_size = {self._mmap_size(db_path)}")
         self._cache: dict[str, np.ndarray] = {}
         self.bytes_read = 0
         self.reads = 0
@@ -150,6 +212,39 @@ class WeightStore:
                 "SELECT name, shape, dtype FROM tensors"
             )
         }
+        # A materialized index over the expert weights, if this database has
+        # one. It is derived from the tensors above and can be dropped, so
+        # its absence is ordinary rather than an error.
+        self._expert_layouts = read_expert_layouts(self.conn)
+        if self._expert_layouts and reader_threads:
+            self._reader = _IndexReader(db_path, workers=reader_threads,
+                                        mmap_size=self._mmap_size(db_path))
+
+    @staticmethod
+    def _mmap_size(db_path: str) -> int:
+        """How much of the file to map, which is all of it or none of it.
+
+        Mapping the file rather than copying each blob through sqlite's own
+        buffer measured 4.1 GB/s to 6.7 GB/s on a 258 MB model, and it is
+        free there because the whole thing fits in memory several times
+        over.
+
+        It stops being free when the file is larger than the machine. A
+        mapped page that has been touched stays resident until the kernel
+        decides otherwise, so on a 22.9 GB database with 16 GB of RAM the
+        map competes for memory with the weights the model is trying to
+        keep, and every read pays for it: measured 1.70 ms per expert block
+        mapped against 0.46 ms unmapped, which is 3.7x the wrong way.
+
+        So this maps the file when it comfortably fits and does not when it
+        does not, rather than asking for 32 GB and hoping.
+        """
+        try:
+            size = os.path.getsize(db_path)
+            available = os.sysconf("SC_PHYS_PAGES") * os.sysconf("SC_PAGE_SIZE")
+        except (OSError, ValueError, AttributeError):
+            return 0
+        return size if size * 4 <= available else 0
 
     def has(self, name: str) -> bool:
         return name in self._shapes
@@ -289,6 +384,10 @@ class WeightStore:
             self._expert_hits += 1
             return cached
 
+        layout = self._expert_layouts.get(name)
+        if layout is not None:
+            return self._from_index(key, layout, index)
+
         rowid, dtype, shape, n_bytes = self._expert_meta(name)
         dims = tuple(ast.literal_eval(shape))[::-1]
         n_experts = dims[0]
@@ -319,10 +418,59 @@ class WeightStore:
                                     _best_group(dims[-1]), True)
         self.backend.eval(arr if not hasattr(arr, "q") else arr.q)
 
+        self._remember_expert(key, arr)
+        return arr
+
+    def prefetch_experts(self, wanted):
+        """Start reading these experts, without waiting for any of them.
+
+        The router names every expert a layer needs at once, and each one
+        is an independent read of a few megabytes. Issued one at a time
+        they serialise: the disk sits idle between them while the GPU sits
+        idle waiting. Issued together they queue, which is the depth an SSD
+        wants, and they overlap with whatever the GPU is doing -- the reads
+        happen on other threads and sqlite releases the interpreter lock
+        for the duration.
+        """
+        if self._reader is None:
+            return
+        for name, index in wanted:
+            if (name, index) in self._expert_cache:
+                continue
+            layout = self._expert_layouts.get(name)
+            if layout is not None:
+                self._reader.submit((name, index), layout.row_id(index))
+
+    def _from_index(self, key, layout, index: int):
+        """One expert out of the materialized index.
+
+        Everything expensive already happened when the index was built, so
+        this is a primary-key seek, one read of a contiguous blob, and the
+        memcpy that puts it where the kernel can reach it. On gpt-oss-20b
+        that is the difference between 8.65 ms and 2.6 ms per expert.
+        """
+        if self._reader is not None:
+            raw = self._reader.take(key, layout.row_id(index))
+        else:
+            with self.conn.blobopen("expert_index", "block",
+                                    layout.row_id(index), readonly=True) as h:
+                raw = h.read()
+        self.bytes_read += len(raw)
+        self.reads += 1
+        self._expert_misses += 1
+
+        words, scales, biases = layout.split(raw)
+        arr = self.backend.adopt_packed(
+            words, scales, biases, layout.bits, layout.group_size,
+            (layout.rows, layout.cols), compact=True,
+        )
+        self._remember_expert(key, arr)
+        return arr
+
+    def _remember_expert(self, key, arr):
         self._expert_cache[key] = arr
         while len(self._expert_cache) > self.expert_cache_size:
             self._expert_cache.popitem(last=False)
-        return arr
 
     def _expert_meta(self, name: str):
         meta = self._expert_shapes.get(name)
@@ -359,6 +507,9 @@ class WeightStore:
         return hasattr(self.conn, "blobopen")
 
     def close(self):
+        if self._reader is not None:
+            self._reader.close()
+            self._reader = None
         for handle in self._blobs.values():
             try:
                 handle.close()
@@ -368,20 +519,6 @@ class WeightStore:
         self.conn.close()
 
 
-# Group sizes the backends implement, largest first. A larger group carries
-# fewer scales, so it is both smaller and faster -- measured on Qwen2.5-0.5B
-# at 8 bits, 128 gives 174 tok/s against 165 for 32, and 625 MB against 682,
-# for a correlation that falls only from 0.99989 to 0.99972. It has to divide
-# the row length, though, which is why this picks per tensor rather than
-# globally: 896 takes 128, 576 does not and takes 64.
-_GROUP_SIZES = (128, 64, 32)
-
-
-def _best_group(row_length: int, limit: int = 128) -> int:
-    for group in _GROUP_SIZES:
-        if group <= limit and row_length % group == 0:
-            return group
-    return 32
 
 
 def _yarn_periods(dim, base, scale, orig_context, beta_fast, beta_slow):
@@ -964,10 +1101,12 @@ class Model:
 
     def __init__(self, db_path: str, stream: bool = False, backend=None,
                  pack_bits=None, pack_group: int = 128,
-                 expert_cache: int = 0, expert_bits=None):
+                 expert_cache: int = 0, expert_bits=None,
+                 reader_threads: int = 0):
         self.backend = backend or select_backend("inference")
         self.store = WeightStore(db_path, stream=stream, backend=self.backend,
-                                 pack_bits=pack_bits, pack_group=pack_group)
+                                 pack_bits=pack_bits, pack_group=pack_group,
+                                 reader_threads=reader_threads)
         if expert_cache:
             if not self.store.can_stream_experts():
                 raise UnsupportedModel(
@@ -976,6 +1115,13 @@ class Model:
                     "stack has to be read at once."
                 )
             self.store.expert_cache_size = expert_cache
+            # Left alone, a fetched expert is kept at the backend's compute
+            # dtype, which is four times what the file holds but is the same
+            # arithmetic the resident path does. Packing it down to 4 bits
+            # fits four times as many in the same memory and is worth doing
+            # -- but it changes the answer, so it is asked for rather than
+            # assumed. An indexed model gets the width the index was built
+            # at and ignores this entirely.
             self.store.expert_bits = expert_bits
         meta = dict(self.store.conn.execute("SELECT key, value FROM model_meta"))
         self.meta = meta
@@ -988,6 +1134,96 @@ class Model:
 
     def close(self):
         self.store.close()
+
+    # -- resident experts --------------------------------------------------
+
+    # How much of the device's working set the expert index may claim. The
+    # rest goes to the dense weights, the key/value cache and the
+    # activations, which are wanted resident just as much and are not
+    # counted here because they are not loaded yet.
+    PRELOAD_SHARE = 0.8
+
+    def preload_experts(self, progress=None) -> dict:
+        """Read the whole expert index into memory and pin it there.
+
+        Reading experts one at a time as the router asks for them is what
+        makes a model larger than memory runnable at all, but it is not
+        what makes it fast. When the index is small enough to hold, holding
+        all of it turns every fetch into a cache hit and takes the disk out
+        of the loop entirely.
+
+        Three things have to happen, and leaving out any one of them gives
+        back most of the gain:
+
+        Read it. The index is contiguous and in the kernel's layout, so
+        this is a sequential scan rather than 2,304 decodes.
+
+        Touch it. A buffer that has been copied to the device has not yet
+        been read by it, and the first read faults it in. Measured on
+        gpt-oss-20b, a token whose experts had never been multiplied took
+        96 ms against 9.5 ms once they had, so the decode rate climbed from
+        1.4 to 24 tok/s over the first seventy tokens and never reached its
+        ceiling. Multiplying each expert by a zero vector at load time is a
+        few seconds and moves the whole curve to the front.
+
+        Pin it. Unified memory is ordinary system memory, and the system
+        will compress it under pressure. See `Backend.reserve`.
+        """
+        store = self.store
+        if not store._expert_layouts:
+            raise UnsupportedModel(
+                "This database has no expert index to preload.\n"
+                "Build one:  reminis prepare <db>"
+            )
+        b = self.backend
+        total = sum(l.n_experts for l in store._expert_layouts.values())
+        needed = sum(l.block_bytes * l.n_experts
+                     for l in store._expert_layouts.values())
+
+        # Overcommitting is not a slow path, it is a wrong one. Asking the
+        # device to hold 10.75 GB of experts against a 12.7 GB working set
+        # left no room for the dense weights and produced fluent-looking
+        # nonsense -- a row of exclamation marks -- rather than an error.
+        # So the fit is checked before anything is read.
+        budget = b.memory_budget()
+        room = int(budget * self.PRELOAD_SHARE) if budget else 0
+        if room and needed > room:
+            raise UnsupportedModel(
+                f"The expert index is {needed / 1e9:.2f} GB and this device "
+                f"will hold about {room / 1e9:.2f} GB of it alongside the "
+                f"rest of the model.\n"
+                f"Either run it a piece at a time:  --experts "
+                f"{max(1, int(total * room / needed / 100) * 100)}\n"
+                f"or rebuild the index smaller:     reminis prepare <db> "
+                f"--bits 3"
+            )
+        store.expert_cache_size = max(store.expert_cache_size, total)
+
+        # The values do not matter, only that the device reads every byte of
+        # the weight. The width does matter: the down projection takes the
+        # feed-forward width where the others take the model width, so the
+        # probe is built per tensor rather than assumed.
+        probes = {}
+        started = time.time()
+        pending = []
+        done = 0
+        for name, layout in store._expert_layouts.items():
+            probe = probes.get(layout.cols)
+            if probe is None:
+                probe = probes[layout.cols] = b.zeros((1, layout.cols))
+            for index in range(layout.n_experts):
+                pending.append(b.matmul_weight(probe, store.expert(name, index)))
+                done += 1
+                if len(pending) >= 64:
+                    b.eval(pending)
+                    pending = []
+            if progress:
+                progress(done, total, name, time.time() - started)
+        b.eval(pending)
+
+        b.reserve(int(needed / self.PRELOAD_SHARE))
+        return {"experts": total, "bytes": needed,
+                "seconds": time.time() - started}
 
     # -- rotary embeddings ------------------------------------------------
 
@@ -1246,19 +1482,33 @@ class Model:
         """
         b = self.backend
         chosen = np.asarray(b.to_numpy(idx)).astype(int).reshape(n_tokens, k)
+
+        # Every read this layer needs is known here, so ask for all of them
+        # before waiting on any. The gate and up projections are wanted
+        # first and the down projection only after the activation, but it
+        # is the same disk and the same trip, so it goes in the same batch.
+        self.store.prefetch_experts(
+            (f"{prefix}{part}.weight", int(e))
+            for e in np.unique(chosen)
+            for part in ("ffn_gate_exps", "ffn_up_exps", "ffn_down_exps")
+        )
+
         results = []
         for token in range(n_tokens):
             row = h[token:token + 1]
-            total = None
-            for slot in range(k):
-                expert = int(chosen[token, slot])
-                gate = self._one_expert(row, prefix, "ffn_gate_exps", expert)
-                up = self._one_expert(row, prefix, "ffn_up_exps", expert)
-                piece = self._one_expert(
-                    self._glu(gate, up), prefix, "ffn_down_exps", expert)
-                total = piece if total is None else b.xp.concatenate(
-                    [total, piece], axis=0)
-            results.append(total)
+            experts = [int(chosen[token, slot]) for slot in range(k)]
+
+            # Both halves of the gate for every chosen expert are queued
+            # before anything is looked at, so the eight matrix multiplies
+            # are in flight together rather than one at a time.
+            gates = [self._one_expert(row, prefix, "ffn_gate_exps", e)
+                     for e in experts]
+            ups = [self._one_expert(row, prefix, "ffn_up_exps", e)
+                   for e in experts]
+            hidden = [self._glu(g, u) for g, u in zip(gates, ups)]
+            pieces = [self._one_expert(x, prefix, "ffn_down_exps", e)
+                      for x, e in zip(hidden, experts)]
+            results.append(b.xp.concatenate(pieces, axis=0))
         return b.xp.stack(results, axis=0)
 
     def _glu(self, gate, up):
@@ -1574,6 +1824,9 @@ def generate(
     backend: str | None = None,
     pack_bits=None,
     kv_bits: int | None = None,
+    expert_cache: int = 0,
+    expert_bits: int | None = None,
+    preload: bool = False,
 ) -> dict:
     """Generate text from a model stored in a reminis database.
 
@@ -1612,7 +1865,16 @@ def generate(
         raise FileNotFoundError(f"Database not found: {db_path}")
 
     chosen = select_backend("inference", backend)
-    model = Model(db_path, stream=stream, backend=chosen, pack_bits=pack_bits)
+    model = Model(db_path, stream=stream, backend=chosen, pack_bits=pack_bits,
+                  expert_cache=expert_cache, expert_bits=expert_bits)
+    if preload:
+        if verbose:
+            print("Loading the expert index into memory", end="", flush=True)
+        loaded = model.preload_experts()
+        if verbose:
+            print(f"\r{loaded['experts']:,} experts resident "
+                  f"({loaded['bytes'] / 1e9:.2f} GB) in "
+                  f"{loaded['seconds']:.0f}s")
     tok = model.tokenizer
     rng = np.random.default_rng(seed)
 
@@ -1730,6 +1992,8 @@ def run_cli(args, on_error=None):
             seed=args.seed, stream=args.stream, chat=args.chat,
             verbose=not args.quiet, backend=args.backend,
             pack_bits=args.pack, kv_bits=args.kv_bits,
+            expert_cache=0 if args.experts in (None, "all") else args.experts,
+            preload=args.experts == "all",
         )
     except (UnsupportedModel, ValueError, FileNotFoundError) as exc:
         print(f"Error: {exc}")

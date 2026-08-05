@@ -321,6 +321,45 @@ Two things made it usable rather than merely possible. Profiling showed the data
 
 Incremental blob reads arrived in Python 3.11, so this needs 3.11 or newer. On 3.10 the whole expert stack is read at once, and `reminis run` says so.
 
+### 0.71 to 37 tok/s, by building an index over the experts
+
+0.71 tok/s runs but is not usable. Profiling one token found that 98% of it was the mixture-of-experts, and 60% of *that* was not reading weights. Fetching one expert cost 8.65 ms: **2.5 ms of read and 6.1 ms of arithmetic** — unpacking MXFP4's 17-byte blocks and re-packing them into the layout the matmul kernel wants, for ~116 experts per token, and again next token for the same experts because the cache had evicted them.
+
+That arithmetic is a pure function of bytes already in the database, so it belongs in the database:
+
+```bash
+reminis prepare model.db          # build it
+reminis prepare model.db --drop   # throw it away, reclaim the space
+```
+
+`prepare` writes a second physical copy of the expert weights — already unpacked, already in the kernel's layout, one row per expert, clustered so a layer's experts are contiguous. It is an index in the ordinary sense: redundant, derived, ordered for one access path, and droppable without losing anything. On gpt-oss-20b it is 2,304 rows and takes 30 seconds.
+
+Then `--experts all` holds the whole index and pins it:
+
+```bash
+reminis run model.db "Why is the sea salty?" --pack 4 --experts all
+```
+
+| | Baseline | Indexed | |
+|---|---|---|---|
+| Expert fetch | 8.65 ms | 2.6 ms | the 6.1 ms is paid once, at build |
+| Resident | 3.65 GB | 8.4 GB | at `--bits 3`, on a 16 GB machine |
+| **Generation** | **0.71 tok/s** | **37.3 tok/s** | 53× |
+
+Four things had to be true at once, and leaving out any one gave back most of it:
+
+**Stop memory-mapping the file.** `PRAGMA mmap_size` was measured on a 258 MB model, where mapping everything is free. It stops being free when the file is bigger than the machine: touched pages stay resident and compete with the weights. Measured **1.70 ms per block mapped against 0.46 ms unmapped** — 3.7× the wrong way. reminis now maps the file only when it comfortably fits.
+
+**Don't thread the reads.** A pool of readers overlapping I/O with compute made it *slower* (0.54 ms/block against 0.46 serial). The read was never the thing waiting.
+
+**Touch the weights, not just load them.** A buffer copied to the device has not been *read* by it, and the first read faults it in. A token whose experts had never been multiplied took 96 ms against 9.5 ms once they had — so the rate climbed from 1.4 to 24 tok/s over seventy tokens and never reached its ceiling. Multiplying each expert by a zero vector at load costs a few seconds and moves the whole curve to the front.
+
+**Pin the memory.** Unified memory is ordinary system memory, and macOS compresses it under pressure — silently, after which the GPU stalls faulting it back. Left to the system, the rate wandered between **4.6 and 33 tok/s** between ten-token windows. Wired, it was a flat **41 tok/s**.
+
+The honest limits. A bigger cache is not better: at 1,400 experts it was *slower* than at 400, because the decoded cache and the OS page cache compete for the same 16 GB. And the index has to fit — a 4-bit index is 10.75 GB against this device's 12.7 GB working set, and overcommitting it produced fluent-looking nonsense rather than an error, so `--experts all` now measures the fit first and refuses with the two ways out. 3 bits fits and costs quality; 4 bits needs a machine with more memory.
+
+The thing that made this possible is the same thing the whole project is about. The expensive step was a deterministic function of stored bytes, and a database is where derived representations of stored bytes belong. A GGUF file has nowhere to put one.
+
 ### Compressing the key/value cache
 
 The weights are a fixed cost; the cache grows with every token. At long context it is the cache, not the model, that decides whether a prompt fits — so `--kv-bits` compresses it.
@@ -895,7 +934,7 @@ Note that GGUF and safetensors use different tensor names (`blk.0.attn_q.weight`
 
 ## Tests
 
-Twelve suites, 221 explicit checks, run with `python tests/<name>.py`. They need no framework and skip rather than fail when a model or an optional dependency is absent.
+Thirteen suites, 297 explicit checks, run with `python tests/<name>.py`. They need no framework and skip rather than fail when a model or an optional dependency is absent.
 
 | Suite | Covers |
 |---|---|
@@ -943,6 +982,7 @@ The checks are written to fail for the right reason. Where a property could pass
 - [x] Mixture-of-experts models: router, stacked experts, packed and gathered
 - [x] SentencePiece tokenizers, verified against llama.cpp token for token
 - [x] Key/value cache compression (`--kv-bits`), for when the context is the constraint
+- [x] A materialized index over MoE experts (`reminis prepare`): gpt-oss-20b from 0.71 to 37 tok/s
 - [ ] Faster repacking at load: 83 s for a 7B, all of it numpy
 - [ ] Running attention-free architectures (Mamba / state space, RWKV)
 - [ ] Unsloth integration
