@@ -103,6 +103,12 @@ def main():
                        help="Re-read every weight from SQLite instead of caching "
                             "it, so peak memory is one layer rather than the "
                             "whole model. Much slower.")
+    p_run.add_argument(
+        "--backend", choices=("auto", "numpy", "mlx", "cupy"), default="auto",
+        help="Which array library to compute with. auto picks the fastest "
+             "one this machine has: mlx on Apple silicon, cupy on NVIDIA, "
+             "numpy otherwise. numpy is the reference implementation.",
+    )
     p_run.add_argument("-q", "--quiet", action="store_true", help="Suppress progress output")
 
     # merge: combine several models into one
@@ -609,5 +615,9 @@ def _show_info(db_path: str):
         "SELECT dtype, COUNT(*), SUM(n_bytes) FROM tensors GROUP BY dtype ORDER BY SUM(n_bytes) DESC"
     ):
         print(f"    {dtype:10s}  {count:4d} tensors  {total / (1024 * 1024):8.1f} MB")
+
+    from reminis.backend import report as backend_report
+    print(f"\n  Compute backends:")
+    print(backend_report())
 
     conn.close()

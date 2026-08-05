@@ -18,6 +18,7 @@ from pathlib import Path
 
 import numpy as np
 
+from reminis.backend import select as select_backend
 from reminis.infer import (
     KVCache,
     Model,
@@ -153,9 +154,15 @@ def test_logits_vs_reference():
     with torch.no_grad():
         ref_logits = reference(torch.tensor([ids])).logits[0, -1].numpy()
 
-    model = Model(str(SMOL))
+    # Pinned to numpy on purpose. numpy is the reference implementation and
+    # this is the check that establishes it; the GPU backends compute in
+    # float16 and are held to agreeing with numpy, which test_backend does.
+    reference_backend = select_backend(requested="numpy")
+    model = Model(str(SMOL), backend=reference_backend)
     try:
-        mine = model.forward(ids, KVCache(model.cfg.n_layers), offset=0)
+        mine = model.forward(
+            ids, KVCache(model.cfg.n_layers, backend=reference_backend), offset=0
+        )
         check("the argmax token agrees",
               int(np.argmax(mine)) == int(np.argmax(ref_logits)),
               f"{ref_tok.decode([int(np.argmax(mine))])!r} vs "
@@ -183,13 +190,19 @@ def test_kv_cache():
         print("  skip  SmolLM-135M.f16.db not present")
         return
 
-    model = Model(str(SMOL))
+    # numpy again: the property being checked is that the cache and the mask
+    # are right, and half precision would add noise that has nothing to do
+    # with either.
+    reference_backend = select_backend(requested="numpy")
+    model = Model(str(SMOL), backend=reference_backend)
     try:
         ids = model.tokenizer.encode("The quick brown fox jumps over the lazy dog and then",
                                      add_special=False)
-        full = model.forward(ids, KVCache(model.cfg.n_layers), offset=0)
+        full = model.forward(
+            ids, KVCache(model.cfg.n_layers, backend=reference_backend), offset=0
+        )
 
-        cache = KVCache(model.cfg.n_layers)
+        cache = KVCache(model.cfg.n_layers, backend=reference_backend)
         incremental = model.forward(ids[:1], cache, offset=0)
         for i, token in enumerate(ids[1:], start=1):
             incremental = model.forward([token], cache, offset=cache.length)

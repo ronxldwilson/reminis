@@ -47,7 +47,8 @@ from pathlib import Path
 
 import numpy as np
 
-from reminis.dtypes import is_float_dtype, to_float32
+from reminis.backend import select as select_backend
+from reminis.dtypes import is_float_dtype
 
 # Architectures whose block structure this file actually implements. The
 # value is the rotary layout llama.cpp uses for that architecture, and it is
@@ -78,9 +79,10 @@ class WeightStore:
     the mode that makes the "the model lives in the database" claim literal.
     """
 
-    def __init__(self, db_path: str, stream: bool = False):
+    def __init__(self, db_path: str, stream: bool = False, backend=None):
         self.path = db_path
         self.stream = stream
+        self.backend = backend or select_backend("inference")
         self.conn = sqlite3.connect(db_path)
         self.conn.execute("PRAGMA query_only = 1")
         # Memory-map the file rather than copying each blob through SQLite's
@@ -102,8 +104,8 @@ class WeightStore:
     def has(self, name: str) -> bool:
         return name in self._shapes
 
-    def get(self, name: str) -> np.ndarray:
-        """A tensor as float32, in numpy's row-major orientation.
+    def get(self, name: str):
+        """A tensor in the backend's compute dtype, row-major.
 
         reminis stores `shape` reversed relative to the data layout, which is
         GGUF's convention, so reversing it back is what turns the blob into
@@ -127,12 +129,30 @@ class WeightStore:
                 f"safetensors checkpoint instead."
             )
 
-        arr = to_float32(blob, dtype).reshape(tuple(ast.literal_eval(shape))[::-1])
+        arr = self.backend.from_bytes(
+            blob, dtype, tuple(ast.literal_eval(shape))[::-1]
+        )
         self.bytes_read += len(blob)
         self.reads += 1
         if not self.stream:
             self._cache[name] = arr
         return arr
+
+    def get_numpy(self, name: str) -> np.ndarray:
+        """A tensor as plain float32 numpy, whatever the backend is.
+
+        For the handful of values that are not part of the arithmetic on the
+        hot path -- rotary scaling factors, say -- and are used to build
+        tables in full precision.
+        """
+        from reminis.dtypes import to_float32
+
+        row = self.conn.execute(
+            "SELECT dtype, data FROM tensors WHERE name = ?", (name,)
+        ).fetchone()
+        if row is None:
+            raise UnsupportedModel(f"This model has no tensor named '{name}'")
+        return to_float32(row[1], row[0])
 
     def drop(self, name: str):
         """Forget a cached tensor, once something else stands in for it."""
@@ -184,7 +204,7 @@ class Config:
         # as metadata. Ignoring it silently would break long-context models
         # in a way that only shows up as slightly-wrong text.
         self.rope_factors = (
-            store.get("rope_freqs.weight").ravel()
+            store.get_numpy("rope_freqs.weight").ravel()
             if store.has("rope_freqs.weight") else None
         )
 
@@ -398,31 +418,25 @@ def _int_or_none(value):
 # ---------------------------------------------------------------- the model
 
 
-def _rms_norm(x: np.ndarray, weight: np.ndarray, eps: float) -> np.ndarray:
-    var = np.mean(np.square(x, dtype=np.float32), axis=-1, keepdims=True)
-    return (x * np.reciprocal(np.sqrt(var + eps))) * weight
-
-
-def _silu(x: np.ndarray) -> np.ndarray:
-    return x / (1.0 + np.exp(-x, dtype=np.float32))
-
-
-def _softmax(x: np.ndarray, axis: int = -1) -> np.ndarray:
-    x = x - np.max(x, axis=axis, keepdims=True)
-    np.exp(x, out=x)
-    return x / np.sum(x, axis=axis, keepdims=True)
-
-
 class Model:
-    """A llama-family transformer whose weights come from SQLite."""
+    """A llama-family transformer whose weights come from SQLite.
 
-    def __init__(self, db_path: str, stream: bool = False):
-        self.store = WeightStore(db_path, stream=stream)
+    The arithmetic is written against a backend rather than against numpy
+    directly, so the same forward pass runs on the CPU or on a GPU depending
+    on what the machine has. numpy stays the reference: it is the one whose
+    logits are checked against transformers to five decimal places, and the
+    others are checked against it.
+    """
+
+    def __init__(self, db_path: str, stream: bool = False, backend=None):
+        self.backend = backend or select_backend("inference")
+        self.store = WeightStore(db_path, stream=stream, backend=self.backend)
         meta = dict(self.store.conn.execute("SELECT key, value FROM model_meta"))
         self.meta = meta
         self.cfg = Config(meta, self.store)
         self.tokenizer = Tokenizer(meta)
         self._rope_cache: tuple | None = None
+        self._mask_cache: tuple | None = None
         self._fused_cache: dict[tuple[int, str], tuple] = {}
 
     def close(self):
@@ -444,6 +458,10 @@ class Model:
 
         cfg = self.cfg
         half = cfg.rope_dim // 2
+        # The tables are built in numpy at full precision regardless of the
+        # backend. They are tiny, they are cached, and the angles are the one
+        # place where half precision would visibly cost accuracy: an error in
+        # a position's angle shifts every token that attends to it.
         inv_freq = 1.0 / (
             cfg.rope_base ** (np.arange(half, dtype=np.float32) * 2.0 / cfg.rope_dim)
         )
@@ -451,11 +469,12 @@ class Model:
             inv_freq = inv_freq / cfg.rope_factors[:half]
         pos = np.arange(offset, offset + n_positions, dtype=np.float32)
         angles = pos[:, None] * inv_freq[None, :]
-        cos, sin = np.cos(angles), np.sin(angles)
+        cos = self.backend.from_numpy(np.cos(angles))
+        sin = self.backend.from_numpy(np.sin(angles))
         self._rope_cache = (n_positions, offset, cos, sin)
         return cos, sin
 
-    def _apply_rope(self, x: np.ndarray, cos: np.ndarray, sin: np.ndarray) -> np.ndarray:
+    def _apply_rope(self, x, cos, sin):
         """Rotate the first `rope_dim` channels of each head.
 
         Two layouts exist and they are not interchangeable. llama.cpp's
@@ -469,26 +488,30 @@ class Model:
         cos = cos[:, None, :]
         sin = sin[:, None, :]
 
+        xp = self.backend.xp
         if self.cfg.rope_style == "norm":
             even, odd = rot[..., 0::2], rot[..., 1::2]
-            out = np.empty_like(rot)
-            out[..., 0::2] = even * cos - odd * sin
-            out[..., 1::2] = even * sin + odd * cos
+            # Interleaving the two halves back together by stacking and
+            # reshaping rather than by assigning into a buffer, since not
+            # every backend's arrays can be written into piecewise.
+            rotated = xp.stack([even * cos - odd * sin, even * sin + odd * cos],
+                               axis=-1)
+            out = rotated.reshape(rot.shape)
         else:
             half = d // 2
             first, second = rot[..., :half], rot[..., half:]
-            out = np.concatenate(
+            out = xp.concatenate(
                 [first * cos - second * sin, first * sin + second * cos], axis=-1
             )
 
-        return out if rest.size == 0 else np.concatenate([out, rest], axis=-1)
+        return out if rest.shape[-1] == 0 else xp.concatenate([out, rest], axis=-1)
 
     # -- one layer --------------------------------------------------------
 
-    def _linear(self, x: np.ndarray, name: str, bias: str | None = None) -> np.ndarray:
+    def _linear(self, x, name: str, bias: str | None = None):
         y = x @ self.store.get(name).T
         if bias and self.store.has(bias):
-            y = y + self.store.get(bias).ravel()
+            y = y + self.store.get(bias).reshape(-1)
         return y
 
     def _fused(self, layer: int, key: str, names: list[str]):
@@ -509,14 +532,15 @@ class Model:
         if cached is not None:
             return cached
 
+        xp = self.backend.xp
         prefix = f"blk.{layer}."
-        weight = np.ascontiguousarray(
-            np.concatenate([self.store.get(prefix + n) for n in names], axis=0)
+        weight = self.backend.contiguous(
+            xp.concatenate([self.store.get(prefix + n) for n in names], axis=0)
         )
         biases = [prefix + n.replace(".weight", ".bias") for n in names]
         bias = None
         if all(self.store.has(b) for b in biases):
-            bias = np.concatenate([self.store.get(b).ravel() for b in biases])
+            bias = xp.concatenate([self.store.get(b).reshape(-1) for b in biases])
 
         for n in names:
             self.store.drop(prefix + n)
@@ -536,7 +560,7 @@ class Model:
         )
         out = h @ weight.T
         if bias is not None:
-            out += bias
+            out = out + bias
         cut_q = self.cfg.n_heads * self.cfg.head_dim
         cut_k = cut_q + self.cfg.n_kv_heads * self.cfg.head_dim
         return out[:, :cut_q], out[:, cut_q:cut_k], out[:, cut_k:]
@@ -551,12 +575,14 @@ class Model:
         half = out.shape[1] // 2
         return out[:, :half], out[:, half:]
 
-    def _block(self, x: np.ndarray, layer: int, cache: "KVCache", offset: int):
+    def _block(self, x, layer: int, cache: "KVCache", offset: int):
         cfg = self.cfg
+        b = self.backend
+        xp = b.xp
         p = f"blk.{layer}."
         n_tokens = x.shape[0]
 
-        h = _rms_norm(x, self.store.get(p + "attn_norm.weight").ravel(), cfg.rms_eps)
+        h = b.rms_norm(x, self.store.get(p + "attn_norm.weight").reshape(-1), cfg.rms_eps)
 
         q, k, v = self._qkv(h, layer, p)
         q = q.reshape(n_tokens, cfg.n_heads, cfg.head_dim)
@@ -581,23 +607,37 @@ class Model:
         kh = k_all.transpose(1, 2, 0)[:, None]
         vh = v_all.transpose(1, 0, 2)[:, None]
 
-        scores = (qh @ kh) * np.float32(1.0 / math.sqrt(cfg.head_dim))
+        scores = (qh @ kh) * (1.0 / math.sqrt(cfg.head_dim))
         # A single token attends to the whole cache, so there is nothing for
         # a causal mask to hide and building one is pure waste. It is only
         # needed when several tokens are processed at once.
         if n_tokens > 1:
-            rows = np.arange(offset, offset + n_tokens)[:, None]
-            cols = np.arange(total)[None, :]
-            scores = np.where(cols <= rows, scores, np.float32(-np.inf))
+            mask = self._causal_mask(n_tokens, offset, total)
+            scores = xp.where(mask, scores, float("-inf"))
 
-        attn = _softmax(scores)
+        attn = b.softmax(scores)
         out = (attn @ vh).reshape(cfg.n_heads, n_tokens, cfg.head_dim)
         out = out.transpose(1, 0, 2).reshape(n_tokens, cfg.n_heads * cfg.head_dim)
         x = x + self._linear(out, p + "attn_output.weight", p + "attn_output.bias")
 
-        h = _rms_norm(x, self.store.get(p + "ffn_norm.weight").ravel(), cfg.rms_eps)
+        h = b.rms_norm(x, self.store.get(p + "ffn_norm.weight").reshape(-1), cfg.rms_eps)
         gate, up = self._gate_up(h, layer, p)
-        return x + self._linear(_silu(gate) * up, p + "ffn_down.weight")
+        return x + self._linear(b.silu(gate) * up, p + "ffn_down.weight")
+
+    def _causal_mask(self, n_tokens: int, offset: int, total: int):
+        """True where a query at an absolute position may see a key.
+
+        Built in numpy and handed to the backend, because it depends only on
+        positions and is reused unchanged by every layer of the pass.
+        """
+        key = (n_tokens, offset, total)
+        if self._mask_cache is not None and self._mask_cache[0] == key:
+            return self._mask_cache[1]
+        rows = np.arange(offset, offset + n_tokens)[:, None]
+        cols = np.arange(total)[None, :]
+        mask = self.backend.xp.array(cols <= rows)
+        self._mask_cache = (key, mask)
+        return mask
 
     def forward(self, tokens: list[int], cache: "KVCache", offset: int) -> np.ndarray:
         """Logits for the last token of `tokens`.
@@ -610,17 +650,25 @@ class Model:
         finite. The logits are checked explicitly below instead, which
         catches a genuinely broken forward pass without the noise.
         """
-        with np.errstate(all="ignore"):
+        b = self.backend
+        with b.errstate():
             embed = self.store.get("token_embd.weight")
-            x = embed[np.asarray(tokens, dtype=np.int64)].astype(np.float32)
+            x = embed[b.xp.array(np.asarray(tokens, dtype=np.int32))]
 
             for layer in range(self.cfg.n_layers):
                 x = self._block(x, layer, cache, offset)
 
-            x = _rms_norm(x, self.store.get("output_norm.weight").ravel(), self.cfg.rms_eps)
+            x = b.rms_norm(x, self.store.get("output_norm.weight").reshape(-1),
+                           self.cfg.rms_eps)
             last = x[-1:]
             out_name = "token_embd.weight" if self.cfg.tied_output else "output.weight"
-            logits = (last @ self.store.get(out_name).T).ravel()
+            logits = (last @ self.store.get(out_name).T).reshape(-1)
+            b.eval(logits)
+
+        # Sampling happens in numpy whatever the backend: the vocabulary-sized
+        # vector is small, the operations on it are sequential, and keeping
+        # one code path means a seed reproduces the same text everywhere.
+        logits = b.to_numpy(logits)
 
         if not np.isfinite(logits).all():
             raise ValueError(
@@ -640,28 +688,36 @@ class KVCache:
     Without one it still grows, in doubling steps rather than by one.
     """
 
-    def __init__(self, n_layers: int, capacity: int | None = None):
+    def __init__(self, n_layers: int, capacity: int | None = None, backend=None):
         self.k = [None] * n_layers
         self.v = [None] * n_layers
         self.capacity = capacity
+        self.backend = backend or select_backend("inference")
         self._used = 0
 
-    def append(self, layer: int, k: np.ndarray, v: np.ndarray):
+    def _empty(self, size, tail, like):
+        xp = self.backend.xp
+        return xp.zeros((size,) + tuple(tail), dtype=like.dtype)
+
+    def append(self, layer: int, k, v):
         n = k.shape[0]
         buf_k, buf_v = self.k[layer], self.v[layer]
 
         if buf_k is None:
             size = max(self.capacity or 0, n)
-            buf_k = np.empty((size,) + k.shape[1:], dtype=np.float32)
-            buf_v = np.empty((size,) + v.shape[1:], dtype=np.float32)
+            buf_k = self._empty(size, k.shape[1:], k)
+            buf_v = self._empty(size, v.shape[1:], v)
             self.k[layer], self.v[layer] = buf_k, buf_v
             used = 0
         else:
             used = self._used
             if used + n > buf_k.shape[0]:
                 grown = max(buf_k.shape[0] * 2, used + n)
-                buf_k = np.resize(buf_k, (grown,) + k.shape[1:])
-                buf_v = np.resize(buf_v, (grown,) + v.shape[1:])
+                bigger_k = self._empty(grown, k.shape[1:], k)
+                bigger_v = self._empty(grown, v.shape[1:], v)
+                bigger_k[:used] = buf_k[:used]
+                bigger_v[:used] = buf_v[:used]
+                buf_k, buf_v = bigger_k, bigger_v
                 self.k[layer], self.v[layer] = buf_k, buf_v
 
         buf_k[used:used + n] = k
@@ -685,7 +741,10 @@ def _sample(logits: np.ndarray, temperature: float, top_p: float, rng) -> int:
     if temperature <= 0:
         return int(np.argmax(logits))
 
-    probs = _softmax(logits.astype(np.float32) / np.float32(temperature))
+    scaled = logits.astype(np.float32) / np.float32(temperature)
+    scaled = scaled - np.max(scaled)
+    np.exp(scaled, out=scaled)
+    probs = scaled / np.sum(scaled)
 
     if 0 < top_p < 1:
         order = np.argsort(probs)[::-1]
@@ -712,6 +771,7 @@ def generate(
     stop_at_eos: bool = True,
     verbose: bool = True,
     on_token=None,
+    backend: str | None = None,
 ) -> dict:
     """Generate text from a model stored in a reminis database.
 
@@ -739,7 +799,8 @@ def generate(
     if not Path(db_path).exists():
         raise FileNotFoundError(f"Database not found: {db_path}")
 
-    model = Model(db_path, stream=stream)
+    chosen = select_backend("inference", backend)
+    model = Model(db_path, stream=stream, backend=chosen)
     tok = model.tokenizer
     rng = np.random.default_rng(seed)
 
@@ -757,11 +818,13 @@ def generate(
         if verbose:
             mode = "streaming from SQLite" if stream else "weights cached in RAM"
             print(f"{model.meta.get('general.name', Path(db_path).name)} "
-                  f"| {model.cfg.arch} | {model.cfg.n_layers} layers | {mode}")
+                  f"| {model.cfg.arch} | {model.cfg.n_layers} layers | "
+                  f"{chosen.describe()} | {mode}")
             print(f"{len(tokens)} prompt tokens\n")
             print(text, end="", flush=True)
 
-        cache = KVCache(model.cfg.n_layers, capacity=len(tokens) + max_tokens)
+        cache = KVCache(model.cfg.n_layers, capacity=len(tokens) + max_tokens,
+                        backend=chosen)
 
         t0 = time.time()
         logits = model.forward(tokens, cache, offset=0)
@@ -808,6 +871,7 @@ def generate(
             "decode_seconds": decode_seconds,
             "bytes_read": model.store.bytes_read,
             "queries": model.store.reads,
+            "backend": chosen.name,
         }
     finally:
         model.close()
@@ -835,7 +899,7 @@ def run_cli(args, on_error=None):
             args.input, args.prompt,
             max_tokens=args.max_tokens, temperature=args.temp, top_p=args.top_p,
             seed=args.seed, stream=args.stream, chat=args.chat,
-            verbose=not args.quiet,
+            verbose=not args.quiet, backend=args.backend,
         )
     except (UnsupportedModel, ValueError, FileNotFoundError) as exc:
         print(f"Error: {exc}")

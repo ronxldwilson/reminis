@@ -25,7 +25,7 @@ The database is also still a *model*, not an archive of one: `reminis run` gener
 **It is not a runtime, and `reminis run` is not a way to serve a model.** It exists so a database can be checked by asking it to speak — after a merge, a rollback, or a delta apply, a hash tells you the bytes changed but cannot tell you the result is still a working model. That is a testing tool, and a genuinely useful one. It is not an inference engine, and three things stop it from becoming one:
 
 - It cannot run quantized weights at all, and quantization is the answer to running large models on small machines.
-- It decodes weights to F32, so it needs **twice** the memory of the F16 file, where llama.cpp memory-maps the file as-is.
+- On the numpy backend it decodes weights to F32, so it holds **twice** the F16 file, where llama.cpp memory-maps the file as-is. (The MLX backend keeps float16 and does not, which is most of why it is faster.)
 - `--stream` costs about 1.2 seconds per gigabyte of model, per token, because every token re-reads and re-converts everything. Measured: 0.26 s/token for a 0.25 GB model, 2.74 s/token for a 2.31 GB one. A 70B would be around three minutes per token.
 
 So `--stream` is a demonstration that the weights really are data paged in on demand — not a way to run a model you could not otherwise run. **It will not make a large model fit on a small device.** llama.cpp already memory-maps its files, so it runs models larger than RAM today, and the OS page cache does that better than anything here.
@@ -232,6 +232,32 @@ Then there is `--stream`, which is a demonstration rather than a capability:
 | Llama-3.2-1B f16 | 2.31 GB | 2.74 s/token |
 
 Nothing is cached, so every token re-reads and re-converts the entire model — eight tokens of SmolLM read **2,796 MB across 2,457 queries** out of a 258 MB file. Peak memory is one layer instead of one model, which sounds like it should let a large model run on a small machine. It does not. The cost is flatly linear in model size, about 1.2 seconds per gigabyte per token, so a 7B lands near 17 s/token and a 70B near three minutes. `--stream` shows that the weights are genuinely data paged in on demand; it is not a way to run a model that would not otherwise fit, and llama.cpp already memory-maps its files for exactly that case.
+
+### Backends: numpy, MLX, CuPy
+
+`reminis run` computes through whichever array library suits the machine — **MLX** on Apple silicon, **CuPy** on NVIDIA, **numpy** everywhere. numpy stays the reference implementation: it is the one whose logits are checked against `transformers`, and the others earn their place by agreeing with it.
+
+Same models, same machine, `--backend numpy` against `--backend mlx`:
+
+| Model | numpy | MLX | Speedup | llama.cpp Metal |
+|---|---|---|---|---|
+| SmolLM-135M f16 | 975 pp / 86 tg | **20,518 pp / 116 tg** | 21× pp / 1.3× tg | 18,126 pp / 176 tg |
+| Qwen2.5-0.5B f16 | 522 pp / 27 tg | **7,962 pp / 59 tg** | 15× pp / 2.2× tg | 5,272 pp / 69 tg |
+| Llama-3.2-1B f16 | 274 pp / 11 tg | **1,866 pp / 25 tg** | 7× pp / 2.3× tg | 1,652 pp / 30 tg |
+
+On prompt processing this now **beats llama.cpp's Metal backend** on all three models, and token generation reaches 66–87% of it. The gain comes less from the GPU than from float16 being a native compute type there: MLX never pays the widening that costs numpy 213 ms of a 274 ms load, and it holds half the memory as a result.
+
+Backends are picked per *workload*, not per machine, because a GPU is not a blanket improvement:
+
+| Workload | Backend | Why |
+|---|---|---|
+| `inference` | MLX / CuPy / numpy | Large matrix multiplies; 7–21× on prompt processing |
+| `elementwise` (merge) | numpy | Measured; see below |
+| `bytes` (diff) | numpy | On a 4M-element block the XOR is 0.4 ms and zlib is 252 ms. zlib runs on the CPU. |
+
+**The merge row is a lesson worth recording.** A benchmark of one 4M-element block said the GPU was 6.6× faster and bit-identical, because numpy's float16 decode and encode run at ~1.2 GB/s. Wired into the real merge it came out **2.4× slower**. The block was warm and reused; a merge reads each blob out of SQLite once, cold, and pays device-transfer costs the benchmark never exercised. The selection table now carries the measured answer rather than the plausible one.
+
+Half precision moves a logit by a few hundredths — enough to reorder near-tied tokens in a top-5 list, never enough to change the argmax. Across three architectures the backends agree on the next token with correlation ≥ 0.999993, and greedy generation produces identical text. Where exactness matters, `--backend numpy` is always there.
 
 ### What made it faster, and what didn't
 
@@ -556,6 +582,9 @@ reminis run model.db "Name three colours." --chat
 
 # Never cache a weight: every matmul re-reads its operand from SQLite
 reminis run model.db "The capital of France is" --stream
+
+# Pick the array library by hand; auto uses the fastest one available
+reminis run model.db "The capital of France is" --backend numpy
 ```
 
 `--stream` holds nothing in memory between uses, so peak memory is one layer rather than one model, and a 258 MB database serves 2,796 MB of reads across 2,457 queries to generate eight tokens. It is the thesis in one flag — the model is data, paged in on demand — and it is a demonstration, not a deployment mode. It costs about 1.2 seconds per gigabyte of model per token, so it does not let a large model run on a small machine, and [it is not trying to](#what-this-is-and-what-it-is-not).
@@ -734,6 +763,8 @@ Note that GGUF and safetensors use different tensor names (`blk.0.attn_q.weight`
 - [x] Attention-free architectures in the viewer (Mamba / state space, RWKV, hybrids)
 - [x] Model merging via SQL operations (`reminis merge`: linear, slerp, task arithmetic, TIES)
 - [x] Inference from database-stored weights (`reminis run`, verified against transformers)
+- [x] GPU backends chosen per workload (`--backend`: MLX on Apple silicon, CuPy on NVIDIA)
+- [ ] Better delta encoding: bit-plane splitting, to get packs below 58% ([#7](https://github.com/ronxldwilson/reminis/issues/7))
 - [ ] Storing the F32 form beside the F16 one, so loading skips the conversion
 - [ ] Running quantized models directly, without an F16 conversion first
 - [ ] Running attention-free architectures (Mamba / state space, RWKV)

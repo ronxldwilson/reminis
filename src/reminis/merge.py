@@ -41,6 +41,7 @@ from pathlib import Path
 
 import numpy as np
 
+from reminis.backend import select as select_backend
 from reminis.dtypes import is_float_dtype, to_float32, from_float32
 
 METHODS = ("linear", "slerp", "task-arithmetic", "ties")
@@ -72,6 +73,7 @@ def merge_models(
     t: float = 0.5,
     scale: float = 1.0,
     verbose: bool = True,
+    backend: str | None = None,
 ) -> dict:
     """Merge model databases into a new one.
 
@@ -176,7 +178,7 @@ def merge_models(
         summary = _apply_merge(
             conn, aliases, plan["mergeable"], method, weights,
             use_base=bool(base), density=density, t=t, scale=scale,
-            verbose=verbose,
+            verbose=verbose, backend=select_backend("elementwise", backend),
         )
 
         _record_provenance(conn, paths, base, method, weights, density, t, scale)
@@ -326,11 +328,12 @@ class _TensorSlicer:
     tensor sixty times.
     """
 
-    def __init__(self, conn: sqlite3.Connection, alias: str, name: str):
+    def __init__(self, conn: sqlite3.Connection, alias: str, name: str, backend=None):
         rowid, dtype, n_elements, n_bytes = conn.execute(
             f"SELECT id, dtype, n_elements, n_bytes FROM {alias}.tensors WHERE name = ?",
             (name,),
         ).fetchone()
+        self.backend = backend or select_backend("elementwise")
         self.dtype = dtype
         self.n_elements = n_elements
         self.itemsize = n_bytes // n_elements if n_elements else 1
@@ -350,10 +353,22 @@ class _TensorSlicer:
             ).fetchone()[0]
             self._view = memoryview(blob)
 
-    def chunk(self, start: int, count: int) -> np.ndarray:
+    def _raw(self, start: int, count: int):
         lo, hi = start * self.itemsize, (start + count) * self.itemsize
-        raw = self._handle[lo:hi] if self._handle is not None else self._view[lo:hi]
-        return to_float32(raw, self.dtype)
+        return self._handle[lo:hi] if self._handle is not None else self._view[lo:hi]
+
+    def chunk(self, start: int, count: int):
+        """A block in the backend's arrays, for the combining itself."""
+        return self.backend.from_bytes(self._raw(start, count), self.dtype)
+
+    def chunk_numpy(self, start: int, count: int) -> np.ndarray:
+        """A block as plain numpy, for the passes that rank and bin values.
+
+        Finding a trim threshold needs a histogram and an exact partial sort,
+        which are numpy's to do; the arrays involved are one block at a time
+        either way.
+        """
+        return to_float32(self._raw(start, count), self.dtype)
 
     def close(self):
         if self._handle is not None:
@@ -370,10 +385,12 @@ class _TensorWriter:
     blocks accumulate in a bytearray and go in with one UPDATE.
     """
 
-    def __init__(self, conn: sqlite3.Connection, name: str, n_elements: int, dtype: str):
+    def __init__(self, conn: sqlite3.Connection, name: str, n_elements: int,
+                 dtype: str, backend=None):
         self.conn = conn
         self.name = name
         self.dtype = dtype
+        self.backend = backend or select_backend("elementwise")
         row = conn.execute(
             "SELECT id, n_bytes FROM tensors WHERE name = ?", (name,)
         ).fetchone()
@@ -390,8 +407,8 @@ class _TensorWriter:
         if self._handle is None:
             self._buffer = bytearray()
 
-    def write(self, start: int, values: np.ndarray):
-        raw = from_float32(values, self.dtype)
+    def write(self, start: int, values):
+        raw = self.backend.to_bytes(values, self.dtype)
         if self._handle is not None:
             offset = start * self.itemsize
             self._handle[offset:offset + len(raw)] = raw
@@ -466,7 +483,8 @@ def _trim_cutoff(reader, base_reader, density, n_elements) -> float:
     def blocks():
         for start in range(0, n_elements, CHUNK_ELEMENTS):
             count = min(CHUNK_ELEMENTS, n_elements - start)
-            yield np.abs(reader.chunk(start, count) - base_reader.chunk(start, count))
+            yield np.abs(reader.chunk_numpy(start, count)
+                         - base_reader.chunk_numpy(start, count))
 
     hi = 0.0
     for magnitudes in blocks():
@@ -533,7 +551,8 @@ def _blocked_message(plan: dict) -> str:
 
 
 def _apply_merge(
-    conn, aliases, mergeable, method, weights, use_base, density, t, scale, verbose
+    conn, aliases, mergeable, method, weights, use_base, density, t, scale,
+    verbose, backend=None
 ) -> dict:
     """Combine each aligned tensor and write it into the output.
 
@@ -544,6 +563,9 @@ def _apply_merge(
     holding one decoded copy of it per input plus one for the output is the
     thing that would otherwise decide the memory ceiling.
     """
+    backend = backend or select_backend("elementwise")
+    xp = backend.xp
+
     n_params = 0
     mixed_dtype = 0
     drift_sum = 0.0
@@ -555,9 +577,9 @@ def _apply_merge(
         if dtypes_differ:
             mixed_dtype += 1
 
-        readers = [_TensorSlicer(conn, alias, name) for alias in aliases]
-        base_reader = _TensorSlicer(conn, "base", name) if use_base else None
-        writer = _TensorWriter(conn, name, n_elements, dtype)
+        readers = [_TensorSlicer(conn, alias, name, backend) for alias in aliases]
+        base_reader = _TensorSlicer(conn, "base", name, backend) if use_base else None
+        writer = _TensorWriter(conn, name, n_elements, dtype, backend)
 
         try:
             # slerp and ties both need a quantity computed over the whole
@@ -574,7 +596,7 @@ def _apply_merge(
                 base_arr = base_reader.chunk(start, count) if base_reader else None
 
                 merged = _combine(method, arrays, weights, base_arr,
-                                  density, t, scale, precomputed, start)
+                                  density, t, scale, precomputed, start, xp)
 
                 # Drift is measured against the first model, which is what
                 # the output would have been had the merge done nothing.
@@ -583,7 +605,7 @@ def _apply_merge(
                 # Apple's Accelerate raises the divide-by-zero and overflow
                 # flags during ordinary float32 dot products whose inputs and
                 # results are all finite, so the warnings say nothing here.
-                with np.errstate(all="ignore"):
+                with backend.errstate():
                     diff = merged - arrays[0]
                     delta_sq += float(diff @ diff)
                     ref_sq += float(arrays[0] @ arrays[0])
@@ -622,7 +644,7 @@ def _apply_merge(
 
 
 def _combine(method, arrays, weights, base_arr, density, t, scale,
-             precomputed=None, start=0) -> np.ndarray:
+             precomputed=None, start=0, xp=np):
     """Combine one block of the aligned tensors.
 
     `precomputed` carries whatever the method needed to know about the whole
@@ -630,33 +652,31 @@ def _combine(method, arrays, weights, base_arr, density, t, scale,
     that are purely elementwise.
     """
     if method == "linear":
-        out = np.zeros_like(arrays[0])
-        for w, a in zip(weights, arrays):
-            out += np.float32(w) * a
+        out = weights[0] * arrays[0]
+        for w, a in zip(weights[1:], arrays[1:]):
+            out = out + w * a
         return out
 
     if method == "slerp":
-        return _slerp(arrays[0], arrays[1], t, precomputed)
+        return _slerp(arrays[0], arrays[1], t, precomputed, xp)
 
     # Both remaining methods work on task vectors rather than the weights.
     taskvecs = [a - base_arr for a in arrays]
 
     if method == "task-arithmetic":
-        combined = np.zeros_like(base_arr)
-        for w, tv in zip(weights, taskvecs):
-            combined += np.float32(w) * tv
-        return base_arr + np.float32(scale) * combined
+        combined = weights[0] * taskvecs[0]
+        for w, tv in zip(weights[1:], taskvecs[1:]):
+            combined = combined + w * tv
+        return base_arr + scale * combined
 
     if method == "ties":
         cutoffs = precomputed["cutoffs"] if precomputed else None
-        return base_arr + np.float32(scale) * _ties(
-            taskvecs, weights, density, cutoffs
-        )
+        return base_arr + scale * _ties(taskvecs, weights, density, cutoffs, xp)
 
     raise AssertionError(f"unreachable: {method}")
 
 
-def _slerp(a: np.ndarray, b: np.ndarray, t: float, stats=None) -> np.ndarray:
+def _slerp(a, b, t: float, stats=None, xp=np):
     """Spherical interpolation between two flattened weight tensors.
 
     The angle is measured between the normalised vectors but the
@@ -672,28 +692,27 @@ def _slerp(a: np.ndarray, b: np.ndarray, t: float, stats=None) -> np.ndarray:
     entries, so a chunked merge works them out in a pass of its own first.
     """
     if stats is None:
-        na, nb = float(np.linalg.norm(a)), float(np.linalg.norm(b))
-        dot = float(np.dot(a, b))
+        na, nb = float(xp.sqrt(a @ a)), float(xp.sqrt(b @ b))
+        dot = float(a @ b)
     else:
         na, nb, dot = stats["na"], stats["nb"], stats["dot"]
 
     if na == 0 or nb == 0:
-        return (1 - np.float32(t)) * a + np.float32(t) * b
+        return (1 - t) * a + t * b
 
     cos_omega = max(-1.0, min(1.0, dot / (na * nb)))
     omega = np.arccos(cos_omega)
     sin_omega = np.sin(omega)
 
     if abs(sin_omega) < 1e-6:
-        return (1 - np.float32(t)) * a + np.float32(t) * b
+        return (1 - t) * a + t * b
 
-    ka = np.float32(np.sin((1 - t) * omega) / sin_omega)
-    kb = np.float32(np.sin(t * omega) / sin_omega)
+    ka = float(np.sin((1 - t) * omega) / sin_omega)
+    kb = float(np.sin(t * omega) / sin_omega)
     return ka * a + kb * b
 
 
-def _ties(taskvecs: list[np.ndarray], weights: list[float], density: float,
-          cutoffs: list[float] | None = None) -> np.ndarray:
+def _ties(taskvecs, weights, density: float, cutoffs=None, xp=np):
     """TIES: trim each task vector, elect a sign, then average the agreers.
 
     Fine-tunes interfere in two ways -- they disagree about the direction of
@@ -724,26 +743,27 @@ def _ties(taskvecs: list[np.ndarray], weights: list[float], density: float,
         if cutoff == float("-inf"):
             trimmed.append(tv)
             continue
-        trimmed.append(np.where(np.abs(tv) >= cutoff, tv, np.float32(0)))
+        trimmed.append(xp.where(xp.abs(tv) >= cutoff, tv, 0.0))
 
-    w = [np.float32(x) for x in weights]
+    elected = weights[0] * trimmed[0]
+    for wi, tv in zip(weights[1:], trimmed[1:]):
+        elected = elected + wi * tv
+    sign = xp.sign(elected)
 
-    elected = np.zeros_like(trimmed[0])
-    for wi, tv in zip(w, trimmed):
-        elected += wi * tv
-    sign = np.sign(elected)
+    numerator = None
+    denominator = None
+    for wi, tv in zip(weights, trimmed):
+        agrees = (xp.sign(tv) == sign) & (tv != 0)
+        num = xp.where(agrees, wi * tv, 0.0)
+        den = xp.where(agrees, float(wi), 0.0)
+        numerator = num if numerator is None else numerator + num
+        denominator = den if denominator is None else denominator + den
 
-    numerator = np.zeros_like(elected)
-    denominator = np.zeros_like(elected)
-    for wi, tv in zip(w, trimmed):
-        agrees = (np.sign(tv) == sign) & (tv != 0)
-        numerator += np.where(agrees, wi * tv, np.float32(0))
-        denominator += np.where(agrees, wi, np.float32(0))
-
-    return np.divide(
-        numerator, denominator,
-        out=np.zeros_like(numerator), where=denominator != 0,
-    )
+    # Entries where no model agreed with the elected sign contribute nothing,
+    # and dividing by their zero denominator would produce a NaN rather than
+    # the zero that means "left alone".
+    safe = xp.where(denominator != 0, denominator, 1.0)
+    return xp.where(denominator != 0, numerator / safe, 0.0)
 
 
 def _record_provenance(conn, paths, base, method, weights, density, t, scale):
