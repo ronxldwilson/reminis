@@ -56,6 +56,8 @@ from reminis.dtypes import (
     is_float_dtype,
     is_quantized_dtype,
 )
+from reminis.ggml_affine import AFFINE_GROUP, can_repack
+from reminis.ggml_affine import repack as ggml_repack
 
 # Architectures whose block structure this file actually implements. The
 # value is the rotary layout llama.cpp uses for that architecture, and it is
@@ -96,13 +98,14 @@ class WeightStore:
     )
 
     def __init__(self, db_path: str, stream: bool = False, backend=None,
-                 pack_bits: int | None = None, pack_group: int = 32):
+                 pack_bits=None, pack_group: int = 32):
         self.path = db_path
         self.stream = stream
         self.backend = backend or select_backend("inference")
         self.pack_bits = pack_bits
         self.pack_group = pack_group
         self.packed = 0
+        self.packed_native = 0
         self.conn = sqlite3.connect(db_path)
         self.conn.execute("PRAGMA query_only = 1")
         # Memory-map the file rather than copying each blob through SQLite's
@@ -145,6 +148,16 @@ class WeightStore:
         shape, dtype, blob = row
         dims = tuple(ast.literal_eval(shape))[::-1]
 
+        native = self._native_pack(name, blob, dtype, dims)
+        if native is not None:
+            self.bytes_read += len(blob)
+            self.reads += 1
+            self.packed += 1
+            self.packed_native += 1
+            if not self.stream:
+                self._cache[name] = native
+            return native
+
         if is_float_dtype(dtype):
             arr = self.backend.from_bytes(blob, dtype, dims)
         elif is_quantized_dtype(dtype):
@@ -179,11 +192,35 @@ class WeightStore:
 
     def _should_pack(self, name: str) -> bool:
         return (
-            self.pack_bits is not None
+            isinstance(self.pack_bits, int)
             and self.backend.can_pack()
-            and name.startswith("blk.")
-            and name.endswith(self._PACKABLE)
+            and self._packable(name)
         )
+
+    def _packable(self, name: str) -> bool:
+        return name.startswith("blk.") and name.endswith(self._PACKABLE)
+
+    def _native_pack(self, name, blob, dtype, dims):
+        """The stored blocks handed to the backend without being unpacked.
+
+        Several GGML quantizations are already affine within each group of
+        32, which is the form the backend's quantized matmul wants, so they
+        can be rewritten into its layout by moving bits around. No weight is
+        ever decoded, nothing is rounded a second time, and the result is
+        bit-identical to unpacking -- verified against the gguf package's own
+        dequantization, which is the implementation of record.
+        """
+        if self.pack_bits != "native" or not self.backend.can_pack():
+            return None
+        if not self._packable(name) or not can_repack(dtype):
+            return None
+
+        packed = ggml_repack(blob, dtype, dims)
+        if packed is None:
+            return None
+        words, scales, biases, bits = packed
+        return self.backend.adopt_packed(words, scales, biases, bits,
+                                         AFFINE_GROUP, dims)
 
     def get_numpy(self, name: str) -> np.ndarray:
         """A tensor as plain float32 numpy, whatever the backend is.
@@ -476,7 +513,7 @@ class Model:
     """
 
     def __init__(self, db_path: str, stream: bool = False, backend=None,
-                 pack_bits: int | None = None):
+                 pack_bits=None):
         self.backend = backend or select_backend("inference")
         self.store = WeightStore(db_path, stream=stream, backend=self.backend,
                                  pack_bits=pack_bits)

@@ -242,18 +242,25 @@ The check that matters is not that it generates — wrong block arithmetic still
 
 **Be clear what this is not.** Unpacked blocks become float16 in memory, so the Q4_K_M model holds 772 MB against the F16 model's 784 MB — near-identical, from a file that is 101 MB rather than 258 MB. **Quantization saves disk and download here, not RAM.**
 
-`--pack` recovers part of that by re-packing into the backend's own quantization format and multiplying without unpacking. It costs a second rounding on top of the file's own, and the trade is measurable:
+`--pack` keeps them packed instead, and there are two ways to do it.
+
+**`--pack` with no value moves GGML's own blocks into the backend's layout, bit-exactly.** This is the interesting one. Several GGML quantizations turn out to be *already affine* within each group of 32 weights — `Q4_K` is `(d·sc)·q − (dmin·m)`, `Q5_0` is `d·(q−16)`, `Q8_0` is `d·q` — which is precisely the `scale·q + bias` form MLX's quantized matmul expects. So they can be rewritten into its layout by shuffling bits, with **no arithmetic on any weight and no second rounding**. Verified against the `gguf` package's own dequantization: Q4_0, Q4_1, Q5_0, Q5_1, Q5_K, Q4_K and Q8_0 all come back **bit-identical**, zero difference.
+
+**`--pack 4|6|8` re-quantizes instead**, which is smaller and faster but rounds every weight a second time.
 
 | | Weights resident | Generation | Logits vs unpacked |
 |---|---|---|---|
-| unpacked (default) | 258 MB | 113 tok/s | — |
+| unpacked (default) | 258 MB | 112 tok/s | — |
+| `--pack` (bit-exact) | 158 MB (1.6×) | 83 tok/s | corr 0.9999946, top-5 intact |
 | `--pack 8` | 172 MB (1.5×) | 110 tok/s | corr 0.9999, top-5 intact |
 | `--pack 6` | 148 MB (1.7×) | 115 tok/s | corr 0.9981, top-5 intact |
-| `--pack 4` | **122 MB (2.1×)** | **128 tok/s** | corr 0.9710, top-5 **reordered** |
+| `--pack 4` | **122 MB (2.1×)** | **138 tok/s** | corr 0.9710, top-5 **reordered** |
 
-4-bit is smallest and fastest — less memory to read is less time reading it — but the double quantization visibly reorders the ranking. 6-bit is the honest recommendation: 1.7× smaller, slightly faster, top-5 unchanged.
+The bit-exact path costs speed on this file, which is 86% Q5_0. I measured individual quantized matmuls to explain why and got a result that contradicted the end-to-end run, so the cause is unestablished and the number stands as measured.
 
-Note what this does *not* beat. MLX's 4-bit packing of a Q4_K tensor is 0.63 MB where the original GGUF block was 0.47 MB — GGML's K-quants are more space-efficient, and llama.cpp multiplies them directly with no requantization error at all. This narrows the gap; it does not close it.
+What does not map: `Q6_K`, `Q2_K` and `Q3_K` use sub-blocks of **16** weights where MLX supports 32, 64 or 128; and the i-quants are codebook lookups rather than a scale times an integer, so no affine form exists. Those fall back to being unpacked.
+
+This closes most of the gap with llama.cpp on quantized weights — the values multiplied are now exactly the ones in the file — without closing it entirely: llama.cpp still reads the original blocks with no repack step and no float32 scale array beside them.
 
 ### Backends: numpy, MLX, CuPy
 
@@ -790,7 +797,8 @@ Note that GGUF and safetensors use different tensor names (`blk.0.attn_q.weight`
 - [ ] Storing the F32 form beside the F16 one, so loading skips the conversion
 - [x] Running quantized models: every K-quant and i-quant, unpacked at load
 - [x] Keeping weights packed in the backend's own format (`--pack 4/6/8`)
-- [ ] Multiplying GGML's K-quant blocks directly, without the second rounding
+- [x] Multiplying GGML's blocks with no second rounding, for the affine types (`--pack`)
+- [ ] The remaining quant types (Q6_K, Q2_K, Q3_K, i-quants), which need 16-weight groups or a codebook
 - [ ] Running attention-free architectures (Mamba / state space, RWKV)
 - [ ] Unsloth integration
 

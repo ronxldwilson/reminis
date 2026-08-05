@@ -148,6 +148,10 @@ class Backend:
     def pack(self, arr, bits: int, group_size: int = 32):
         raise NotImplementedError
 
+    def adopt_packed(self, words, scales, biases, bits, group_size, shape):
+        """Take an already-packed weight, laid out the way this backend wants."""
+        raise NotImplementedError
+
     def matmul_weight(self, x, w):
         """x @ w.T, whether w is a plain matrix or a packed one."""
         return x @ w.T
@@ -334,6 +338,14 @@ class MLXBackend(Backend):
         q, scales, biases = mx.quantize(arr, group_size=group_size, bits=bits)
         mx.eval(q, scales, biases)
         return QuantizedWeight(q, scales, biases, group_size, bits, arr.shape)
+
+    def adopt_packed(self, words, scales, biases, bits, group_size, shape):
+        mx = self.mx
+        q = mx.array(words)
+        s = mx.array(scales)
+        b = mx.array(biases)
+        mx.eval(q, s, b)
+        return QuantizedWeight(q, s, b, group_size, bits, shape)
 
     def matmul_weight(self, x, w):
         if not isinstance(w, QuantizedWeight):
