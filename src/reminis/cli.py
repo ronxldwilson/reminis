@@ -80,6 +80,20 @@ def main():
     )
     p_diff.add_argument("-q", "--quiet", action="store_true", help="Suppress progress output")
 
+    # log: inspect a training log
+    p_log = sub.add_parser("log", help="Inspect a training log written by reminis.track")
+    p_log.add_argument("input", help="Path to the training log database")
+    p_log.add_argument("--step", type=int, help="Show per-parameter detail for one step")
+    p_log.add_argument("--spikes", action="store_true", help="Show only loss spikes")
+
+    # rollback: restore a model to a snapshot
+    p_rollback = sub.add_parser(
+        "rollback", help="Restore a model to its weights at a logged snapshot"
+    )
+    p_rollback.add_argument("log", help="Path to the training log database")
+    p_rollback.add_argument("step", type=int, help="Snapshot step to restore")
+    p_rollback.add_argument("-o", "--output", required=True, help="Output database path")
+
     # apply: apply a delta pack to a base model
     p_apply = sub.add_parser("apply", help="Apply a delta pack to a base model")
     p_apply.add_argument("base", help="Path to the base model database")
@@ -137,6 +151,17 @@ def main():
             verbose=not args.quiet, lossy_tolerance=args.lossy,
         )
 
+    elif args.command == "log":
+        _show_log(args.input, step=args.step, spikes_only=args.spikes)
+
+    elif args.command == "rollback":
+        from reminis.track import TrainingLog, rollback_to_step
+        log = TrainingLog(args.log)
+        try:
+            rollback_to_step(log, args.step, args.output, verbose=True)
+        finally:
+            log.close()
+
     elif args.command == "apply":
         from reminis.diff import apply_delta
         apply_delta(
@@ -174,6 +199,89 @@ def _source_format(db_path: str) -> str:
     finally:
         conn.close()
     return row[0] if row else "gguf"
+
+
+def _show_log(log_path: str, step: int | None = None, spikes_only: bool = False):
+    """Print what a training run did, straight out of SQL."""
+    from reminis.track import TrainingLog
+
+    if not Path(log_path).exists():
+        print(f"Error: {log_path} not found")
+        sys.exit(1)
+
+    log = TrainingLog(log_path)
+    try:
+        meta = dict(log.conn.execute("SELECT key, value FROM run_meta"))
+        n_steps = log.conn.execute("SELECT COUNT(*) FROM steps").fetchone()[0]
+        n_updates = log.conn.execute("SELECT COUNT(*) FROM param_updates").fetchone()[0]
+        n_snaps = log.conn.execute("SELECT COUNT(*) FROM snapshots").fetchone()[0]
+
+        size_mb = Path(log_path).stat().st_size / (1024 * 1024)
+        print(f"Training log: {log_path} ({size_mb:.2f} MB)")
+        print(f"  Run: {meta.get('run_name', 'unknown')}")
+        for key in ("model_class", "learning_rate", "num_train_epochs",
+                    "logging_overhead_seconds"):
+            if key in meta:
+                print(f"  {key}: {meta[key]}")
+        print(f"  Steps logged: {n_steps}")
+        print(f"  Parameter updates: {n_updates:,}")
+        print(f"  Snapshots: {n_snaps}")
+
+        if step is not None:
+            print(f"\n  Step {step}, largest gradients:")
+            rows = log.step_detail(step)
+            if not rows:
+                print("    (no rows for that step)")
+            for param, gnorm, gmax, wnorm in rows:
+                print(f"    {param:<50s} |grad|={gnorm:>10.4f}  "
+                      f"max={gmax:>9.4f}  |w|={wnorm if wnorm else 0:>10.4f}")
+            return
+
+        spikes = log.loss_spikes()
+        if spikes:
+            print(f"\n  Loss spikes ({len(spikes)}):")
+            for spike_step, before, after in spikes[:10]:
+                print(f"    step {spike_step:>5}: {before:.4f} -> {after:.4f} "
+                      f"({after / before:.2f}x)")
+            print("    Inspect one with: reminis log <log.db> --step <N>")
+        elif spikes_only:
+            print("\n  No loss spikes detected.")
+
+        if spikes_only:
+            return
+
+        curve = log.loss_curve()
+        if curve:
+            first, last = curve[0], curve[-1]
+            best = min(curve, key=lambda r: r[1])
+            print(f"\n  Loss: {first[1]:.4f} (step {first[0]}) -> "
+                  f"{last[1]:.4f} (step {last[0]}), best {best[1]:.4f} at step {best[0]}")
+
+        top = log.most_changed_params(limit=10)
+        if top:
+            print(f"\n  Most-updated parameters (by cumulative gradient norm):")
+            for param, total, n in top:
+                print(f"    {param:<50s} {total:>12.2f}  over {n} steps")
+
+        snaps = log.conn.execute(
+            "SELECT step, kind, base_step, bytes FROM snapshots ORDER BY step"
+        ).fetchall()
+        if snaps:
+            total = sum(s[3] for s in snaps)
+            print(f"\n  Snapshots ({_fmt(total)} total):")
+            for snap_step, kind, base_step, size in snaps:
+                against = f" vs step {base_step}" if base_step is not None else ""
+                print(f"    step {snap_step:>5}  {kind:<6s}{against:<15s} {_fmt(size)}")
+            print(f"\n  Restore one with: reminis rollback <log.db> <step> -o restored.db")
+    finally:
+        log.close()
+
+
+def _fmt(b: int) -> str:
+    for unit, size in (("GB", 1024 ** 3), ("MB", 1024 ** 2), ("KB", 1024)):
+        if b >= size:
+            return f"{b / size:.1f} {unit}"
+    return f"{b} B"
 
 
 def _show_info(db_path: str):

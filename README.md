@@ -12,7 +12,9 @@ pip install reminis
 
 The ML world treats model weights as opaque files. You save the whole thing, load the whole thing, and if something goes wrong, you retrain from scratch.
 
-Once weights are in a database, you get — for free — everything that 40 years of database engineering has built: queries, rollback, diffs, branching, merging, audit logs, access control, replication.
+Once weights are in a database, you get — for free — much of what 40 years of database engineering has built: queries, diffs, snapshots, audit logs, replication.
+
+Not all of it, and reminis tries to be specific about which. Rollback, in particular, does not mean what it means in a database — see [what rollback actually gives you](#what-rollback-actually-gives-you--a-negative-result).
 
 ## Quick Start
 
@@ -38,6 +40,10 @@ reminis diff base.db finetuned.db -o change.delta.db
 
 # Reconstruct the fine-tune from the base plus the pack
 reminis apply base.db change.delta.db -o rebuilt.db
+
+# See what a tracked training run did, and rewind to a snapshot
+reminis log run.log.db
+reminis rollback run.log.db 500 -o restored.db
 
 # Convert back to GGUF
 reminis export model.db -o model_restored.gguf
@@ -258,6 +264,86 @@ Verified against peft itself: the applied result is compared tensor-by-tensor ag
 
 `modules_to_save` tensors — ones peft trained outright rather than through a factor pair — are carried in the pack in full. Embedding LoRA (`lora_embedding_A/B`) is not handled yet, and reminis refuses such an adapter rather than writing a pack that quietly omits part of it.
 
+## Tracking a training run
+
+`reminis` can record what training did to a model as it happens, so a bad step can be found later with a query rather than a guess.
+
+```python
+from reminis import TrainingLog
+from reminis.integrations import TrackedOptimizer
+
+log = TrainingLog("run.log.db", run_name="my-finetune", snapshot_dir="snapshots/")
+optimizer = TrackedOptimizer(
+    torch.optim.AdamW(model.parameters(), lr=1e-4),
+    log,
+    model.named_parameters(),
+    every_n_steps=5,          # the main cost dial
+)
+
+for step, batch in enumerate(loader):
+    if step % 500 == 0:
+        log.snapshot(step, model.state_dict())
+    loss = model(**batch).loss
+    loss.backward()
+    optimizer.current_loss = float(loss.detach())
+    optimizer.step()
+    optimizer.zero_grad()
+```
+
+With HuggingFace `Trainer`, pass the same wrapped optimizer via `optimizers=` and add `reminis.integrations.make_callback(log, snapshot_every=500)` so loss, epoch, and learning rate reach the log too.
+
+Then read it:
+
+```bash
+$ reminis log run.log.db
+
+  Steps logged: 20
+  Parameter updates: 420
+  Snapshots: 3
+
+  Loss: 4.1679 (step 0) -> 2.8655 (step 19), best 2.8186 at step 18
+
+  Most-updated parameters (by cumulative gradient norm):
+    model.embed_tokens.weight                    24.38  over 20 steps
+    lm_head.weight                               23.55  over 20 steps
+
+  Snapshots (1.1 MB total):
+    step     0  full                  396.0 KB
+    step     8  delta  vs step 0      364.0 KB
+```
+
+`reminis log run.log.db --step N` shows per-parameter detail for one step. Snapshots are stored as delta packs against the previous snapshot, and `reminis rollback run.log.db <step> -o restored.db` restores one, verified against the hash recorded during training.
+
+### What tracking costs
+
+Measured on SmolLM2-135M (134.5M parameters, fp32, CPU):
+
+| Setting | Per step | Overhead |
+|---|---|---|
+| untracked | 405 ms | — |
+| `every_n_steps=1` | 536 ms | +32% |
+| `every_n_steps=5` | 407 ms | +0.5% |
+
+The work is a handful of reductions per parameter, done in the framework rather than by copying to numpy, so on a GPU it costs far less than these CPU figures suggest. `track_params` (log only the trainable subset, e.g. LoRA) and `track_weights=False` cut it further.
+
+### What rollback actually gives you — a negative result
+
+The appealing idea is surgical: find the bad step, subtract its update from the final weights, keep everything learned since. **That does not work, and reminis says so rather than shipping it.**
+
+`tests/experiment_rollback.py` measures it directly. The same model is trained twice on identical data with identical seeds, differing only in whether one step sees a corrupted batch — so run B is the ground truth we would want to recover. Then three ways of "undoing" run A's bad step are compared against it:
+
+| Approach | Distance from ground truth |
+|---|---|
+| Do nothing (keep the bad step) | 2.19e-02 |
+| Subtract the bad step's weight delta | 2.28e-02 — **worse** |
+| Rewind to the snapshot before it | exact at that step, but discards the 20 steps since |
+
+Subtracting the delta made it *worse*, not better. Across 3 seeds × 3 step positions the pattern is consistent and matches the theory: it only helps when few steps follow the bad one, and even then by a few percent.
+
+The reason is that every gradient after the bad step was computed *from the weights that step produced*. Those later updates are only valid in the context of the step you want gone. Adam's moment estimates diverge too, and subtracting a weight delta never touches them.
+
+So rollback in reminis is an honest rewind: it restores a snapshot exactly, hash-verified, and tells you plainly that the steps after it are gone rather than selectively removed. Genuinely dropping a mid-run step means rewinding and training forward again — the log tells you *where* to rewind to, which is the part that was previously guesswork.
+
 ## Python API
 
 ```python
@@ -318,8 +404,9 @@ Note that GGUF and safetensors use different tensor names (`blk.0.attn_q.weight`
 - [x] Low-rank delta encoding for LoRA fine-tunes (`--lossy`)
 - [x] Safetensors input and output, sharded and BF16 (`reminis convert ./model/`)
 - [x] peft LoRA adapters as exact delta packs (`reminis lora`)
-- [ ] Fine-tune tracking with edit logs
-- [ ] Surgical rollback of bad training steps
+- [x] Fine-tune tracking with edit logs (`reminis log`)
+- [x] Hash-verified rewind to a snapshot (`reminis rollback`)
+- [x] Measured why *surgical* rollback of a mid-run step does not work
 - [ ] Model merging via SQL operations
 - [ ] Inference from database-stored weights
 - [ ] Unsloth integration
