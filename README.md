@@ -308,6 +308,22 @@ Same models, same machine, `--backend numpy` against `--backend mlx`:
 
 The gain comes less from the GPU than from float16 being a native compute type there: MLX never pays the widening that costs numpy 213 ms of a 274 ms load, and it holds half the memory as a result.
 
+### Beating llama.cpp by packing on the way in
+
+An f16 model can be packed as it loads, with no separate quantization step and no second file. On the same f16 GGUF llama.cpp is reading, interleaved and best-of-four:
+
+| Model | reminis f16 | reminis `--pack 8` | llama.cpp f16 | packed vs llama.cpp |
+|---|---|---|---|---|
+| SmolLM-135M | 272 | 333 | 334 | **100%** |
+| Qwen2.5-0.5B | 107 | 164 | 124 | **133%** |
+| Llama-3.2-1B | 48 | 80 | 51 | **156%** |
+
+`--pack 8` correlates with the unpacked model at **0.9999** and produces identical greedy text, so this is not a quality trade in any sense that shows up in output — it is the same model reading half the bytes.
+
+Two things make it work. Packing is applied to the **embedding table** as well, which is normally excluded because it is indexed rather than multiplied: a packed table can still be indexed, and on a tied-weights model it is also the output projection, where it is the single largest read of every token. And the per-group scales are held in float16, which is what `compact` does.
+
+Be clear about the boundary. Precision-matched, llama.cpp is still ahead: its **Q8_0** kernels beat this at 402 against 333 on SmolLM, and f16 against f16 it wins everywhere by 6–19%. The claim is narrower and still useful — *given an f16 file and no willingness to convert it*, reminis will run it faster than llama.cpp will.
+
 ### Against llama.cpp, generating tokens
 
 Token generation was the one axis llama.cpp clearly won. These are run **interleaved** — one round of each, alternating, best of seven — because the machine is not idle and alternating makes shared load cancel:

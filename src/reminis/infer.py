@@ -103,6 +103,13 @@ class WeightStore:
         "ffn_gate_exps.weight", "ffn_up_exps.weight", "ffn_down_exps.weight",
     )
 
+    # The embedding table is indexed rather than multiplied, but on a model
+    # with tied weights it is also the output projection -- and there it is
+    # the single largest read of every token. Packing it pays for the whole
+    # output side, and the handful of rows an embedding lookup needs are
+    # decoded individually.
+    _PACKABLE_EMBED = ("token_embd.weight", "output.weight")
+
     def __init__(self, db_path: str, stream: bool = False, backend=None,
                  pack_bits=None, pack_group: int = 32):
         self.path = db_path
@@ -206,6 +213,8 @@ class WeightStore:
         )
 
     def _packable(self, name: str) -> bool:
+        if name in self._PACKABLE_EMBED:
+            return True
         return name.startswith("blk.") and name.endswith(self._PACKABLE)
 
     def _native_pack(self, name, blob, dtype, dims):
@@ -1077,7 +1086,7 @@ class Model:
         b = self.backend
         with b.errstate():
             embed = self.store.get("token_embd.weight")
-            x = embed[b.xp.array(np.asarray(tokens, dtype=np.int32))]
+            x = b.take_rows(embed, b.xp.array(np.asarray(tokens, dtype=np.int32)))
             if self.cfg.embedding_scale != 1.0:
                 x = x * self.cfg.embedding_scale
 

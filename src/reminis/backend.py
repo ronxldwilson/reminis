@@ -156,6 +156,16 @@ class Backend:
         """x @ w.T, whether w is a plain matrix or a packed one."""
         return x @ w.T
 
+    def take_rows(self, w, indices):
+        """Rows of a weight matrix, unpacking only the ones asked for.
+
+        An embedding table is indexed rather than multiplied, which is why
+        it is normally left unpacked -- but a packed table can still be
+        indexed, because the rows are stored contiguously. Only the handful
+        of rows a prompt actually needs get decoded.
+        """
+        return self.xp.take(w, indices, axis=0)
+
     def gather_matmul(self, x, w, indices, k):
         """Multiply each token by the experts chosen for it.
 
@@ -478,6 +488,16 @@ class MLXBackend(Backend):
 
     def to_compute32(self, x):
         return x.astype(self.mx.float32)
+
+    def take_rows(self, w, indices):
+        if not isinstance(w, QuantizedWeight):
+            return self.mx.take(w, indices, axis=0)
+        mx = self.mx
+        rows = mx.take(w.q, indices, axis=0)
+        scales = mx.take(w.scales, indices, axis=0)
+        biases = mx.take(w.biases, indices, axis=0)
+        return mx.dequantize(rows, scales, biases,
+                             group_size=w.group_size, bits=w.bits)
 
     def gather_matmul(self, x, w, indices, k):
         if not isinstance(w, QuantizedWeight):
