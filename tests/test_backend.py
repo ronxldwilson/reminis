@@ -121,6 +121,58 @@ def test_roundtrip():
                   f"{len(reencoded)} bytes vs {len(raw)}")
 
 
+def test_attention_features():
+    """Attention sinks and sliding windows, backend against backend.
+
+    Both change what a model computes rather than how fast it computes it,
+    so a backend that quietly ignores either would still produce fluent
+    text. These check that each one alters the result at all, and that the
+    array-op fallback and the fused kernel agree about how.
+    """
+    print("\nAttention sinks and sliding windows")
+    if not others():
+        print("  skip  no backend beyond numpy on this machine")
+        return
+
+    rng = np.random.default_rng(0)
+    batch, heads, kv_heads, tokens, keys, dim = 1, 8, 2, 3, 16, 32
+    q = rng.standard_normal((batch, heads, tokens, dim)).astype(np.float32)
+    k = rng.standard_normal((batch, kv_heads, keys, dim)).astype(np.float32)
+    v = rng.standard_normal((batch, kv_heads, keys, dim)).astype(np.float32)
+    sink = rng.standard_normal(heads).astype(np.float32)
+    scale = 1.0 / np.sqrt(dim)
+
+    rows = np.arange(keys - tokens, keys)[:, None]
+    cols = np.arange(keys)[None, :]
+    window = (cols <= rows) & (cols > rows - 5)
+
+    def run(name):
+        b = select(requested=name)
+        args = (b.from_numpy(q), b.from_numpy(k), b.from_numpy(v))
+        m = b.xp.array(window)
+        sk = b.from_numpy(sink)
+        return {
+            "plain": b.to_numpy(b.attention(*args, scale)),
+            "sinks": b.to_numpy(b.attention(*args, scale, None, sk)),
+            "window": b.to_numpy(b.attention(*args, scale, m)),
+            "both": b.to_numpy(b.attention(*args, scale, m, sk)),
+        }
+
+    reference = run("numpy")
+    check("a sink changes the result", not np.allclose(
+        reference["plain"], reference["sinks"], atol=1e-4))
+    check("a window changes the result", not np.allclose(
+        reference["plain"], reference["window"], atol=1e-4))
+
+    for name in others():
+        got = run(name)
+        for kind in ("plain", "sinks", "window", "both"):
+            gap = float(np.abs(got[kind] - reference[kind]).max())
+            check(f"{name}: {kind} attention matches numpy",
+                  np.allclose(got[kind], reference[kind], atol=3e-3),
+                  f"max diff {gap:.2e}")
+
+
 def test_forward_pass_agrees():
     """The whole model, on each backend, against numpy's answer."""
     print("\nA full forward pass on each backend")
@@ -197,6 +249,7 @@ def main():
     test_selection()
     test_primitives()
     test_roundtrip()
+    test_attention_features()
     test_forward_pass_agrees()
     test_generation_agrees()
 

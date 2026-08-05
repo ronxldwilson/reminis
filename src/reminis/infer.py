@@ -338,6 +338,12 @@ class Config:
         self.attn_scale = float(num("attention.scale", 0.0)) or (
             1.0 / math.sqrt(self.head_dim)
         )
+        # A sliding window limits a layer to the most recent keys. Models
+        # that use one usually alternate: some layers see everything, the
+        # rest see a window, which is how they keep long contexts affordable.
+        self.sliding_window = int(num("attention.sliding_window", 0))
+        self.swa_pattern = int(num("attention.sliding_window_pattern", 0))
+
         self.embedding_scale = float(num("embedding_scale", 1.0))
         self.residual_scale = float(num("residual_scale", 1.0))
         self.logit_scale = float(num("logit_scale", 1.0))
@@ -573,7 +579,7 @@ class Model:
         self.tokenizer = Tokenizer(meta)
         self._layer_cache: dict[int, tuple] = {}
         self._rope_cache: tuple | None = None
-        self._mask_cache: tuple | None = None
+        self._mask_cache: dict = {}
         self._fused_cache: dict[tuple[int, str], tuple] = {}
 
     def close(self):
@@ -770,11 +776,16 @@ class Model:
         # A single token attends to the whole cache, so there is nothing for
         # a causal mask to hide and building one is pure waste. It is only
         # needed when several tokens are processed at once.
+        window = cfg.sliding_window if self._layer_slides(layer) else 0
         mask = None
-        if n_tokens > 1:
-            mask = self._causal_mask(n_tokens, offset, k_all.shape[-2])
+        if n_tokens > 1 or window:
+            mask = self._causal_mask(n_tokens, offset, k_all.shape[-2], window)
 
-        out = b.attention(q, k_all, v_all, cfg.attn_scale, mask)
+        sinks = None
+        if self.store.has(p + "attn_sinks.weight"):
+            sinks = self.store.get(p + "attn_sinks.weight").reshape(-1)
+
+        out = b.attention(q, k_all, v_all, cfg.attn_scale, mask, sinks)
         out = out[0].transpose(1, 0, 2).reshape(n_tokens, cfg.n_heads * cfg.head_dim)
         attn_out = self._linear(out, p + "attn_output.weight", p + "attn_output.bias")
         x = x + cfg.residual_scale * attn_out
@@ -831,19 +842,38 @@ class Model:
         ).reshape(n_tokens, k, -1)
         return xp.sum(out * weight.astype(out.dtype)[..., None], axis=1)
 
-    def _causal_mask(self, n_tokens: int, offset: int, total: int):
+    def _layer_slides(self, layer: int) -> bool:
+        """Whether this layer sees only a window of the context.
+
+        The pattern says how the layers alternate: a value of N means one
+        layer in every N attends to everything and the rest are windowed,
+        which is the convention llama.cpp records. Without a pattern, a
+        stated window applies to every layer.
+        """
+        if not self.cfg.sliding_window:
+            return False
+        if self.cfg.swa_pattern <= 1:
+            return True
+        return (layer + 1) % self.cfg.swa_pattern != 0
+
+    def _causal_mask(self, n_tokens: int, offset: int, total: int, window: int = 0):
         """True where a query at an absolute position may see a key.
 
         Built in numpy and handed to the backend, because it depends only on
-        positions and is reused unchanged by every layer of the pass.
+        positions and is reused unchanged by every layer that shares a
+        window size.
         """
-        key = (n_tokens, offset, total)
-        if self._mask_cache is not None and self._mask_cache[0] == key:
-            return self._mask_cache[1]
+        key = (n_tokens, offset, total, window)
+        cached = self._mask_cache.get(key)
+        if cached is not None:
+            return cached
         rows = np.arange(offset, offset + n_tokens)[:, None]
         cols = np.arange(total)[None, :]
-        mask = self.backend.xp.array(cols <= rows)
-        self._mask_cache = (key, mask)
+        allowed = cols <= rows
+        if window:
+            allowed &= cols > rows - window
+        mask = self.backend.xp.array(allowed)
+        self._mask_cache[key] = mask
         return mask
 
     def forward(self, tokens: list[int], cache: "KVCache", offset: int) -> np.ndarray:

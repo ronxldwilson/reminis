@@ -677,6 +677,8 @@ Implemented, and enforced rather than assumed:
 
 - **llama-family, qwen2 and Granite architectures** — RMSNorm, SwiGLU, grouped-query attention, rotary embeddings. That covers llama, llama 3 (including its per-dimension rotary scaling, which is stored as a tensor rather than as metadata), mistral, qwen2 (which uses the other rotary layout and has QKV biases), smollm, and Granite (which scales embeddings, residuals, logits and attention by its own constants — `attention.scale` is 1/head_dim where everyone else uses 1/sqrt(head_dim)).
 - **Mixture of experts** — a router picks the top-k of many stacked feed-forward networks per token. The experts are one 3-D tensor per projection, so selecting them is a gather rather than a Python loop, and they pack like any other weight.
+- **Attention sinks** — a learned per-head logit that joins the softmax denominator without contributing a value, letting a head attend to nothing in particular.
+- **Sliding-window attention** — layers that see only the most recent N keys, alternating with full-attention layers on whatever pattern the metadata records.
 - **Float weights** — F32, F16, BF16.
 - **Byte-level BPE**, rebuilt from the vocabulary and merge list in the database, matching `transformers` exactly across three tokenizer families.
 

@@ -236,12 +236,18 @@ class Backend:
             self.silu(out[..., :half]) * out[..., half:], down
         )
 
-    def attention(self, q, k, v, scale, mask=None):
+    def attention(self, q, k, v, scale, mask=None, sinks=None):
         """Scaled dot-product attention on (batch, heads, tokens, dim).
 
         Grouped-query attention is expressed by k and v having fewer heads
         than q. The fallback below spells that out with a broadcast axis
         rather than repeating the cache, which would copy it every layer.
+
+        `sinks` is one learned logit per head that joins the softmax
+        denominator without contributing a value -- an escape valve letting
+        a head attend to nothing in particular. Implemented by carrying the
+        sink as an extra score column and dropping it after the softmax,
+        which is what the fused kernels do internally.
         """
         xp = self.xp
         n_heads, n_kv = q.shape[1], k.shape[1]
@@ -255,7 +261,17 @@ class Backend:
         scores = (qh @ xp.swapaxes(kh, -1, -2)) * scale
         if mask is not None:
             scores = xp.where(mask, scores, float("-inf"))
-        attn = self.softmax(scores)
+
+        if sinks is None:
+            attn = self.softmax(scores)
+        else:
+            column = xp.broadcast_to(
+                sinks.reshape(n_kv, repeat, 1, 1).astype(scores.dtype),
+                scores.shape[:-1] + (1,),
+            )
+            attn = self.softmax(xp.concatenate([scores, column], axis=-1))
+            attn = attn[..., :-1]
+
         return (attn @ vh).reshape(b, n_heads, t, d)
 
 
@@ -515,11 +531,11 @@ class MLXBackend(Backend):
             self._compiled_ffn = mx.compile(ffn)
         return self._compiled_ffn(x, norm, gate_up, down)
 
-    def attention(self, q, k, v, scale, mask=None):
+    def attention(self, q, k, v, scale, mask=None, sinks=None):
         # Fused attention: the scores matrix is never materialised, and
-        # grouped-query attention is handled inside the kernel.
+        # grouped-query attention and sinks are handled inside the kernel.
         return self.mx.fast.scaled_dot_product_attention(
-            q, k, v, scale=scale, mask=mask
+            q, k, v, scale=scale, mask=mask, sinks=sinks
         )
 
     def softmax(self, x, axis=-1):
