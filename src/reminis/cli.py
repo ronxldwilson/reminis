@@ -80,6 +80,78 @@ def main():
     )
     p_diff.add_argument("-q", "--quiet", action="store_true", help="Suppress progress output")
 
+    # run: generate text from weights in the database
+    p_run = sub.add_parser(
+        "run",
+        help="Generate text from a model, reading its weights out of the database",
+        description="A pure-numpy forward pass over tensors selected from "
+                    "SQLite. No torch, no llama.cpp, no config files -- "
+                    "everything comes out of the database.",
+    )
+    p_run.add_argument("input", help="Path to the model database")
+    p_run.add_argument("prompt", help="The prompt to continue")
+    p_run.add_argument("-n", "--max-tokens", type=int, default=64,
+                       help="How many tokens to generate (default 64)")
+    p_run.add_argument("--temp", type=float, default=0.8,
+                       help="Sampling temperature; 0 is greedy (default 0.8)")
+    p_run.add_argument("--top-p", type=float, default=0.95,
+                       help="Nucleus sampling cutoff; 1 disables it (default 0.95)")
+    p_run.add_argument("--seed", type=int, help="Seed, so a run repeats exactly")
+    p_run.add_argument("--chat", action="store_true",
+                       help="Wrap the prompt in the model's chat template")
+    p_run.add_argument("--stream", action="store_true",
+                       help="Re-read every weight from SQLite instead of caching "
+                            "it, so peak memory is one layer rather than the "
+                            "whole model. Much slower.")
+    p_run.add_argument("-q", "--quiet", action="store_true", help="Suppress progress output")
+
+    # merge: combine several models into one
+    p_merge = sub.add_parser(
+        "merge",
+        help="Merge several model databases into one",
+        description="Align the models' tensors with a SQL join and combine "
+                    "them elementwise. Float weights only -- quantized "
+                    "tensors cannot be averaged meaningfully.",
+    )
+    p_merge.add_argument(
+        "inputs", nargs="+",
+        help="Two or more model databases. With --base, one is allowed too: "
+             "--scale then rescales that single fine-tune, and a negative "
+             "scale subtracts it from the base.",
+    )
+    p_merge.add_argument("-o", "--output", required=True, help="Output database path")
+    p_merge.add_argument(
+        "--method", choices=("linear", "slerp", "task-arithmetic", "ties"),
+        default="linear",
+        help="linear: weighted average. slerp: spherical interpolation between "
+             "two. task-arithmetic / ties: combine (model - base) task vectors, "
+             "which need --base. Default: linear.",
+    )
+    p_merge.add_argument(
+        "--weights",
+        help="Comma-separated weight per input (default: equal). Linear "
+             "weights are normalised to sum to 1.",
+    )
+    p_merge.add_argument(
+        "--base",
+        help="For task-arithmetic and ties: the checkpoint the inputs were "
+             "fine-tuned from",
+    )
+    p_merge.add_argument(
+        "-t", type=float, default=0.5, metavar="T",
+        help="For slerp: how far from the first model to the second (default 0.5)",
+    )
+    p_merge.add_argument(
+        "--density", type=float, default=0.2,
+        help="For ties: fraction of each task vector kept when trimming (default 0.2)",
+    )
+    p_merge.add_argument(
+        "--scale", type=float, default=1.0,
+        help="Multiplier on the combined task vector before it is added back "
+             "to the base (default 1.0)",
+    )
+    p_merge.add_argument("-q", "--quiet", action="store_true", help="Suppress progress output")
+
     # registry: many models in one database
     p_reg = sub.add_parser(
         "registry",
@@ -202,6 +274,31 @@ def main():
             args.base, args.target, args.output,
             verbose=not args.quiet, lossy_tolerance=args.lossy,
         )
+
+    elif args.command == "run":
+        _reject_registry(args.input, "run")
+        from reminis.infer import run_cli
+        run_cli(args)
+
+    elif args.command == "merge":
+        from reminis.merge import merge_models
+        for path in args.inputs + ([args.base] if args.base else []):
+            _reject_registry(path, "merge")
+        weights = None
+        if args.weights:
+            try:
+                weights = [float(w) for w in args.weights.split(",")]
+            except ValueError:
+                parser.error("--weights must be comma-separated numbers, e.g. 0.7,0.3")
+        try:
+            merge_models(
+                args.inputs, args.output, method=args.method, weights=weights,
+                base=args.base, density=args.density, t=args.t, scale=args.scale,
+                verbose=not args.quiet,
+            )
+        except ValueError as exc:
+            print(f"Error: {exc}")
+            sys.exit(1)
 
     elif args.command == "registry":
         if args.registry_command is None:

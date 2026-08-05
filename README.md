@@ -2,7 +2,7 @@
 
 **Your model's weights are just data. Store them in a database.**
 
-`reminis` converts any GGUF or safetensors model into a SQLite database where every tensor becomes a queryable, versionable, diffable row. Convert back when you're done. Lossless. Fast.
+`reminis` converts any GGUF or safetensors model into a SQLite database where every tensor becomes a queryable, versionable, diffable row — one you can also merge with a join and run text through. Convert back when you're done. Lossless. Fast.
 
 ```bash
 pip install reminis
@@ -15,6 +15,8 @@ The ML world treats model weights as opaque files. You save the whole thing, loa
 Once weights are in a database, you get — for free — much of what 40 years of database engineering has built: queries, diffs, snapshots, audit logs, replication.
 
 Not all of it, and reminis tries to be specific about which. Rollback, in particular, does not mean what it means in a database — see [what rollback actually gives you](#what-rollback-actually-gives-you--a-negative-result).
+
+The database is also still a *model*, not an archive of one: `reminis run` generates text straight from the rows, and its logits match `transformers` to 4e-05.
 
 ## Quick Start
 
@@ -45,6 +47,13 @@ reminis diff base.db finetuned.db -o change.delta.db
 
 # Reconstruct the fine-tune from the base plus the pack
 reminis apply base.db change.delta.db -o rebuilt.db
+
+# Merge models: the tensors are aligned by a SQL join
+reminis merge base.db instruct.db -o soup.db
+reminis merge sql.db chat.db -o both.db --method ties --base base.db
+
+# Generate text straight from the weights in the database
+reminis run soup.db "The capital of France is"
 
 # See what a tracked training run did, and rewind to a snapshot
 reminis log run.log.db
@@ -136,6 +145,32 @@ Perturbing all 64 attention projections, then reconstructing from the pack:
 The 7B row is quantized, so per-value deltas are not computable — but changes are still detected and encoded byte-exactly through the XOR path, which is why quantized models work at all.
 
 Roughly half of each timing is SHA256 hashing the full model, which is what guarantees a pack cannot be applied to the wrong base. SHA256 is hardware-accelerated here (957 MB/s) and measurably faster than blake2b, so that is already the cheapest safe option.
+
+### Inference against a reference implementation
+
+`reminis run` computes its forward pass in numpy from tensors selected out of SQLite. To show that this is the same model rather than a plausible imitation, its output is checked against `transformers` running the original checkpoint in float32:
+
+| Check | Result |
+|---|---|
+| Tokenizer ids vs `transformers`, 16 strings × 3 tokenizer families | **48 / 48 identical** |
+| Top-10 next tokens, SmolLM-135M | identical, in order |
+| Largest difference in any of the 49,152 logits | **4.0e-05** |
+| Token-by-token decoding vs one batched pass | 3.4e-05 |
+
+The logit gap is the F16 the GGUF stores against the F32 torch loads, which is the size it should be. The last row uses no external reference at all: if the KV cache, the rotary positions, or the causal mask were wrong, incremental decoding would diverge from a single batched pass, and it does not.
+
+### Inference speed
+
+Greedy decoding, single-threaded numpy, on an M-series laptop:
+
+| Model | Database | Prompt | Generation |
+|---|---|---|---|
+| SmolLM-135M f16 | 258 MB | 0.38s | 80.1 tok/s |
+| Qwen2.5-0.5B f16 | 1,208 MB | 1.99s | 26.4 tok/s |
+| Llama-3.2-1B f16 | 2,366 MB | 4.93s | 7.6 tok/s |
+| SmolLM-135M f16, `--stream` | 258 MB | 0.37s | 2.8 tok/s |
+
+This is not fast, and it is not trying to be — llama.cpp will beat it by an order of magnitude and always will. The last row is the interesting one: with `--stream`, nothing is cached, so those 8 tokens re-read **2,796 MB across 2,457 queries** from a 258 MB file. Peak memory is one layer instead of one model.
 
 ### Quantization coverage
 
@@ -362,6 +397,80 @@ with Registry("models.db") as reg:
     reg.materialize("smollm2-sql", "sql.db")     # back to a normal database
 ```
 
+## Merging models is a join
+
+Model merging is normally a bespoke script: load two checkpoints into memory, match parameter names by hand, average, save. Once the weights are rows, the matching half of that is a join. `reminis merge` attaches every input onto one SQLite connection and asks which tensor names line up, with which shapes, in which dtypes — and that query *is* the merge plan.
+
+```bash
+# Weighted average ("model soup")
+reminis merge base.db instruct.db -o soup.db --weights 0.7,0.3
+
+# Spherical interpolation between two checkpoints
+reminis merge base.db instruct.db -o slerp.db --method slerp -t 0.35
+
+# Combine two fine-tunes as task vectors against their shared base
+reminis merge sql.db chat.db -o both.db --method task-arithmetic --base base.db
+
+# TIES: trim each task vector, elect a sign per parameter, average the agreers
+reminis merge sql.db chat.db -o both.db --method ties --base base.db --density 0.2
+
+# One fine-tune at a negative scale subtracts what it learned
+reminis merge sql.db -o unlearned.db --method task-arithmetic --base base.db --scale -1
+```
+
+| Method | What it does | Needs |
+|---|---|---|
+| `linear` | Weighted average, normalised to sum 1 | 2+ models |
+| `slerp` | Interpolation along the arc, so magnitude travels with direction | exactly 2 |
+| `task-arithmetic` | `base + Σ wᵢ·(modelᵢ − base)` | `--base` |
+| `ties` | Task vectors trimmed to `--density`, sign elected by total magnitude, then averaged over the models that agree | `--base` |
+
+Because the alignment is declarative, a bad merge fails as a row in a result set rather than as an exception thrown halfway through a written file:
+
+- **Quantized tensors are refused, not approximated.** Averaging two Q4_K blocks byte by byte produces noise that still parses as a model, which is the worst available failure. If most of a model's bytes are quantized but identical in every input, the merge says so rather than reporting a merge that changed 0.4% of the file.
+- **Shape mismatches are refused**, with the count and an example — those models are not the same architecture.
+- **Dtypes may differ.** An F32 model and a BF16 one merge fine: everything is combined in float32 and written back in the first model's dtype.
+- **Tensors only the first model has** are carried through; ones only a later model has are dropped, and both counts are reported.
+- **Nothing is written on failure**, and the output may not be one of the inputs.
+
+The result records where it came from — `reminis.merge.method`, `.sources`, `.weights`, `.base` — so a merged file is never anonymous.
+
+Verified on two real 135M checkpoints that share an architecture (SmolLM-135M and its instruct fine-tune, 272 tensors, 134.5M parameters, 1.9s). The sharpest check is an identity: `task-arithmetic` at scale 1 against the base must reconstruct the fine-tune, and it reproduces **every one of the 134,515,008 weights**. Four tensors come back with a different bit pattern for the same number, because adding a zero task vector to a `+0.0` base yields `+0.0` where the original stored `-0.0` — which is what floating-point addition does, and worth stating rather than papering over.
+
+## Running the model out of the database
+
+The obvious question about storing weights in SQLite is whether the result is still a model or just an archive of one. `reminis run` answers it by generating text — a pure-numpy forward pass over tensors selected out of the database, with no torch, no llama.cpp, and no config files. Everything it needs is already in the file: the weights are rows in `tensors`, and the hyperparameters and the tokenizer's vocabulary and merges are rows in `model_meta`.
+
+```bash
+reminis run model.db "The capital of France is"
+
+# Greedy, for a reproducible answer
+reminis run model.db "The capital of France is" --temp 0 -n 40
+
+# Wrap the prompt in the model's chat template
+reminis run model.db "Name three colours." --chat
+
+# Never cache a weight: every matmul re-reads its operand from SQLite
+reminis run model.db "The capital of France is" --stream
+```
+
+`--stream` is the mode that makes the claim literal. Nothing is held in memory between uses, so peak memory is one layer rather than one model, and a 258 MB database serves 2,796 MB of reads across 2,457 queries to generate eight tokens. It is ~30× slower, and it is the whole thesis in one flag: the model is data, paged in on demand.
+
+This also closes the loop on everything else here. A merged, rolled-back, or delta-applied database can be checked by asking it to speak:
+
+```bash
+reminis merge base.db instruct.db -o soup.db
+reminis run soup.db "Name three colours." --chat --temp 0
+```
+
+Implemented, and enforced rather than assumed:
+
+- **llama-family and qwen2 architectures** — RMSNorm, SwiGLU, grouped-query attention, rotary embeddings. That covers llama, llama 3 (including its per-dimension rotary scaling, which is stored as a tensor rather than as metadata), mistral, qwen2 (which uses the other rotary layout and has QKV biases), and smollm.
+- **Float weights** — F32, F16, BF16.
+- **Byte-level BPE**, rebuilt from the vocabulary and merge list in the database, matching `transformers` exactly across three tokenizer families.
+
+Anything else raises. A state-space model is refused by name; a quantized tensor is refused before it can be decoded as though its blocks were floats. A forward pass that guesses produces fluent nonsense, which is worse than an error.
+
 ## Tracking a training run
 
 `reminis` can record what training did to a model as it happens, so a bad step can be found later with a query rather than a guess.
@@ -463,6 +572,17 @@ for name, n_elements in conn.execute(
 sqlite_to_gguf(db_path, "model_restored.gguf")
 ```
 
+```python
+from reminis.merge import merge_models
+from reminis.infer import generate
+
+summary = merge_models(["base.db", "instruct.db"], "soup.db", method="linear")
+print(summary["tensors_merged"], summary["mean_drift"])
+
+result = generate("soup.db", "The capital of France is", max_tokens=32, temperature=0.0)
+print(result["completion"])
+```
+
 ## Supported Formats
 
 ### GGUF
@@ -508,8 +628,10 @@ Note that GGUF and safetensors use different tensor names (`blk.0.attn_q.weight`
 - [x] Many models in one database, derived ones stored as deltas (`reminis registry`)
 - [x] MoE expert routing in the viewer: expert count, router, active-vs-total parameters
 - [x] Attention-free architectures in the viewer (Mamba / state space, RWKV, hybrids)
-- [ ] Model merging via SQL operations
-- [ ] Inference from database-stored weights
+- [x] Model merging via SQL operations (`reminis merge`: linear, slerp, task arithmetic, TIES)
+- [x] Inference from database-stored weights (`reminis run`, verified against transformers)
+- [ ] Running quantized models directly, without an F16 conversion first
+- [ ] Running attention-free architectures (Mamba / state space, RWKV)
 - [ ] Unsloth integration
 
 ## License
