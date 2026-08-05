@@ -934,7 +934,9 @@ Note that GGUF and safetensors use different tensor names (`blk.0.attn_q.weight`
 
 ## Tests
 
-Thirteen suites, 297 explicit checks, run with `python tests/<name>.py`. They need no framework and skip rather than fail when a model or an optional dependency is absent.
+Thirteen suites, 297 explicit checks, run with `uv run python tests/<name>.py`. They need no framework and skip rather than fail when a model or an optional dependency is absent.
+
+The references they check against — transformers for logits, peft for LoRA adapters, torch, and MLX on Apple silicon — are declared as a dev dependency group, so `uv sync` installs them and does not remove them. That is worth stating because getting it wrong is quiet: when those packages went missing, the three suites that compare reminis against a reference implementation degraded to skips and went on reporting PASS.
 
 | Suite | Covers |
 |---|---|

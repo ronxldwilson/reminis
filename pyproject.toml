@@ -24,6 +24,32 @@ dependencies = [
     "zstandard>=0.22.0",
 ]
 
+# Everything the test suite needs and reminis itself does not. None of these
+# are imported at import time -- torch and transformers are reached for
+# inside the functions that need them, and the GPU backends are chosen at
+# runtime from whatever the machine has -- so they stay out of `dependencies`
+# and installing reminis stays a three-package affair.
+#
+# They are declared here rather than left to be installed by hand because
+# `uv sync` removes anything it does not know about. When that happened, the
+# three suites that check reminis against a reference implementation
+# degraded to skips and went on reporting PASS, which is the worst way for a
+# test to fail. `uv sync` and `uv run` install this group by default.
+[dependency-groups]
+dev = [
+    # The references the suites check against: transformers for logits,
+    # peft for LoRA adapters, safetensors for the format, torch underneath.
+    "torch>=2.0.0",
+    "transformers>=4.40.0",
+    "peft>=0.10.0",
+    "safetensors>=0.4.0",
+    # Resident-memory checks; the fallback is coarser but works without it.
+    "psutil>=5.9.0",
+    # The Apple silicon backend. Elsewhere there is nothing to install and
+    # the tests skip the backend comparisons rather than fail them.
+    "mlx>=0.29.0; sys_platform == 'darwin' and platform_machine == 'arm64'",
+]
+
 [project.scripts]
 reminis = "reminis.cli:main"
 
