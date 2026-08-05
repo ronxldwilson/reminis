@@ -284,6 +284,109 @@ def test_provenance():
           str(read_meta(out, "general.name")))
 
 
+def test_chunking_matches_whole_tensor():
+    """Blocked processing must give the answer the whole-tensor code gives.
+
+    Tensors are combined in blocks so that peak memory does not depend on
+    how big the largest tensor is. Two of the four methods need a quantity
+    measured over the entire tensor before any block can be handled -- an
+    angle for slerp, a trim threshold for ties -- and those are the ones a
+    chunking bug would silently corrupt. So the block size is shrunk to a
+    few dozen elements here, forcing many blocks over a tensor small enough
+    that the reference answer can be computed outright.
+    """
+    print("\nChunked merges against whole-tensor merges")
+    from reminis import merge as M
+
+    rng = np.random.default_rng(11)
+    n = 5000
+    base_w = rng.standard_normal(n).astype(np.float32)
+    a_w = (base_w + rng.standard_normal(n) * 0.1).astype(np.float32)
+    b_w = (base_w + rng.standard_normal(n) * 0.1).astype(np.float32)
+
+    a = build_db(TMP_DIR / "ca.db", {"w": ("F32", a_w)})
+    b = build_db(TMP_DIR / "cb.db", {"w": ("F32", b_w)})
+    base = build_db(TMP_DIR / "cbase.db", {"w": ("F32", base_w)})
+    out = str(TMP_DIR / "cout.db")
+
+    original = M.CHUNK_ELEMENTS
+    try:
+        for chunk in (n * 2, 64, 999):
+            M.CHUNK_ELEMENTS = chunk
+            label = "one block" if chunk > n else f"{-(-n // chunk)} blocks"
+
+            M.merge_models([a, b], out, method="linear", verbose=False)
+            close(f"linear, {label}", read_tensor(out, "w"), (a_w + b_w) / 2, tol=1e-6)
+
+            M.merge_models([a, b], out, method="slerp", t=0.3, verbose=False)
+            # The reference is the whole-tensor slerp, with no precomputed
+            # statistics -- the path the chunked version has to reproduce.
+            want = M._slerp(a_w.copy(), b_w.copy(), 0.3)
+            close(f"slerp, {label}", read_tensor(out, "w"), want, tol=1e-5)
+
+            M.merge_models([a, b], out, method="task-arithmetic", base=base,
+                           weights=[0.7, 0.4], scale=0.9, verbose=False)
+            want = base_w + 0.9 * (0.7 * (a_w - base_w) + 0.4 * (b_w - base_w))
+            close(f"task arithmetic, {label}", read_tensor(out, "w"), want, tol=1e-5)
+
+            for density in (0.2, 0.5, 0.83):
+                M.merge_models([a, b], out, method="ties", base=base,
+                               density=density, verbose=False)
+                want = base_w + M._ties([a_w - base_w, b_w - base_w],
+                                        [1.0, 1.0], density)
+                close(f"ties d={density}, {label}", read_tensor(out, "w"), want, tol=1e-5)
+    finally:
+        M.CHUNK_ELEMENTS = original
+
+
+def test_trim_cutoff():
+    """The blocked trim threshold must equal what np.partition returns.
+
+    Trimming keeps the largest fraction of a task vector by magnitude, which
+    is a rank over every entry. Found in passes it is a histogram narrowed
+    until the band around the threshold is small enough to rank exactly, and
+    "exactly" is the claim being checked: an approximate threshold would
+    keep the wrong entries and no test of the merged values would say why.
+    """
+    print("\nTrim threshold found in passes")
+    from reminis import merge as M
+
+    rng = np.random.default_rng(5)
+    cases = [
+        ("gaussian", rng.standard_normal(20000).astype(np.float32)),
+        ("heavy-tailed", (rng.standard_normal(20000) ** 5).astype(np.float32)),
+        # Many entries sharing one magnitude is the case that would overflow
+        # a single collection pass, so the band has to keep narrowing.
+        ("mostly identical", np.r_[np.full(19000, 0.5), rng.standard_normal(1000)
+                                   ].astype(np.float32)),
+        ("all zeros", np.zeros(5000, dtype=np.float32)),
+    ]
+
+    zero = np.zeros_like(cases[0][1])
+    original = M.CHUNK_ELEMENTS
+    try:
+        M.CHUNK_ELEMENTS = 512
+        for label, vec in cases:
+            base = build_db(TMP_DIR / "tb.db", {"w": ("F32", np.zeros(vec.size, np.float32))})
+            model = build_db(TMP_DIR / "tm.db", {"w": ("F32", vec)})
+            conn = sqlite3.connect(str(model))
+            conn.execute("ATTACH DATABASE ? AS m0", (str(Path(model).resolve()),))
+            conn.execute("ATTACH DATABASE ? AS base", (str(Path(base).resolve()),))
+            reader = M._TensorSlicer(conn, "m0", "w")
+            base_reader = M._TensorSlicer(conn, "base", "w")
+            for density in (0.1, 0.25, 0.5, 0.9):
+                got = M._trim_cutoff(reader, base_reader, density, vec.size)
+                k = max(1, int(round(vec.size * density)))
+                want = float(np.partition(np.abs(vec), vec.size - k)[vec.size - k])
+                check(f"{label}, density {density}", got == want,
+                      f"got {got!r}, np.partition says {want!r}")
+            reader.close()
+            base_reader.close()
+            conn.close()
+    finally:
+        M.CHUNK_ELEMENTS = original
+
+
 def test_real_models():
     """Merge two real checkpoints that share an architecture."""
     base_db = MODELS_DIR / "SmolLM-135M.f16.db"
@@ -379,6 +482,8 @@ def main():
         test_structure_mismatch()
         test_mixed_dtypes()
         test_provenance()
+        test_chunking_matches_whole_tensor()
+        test_trim_cutoff()
         test_real_models()
     finally:
         shutil.rmtree(TMP_DIR, ignore_errors=True)

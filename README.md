@@ -203,7 +203,7 @@ Together those took SmolLM-135M from 0.71× llama.cpp's CPU speed to 0.89×. The
 Three ideas that seemed obvious and lost, all measured:
 
 - **Threading the matrix products** made it *slower*. Accelerate already reaches 70 GB/s single-threaded; splitting the work across 8 threads dropped it to 17 GB/s.
-- **Keeping weights in F16** to halve memory traffic was 34× slower. numpy's F16→F32 conversion runs at ~1.2 GB/s, far below the bandwidth it would save.
+- **Keeping weights in F16** to halve memory traffic was 34× slower, and the reason is worth stating plainly, because "why convert at all?" is the obvious question. BLAS provides `sgemm` and `dgemm` — single and double precision — and no half-precision equivalent, so numpy has no BLAS-backed matmul for F16 and falls back to a generic loop. On a 4096×4096 matrix-vector product: **0.92 ms in F32, 48.6 ms in F16**, a 53× penalty for halving the bytes. llama.cpp does not convert because it ships its own F16 SIMD kernels and Metal shaders; numpy has neither, so widening to F32 once at load is the cheaper of the two bad options.
 - **Hand-written bit-twiddling** for that conversion was slower than numpy's, and wrong on subnormals.
 
 The remaining ceiling is DRAM bandwidth on F32 weights, and numpy has no way to read fewer bytes. One database-shaped answer is left on the table: the F16→F32 conversion costs 213 ms of a 274 ms load, so storing the F32 form alongside the F16 — a materialized view of the weights — cuts load time and makes `--stream` about 1.7× faster, for double the disk. That is on the roadmap rather than in the code.
@@ -470,6 +470,27 @@ Because the alignment is declarative, a bad merge fails as a row in a result set
 - **Nothing is written on failure**, and the output may not be one of the inputs.
 
 The result records where it came from — `reminis.merge.method`, `.sources`, `.weights`, `.base` — so a merged file is never anonymous.
+
+### Merging models that do not fit in memory
+
+Tensors are combined in **row-blocks**, so peak memory is set by the block size rather than by the largest tensor in the model. Nothing ever holds a decoded copy of a whole tensor — which matters because a large model's embedding matrix is the single thing that would otherwise decide the ceiling.
+
+Merging a 2.31 GB Llama-3.2-1B, whose embedding matrix alone is 501 MB:
+
+| | Peak memory | Time |
+|---|---|---|
+| Whole tensors at a time | 5,951 MB | 15.1s |
+| Row-blocks, Python 3.10 | 2,162 MB | 13.4s |
+| Row-blocks, Python 3.11+ | **185 MB** | 9.7s |
+
+Python 3.11 added incremental blob I/O, which reads a byte range out of a BLOB without materialising the rest, and writes one back the same way. On 3.11+ nothing model-sized is ever resident, so the peak is flat in model size: merging a 70B checkpoint costs the same 185 MB as merging this 1B one. On 3.10 the blob is fetched whole and sliced, which still avoids decoding it to float32 but keeps the stored bytes around.
+
+(SQLite's own `substr` looks like a third option and is not: it materialises the entire blob to answer each call, so reading a 501 MB tensor in blocks would read it once per block.)
+
+Two of the four methods need a quantity measured over the whole tensor before any block can be combined, and both get their own pass:
+
+- **slerp** needs the angle between the two models, which is two norms and a dot product — the angle between two vectors is not the angle between their first thousand entries.
+- **ties** needs the magnitude threshold that trimming keeps, which is a rank over every entry. Blocked, that is a histogram narrowed until the band containing the threshold is small enough to rank exactly. The result is the number `np.partition` would have returned, not an approximation of it — tested against it directly, including on a vector where 95% of entries share one magnitude.
 
 Verified on two real 135M checkpoints that share an architecture (SmolLM-135M and its instruct fine-tune, 272 tensors, 134.5M parameters, 1.9s). The sharpest check is an identity: `task-arithmetic` at scale 1 against the base must reconstruct the fine-tune, and it reproduces **every one of the 134,515,008 weights**. Four tensors come back with a different bit pattern for the same number, because adding a zero task vector to a `+0.0` base yields `+0.0` where the original stored `-0.0` — which is what floating-point addition does, and worth stating rather than papering over.
 

@@ -13,6 +13,12 @@ buys is that the alignment is declarative and checkable -- a shape mismatch or
 a missing tensor is a row in a result set, not an exception thrown halfway
 through a merge that has already written half a file.
 
+Tensors are processed in row-blocks rather than whole, so peak memory follows
+the block size and not the model. On Python 3.11+, which has incremental blob
+I/O, nothing model-sized is ever resident at all: merging a 70B checkpoint
+costs the same as merging a 1B one, and both run in a couple of hundred
+megabytes.
+
 Four methods are implemented, all elementwise, so none of them needs the
 stored shape:
 
@@ -27,6 +33,7 @@ failure, so quantized inputs are refused rather than approximated.
 """
 
 import json
+import math
 import shutil
 import sqlite3
 import time
@@ -41,6 +48,18 @@ METHODS = ("linear", "slerp", "task-arithmetic", "ties")
 # SQLite's compile-time limit on ATTACH is 10 databases, and the base model
 # for task arithmetic needs one of the slots.
 MAX_INPUTS = 8
+
+# Tensors are combined in blocks of this many elements: 4M floats is 16 MB
+# decoded, small enough that a dozen of them at once is nothing and large
+# enough that the per-block overhead disappears against the arithmetic.
+CHUNK_ELEMENTS = 4 << 20
+
+# Parameters for finding a trim threshold without holding the tensor. The
+# histogram narrows the range that can contain the threshold; the limit is
+# how many values may be collected for an exact ranking at the end.
+TRIM_BINS = 4096
+TRIM_REFINEMENTS = 4
+TRIM_EXACT_LIMIT = 4 << 20
 
 
 def merge_models(
@@ -292,6 +311,205 @@ def _coverage(conn: sqlite3.Connection, plan: dict) -> float:
     return merged / total
 
 
+class _TensorSlicer:
+    """Reads one tensor out of one attached model, a block at a time.
+
+    Python 3.11 gained incremental blob I/O, which reads a byte range out of
+    a BLOB without materialising the rest of it -- exactly what is needed
+    here, and the difference between a bounded merge and one that holds the
+    whole tensor. Older Pythons fall back to fetching the blob once and
+    slicing a memoryview of it, which still avoids decoding the whole thing
+    to float32 but does keep the stored bytes around.
+
+    SQLite's own `substr` is not a third option: it materialises the entire
+    blob to answer each call, so asking for sixty blocks reads a 500 MB
+    tensor sixty times.
+    """
+
+    def __init__(self, conn: sqlite3.Connection, alias: str, name: str):
+        rowid, dtype, n_elements, n_bytes = conn.execute(
+            f"SELECT id, dtype, n_elements, n_bytes FROM {alias}.tensors WHERE name = ?",
+            (name,),
+        ).fetchone()
+        self.dtype = dtype
+        self.n_elements = n_elements
+        self.itemsize = n_bytes // n_elements if n_elements else 1
+        self._handle = None
+        self._view = None
+
+        if hasattr(conn, "blobopen"):
+            try:
+                self._handle = conn.blobopen(
+                    "tensors", "data", rowid, readonly=True, name=alias
+                )
+            except (sqlite3.Error, AttributeError, TypeError):
+                self._handle = None
+        if self._handle is None:
+            blob = conn.execute(
+                f"SELECT data FROM {alias}.tensors WHERE name = ?", (name,)
+            ).fetchone()[0]
+            self._view = memoryview(blob)
+
+    def chunk(self, start: int, count: int) -> np.ndarray:
+        lo, hi = start * self.itemsize, (start + count) * self.itemsize
+        raw = self._handle[lo:hi] if self._handle is not None else self._view[lo:hi]
+        return to_float32(raw, self.dtype)
+
+    def close(self):
+        if self._handle is not None:
+            self._handle.close()
+        self._view = None
+
+
+class _TensorWriter:
+    """Writes a tensor into the output database a block at a time.
+
+    The output starts as a copy of the first model, so the row already holds
+    a blob of exactly the right size and incremental blob I/O can overwrite
+    it in place -- no buffer holding the finished tensor at all. Without it,
+    blocks accumulate in a bytearray and go in with one UPDATE.
+    """
+
+    def __init__(self, conn: sqlite3.Connection, name: str, n_elements: int, dtype: str):
+        self.conn = conn
+        self.name = name
+        self.dtype = dtype
+        row = conn.execute(
+            "SELECT id, n_bytes FROM tensors WHERE name = ?", (name,)
+        ).fetchone()
+        rowid, n_bytes = row
+        self.itemsize = n_bytes // n_elements if n_elements else 1
+        self._handle = None
+        self._buffer = None
+
+        if hasattr(conn, "blobopen"):
+            try:
+                self._handle = conn.blobopen("tensors", "data", rowid, readonly=False)
+            except (sqlite3.Error, AttributeError, TypeError):
+                self._handle = None
+        if self._handle is None:
+            self._buffer = bytearray()
+
+    def write(self, start: int, values: np.ndarray):
+        raw = from_float32(values, self.dtype)
+        if self._handle is not None:
+            offset = start * self.itemsize
+            self._handle[offset:offset + len(raw)] = raw
+        else:
+            self._buffer += raw
+
+    def close(self):
+        if self._handle is not None:
+            self._handle.close()
+            self._handle = None
+        elif self._buffer is not None:
+            self.conn.execute(
+                "UPDATE tensors SET data = ?, n_bytes = ? WHERE name = ?",
+                (bytes(self._buffer), len(self._buffer), self.name),
+            )
+            self._buffer = None
+
+
+def _precompute(method, readers, base_reader, weights, density, n_elements):
+    """Whole-tensor quantities that a single block cannot work out for itself.
+
+    Linear and task arithmetic are purely elementwise and need nothing here.
+    slerp needs the angle between the two models, which is two norms and a
+    dot product. ties needs the magnitude threshold that trimming keeps,
+    which is a rank statistic over every entry of each task vector.
+    """
+    if method == "linear" or method == "task-arithmetic":
+        return None
+
+    if method == "slerp":
+        aa = bb = ab = 0.0
+        for start in range(0, n_elements, CHUNK_ELEMENTS):
+            count = min(CHUNK_ELEMENTS, n_elements - start)
+            a = readers[0].chunk(start, count)
+            b = readers[1].chunk(start, count)
+            aa += float(a @ a)
+            bb += float(b @ b)
+            ab += float(a @ b)
+        return {"na": math.sqrt(aa), "nb": math.sqrt(bb), "dot": ab}
+
+    if method == "ties":
+        return {"cutoffs": [
+            _trim_cutoff(reader, base_reader, density, n_elements)
+            for reader in readers
+        ]}
+
+    raise AssertionError(f"unreachable: {method}")
+
+
+def _trim_cutoff(reader, base_reader, density, n_elements) -> float:
+    """The magnitude at which trimming a task vector cuts, found in passes.
+
+    Trimming keeps the largest `density` fraction of a task vector, which is
+    a rank statistic: with the whole vector in memory it is one call to
+    `np.partition`. Block by block it takes three passes -- the largest
+    magnitude, then a histogram to find which narrow band the threshold
+    falls in, then the values inside that band, which are few enough to sort
+    exactly.
+
+    The result is the same number `np.partition` would return, not an
+    approximation of it, so a chunked ties merge and a whole-tensor one
+    agree exactly. The band is narrowed repeatedly first, because a task
+    vector where a huge number of entries share one magnitude would
+    otherwise put them all in the collection pass at once.
+    """
+    if density >= 1:
+        return float("-inf")
+    k = max(1, int(round(n_elements * density)))
+    if k >= n_elements:
+        return float("-inf")
+
+    def blocks():
+        for start in range(0, n_elements, CHUNK_ELEMENTS):
+            count = min(CHUNK_ELEMENTS, n_elements - start)
+            yield np.abs(reader.chunk(start, count) - base_reader.chunk(start, count))
+
+    hi = 0.0
+    for magnitudes in blocks():
+        hi = max(hi, float(magnitudes.max(initial=0.0)))
+    if hi == 0.0:
+        return 0.0
+
+    lo = 0.0
+    # `above` counts entries already known to sit above the current band, so
+    # the rank being sought inside the band is k - above.
+    above = 0
+    for _ in range(TRIM_REFINEMENTS):
+        counts = np.zeros(TRIM_BINS, dtype=np.int64)
+        for magnitudes in blocks():
+            inside = magnitudes[(magnitudes >= lo) & (magnitudes <= hi)]
+            counts += np.histogram(inside, bins=TRIM_BINS, range=(lo, hi))[0]
+
+        edges = np.linspace(lo, hi, TRIM_BINS + 1)
+        from_top = np.cumsum(counts[::-1])
+        need = k - above
+        crossing = int(np.searchsorted(from_top, need))
+        if crossing >= TRIM_BINS:
+            break
+        bin_index = TRIM_BINS - 1 - crossing
+        settled = int(from_top[crossing - 1]) if crossing > 0 else 0
+        if int(counts[bin_index]) <= TRIM_EXACT_LIMIT:
+            lo, hi, above = float(edges[bin_index]), float(edges[bin_index + 1]), settled
+            break
+        lo, hi, above = float(edges[bin_index]), float(edges[bin_index + 1]), settled
+
+    candidates = []
+    for magnitudes in blocks():
+        candidates.append(magnitudes[(magnitudes >= lo) & (magnitudes <= hi)])
+    band = np.concatenate(candidates) if candidates else np.zeros(0, dtype=np.float32)
+    rank = k - above
+    if rank <= 0:
+        return float(hi)
+    if rank > band.size:
+        return float(lo)
+    # The rank-th largest value inside the band is the threshold itself.
+    return float(np.partition(band, band.size - rank)[band.size - rank])
+
+
 def _blocked_message(plan: dict) -> str:
     quantized = [n for n, why in plan["blocked"] if "quantized" in why]
     shape = [n for n, why in plan["blocked"] if why == "shapes differ"]
@@ -317,7 +535,15 @@ def _blocked_message(plan: dict) -> str:
 def _apply_merge(
     conn, aliases, mergeable, method, weights, use_base, density, t, scale, verbose
 ) -> dict:
-    """Combine each aligned tensor and write it into the output."""
+    """Combine each aligned tensor and write it into the output.
+
+    Every tensor is processed in row-blocks rather than whole, so peak memory
+    is set by the block size instead of by the largest tensor in the model.
+    That is what makes it possible to merge a model far bigger than RAM: a
+    70B checkpoint's embedding matrix alone is a couple of gigabytes, and
+    holding one decoded copy of it per input plus one for the output is the
+    thing that would otherwise decide the memory ceiling.
+    """
     n_params = 0
     mixed_dtype = 0
     drift_sum = 0.0
@@ -329,38 +555,54 @@ def _apply_merge(
         if dtypes_differ:
             mixed_dtype += 1
 
-        arrays = []
-        for i, alias in enumerate(aliases):
-            blob, d = conn.execute(
-                f"SELECT data, dtype FROM {alias}.tensors WHERE name = ?", (name,)
-            ).fetchone()
-            arrays.append(to_float32(blob, d))
+        readers = [_TensorSlicer(conn, alias, name) for alias in aliases]
+        base_reader = _TensorSlicer(conn, "base", name) if use_base else None
+        writer = _TensorWriter(conn, name, n_elements, dtype)
 
-        base_arr = None
-        if use_base:
-            blob, d = conn.execute(
-                "SELECT data, dtype FROM base.tensors WHERE name = ?", (name,)
-            ).fetchone()
-            base_arr = to_float32(blob, d)
+        try:
+            # slerp and ties both need a quantity computed over the whole
+            # tensor before any block can be combined -- an angle for one, a
+            # trim threshold for the other. Those get their own passes.
+            precomputed = _precompute(method, readers, base_reader, weights,
+                                      density, n_elements)
 
-        merged = _combine(method, arrays, weights, base_arr, density, t, scale)
+            delta_sq = 0.0
+            ref_sq = 0.0
+            for start in range(0, n_elements, CHUNK_ELEMENTS):
+                count = min(CHUNK_ELEMENTS, n_elements - start)
+                arrays = [r.chunk(start, count) for r in readers]
+                base_arr = base_reader.chunk(start, count) if base_reader else None
 
-        # Drift is measured against the first model, which is what the output
-        # would have been if the merge had done nothing.
-        delta = merged - arrays[0]
-        ref = float(np.linalg.norm(arrays[0]))
-        if ref > 0:
-            rel = float(np.linalg.norm(delta)) / ref
+                merged = _combine(method, arrays, weights, base_arr,
+                                  density, t, scale, precomputed, start)
+
+                # Drift is measured against the first model, which is what
+                # the output would have been had the merge done nothing.
+                # Summing squares per block gives the same norms the
+                # whole-tensor version computed.
+                # Apple's Accelerate raises the divide-by-zero and overflow
+                # flags during ordinary float32 dot products whose inputs and
+                # results are all finite, so the warnings say nothing here.
+                with np.errstate(all="ignore"):
+                    diff = merged - arrays[0]
+                    delta_sq += float(diff @ diff)
+                    ref_sq += float(arrays[0] @ arrays[0])
+
+                writer.write(start, merged)
+        finally:
+            for r in readers:
+                r.close()
+            if base_reader:
+                base_reader.close()
+            writer.close()
+
+        if ref_sq > 0:
+            rel = math.sqrt(delta_sq) / math.sqrt(ref_sq)
             drift_sum += rel * n_elements
             drift_weight += n_elements
             if rel > max_drift:
                 max_drift, max_drift_name = rel, name
 
-        out = from_float32(merged, dtype)
-        conn.execute(
-            "UPDATE tensors SET data = ?, n_bytes = ? WHERE name = ?",
-            (out, len(out), name),
-        )
         n_params += n_elements
 
         if verbose and (idx + 1) % 50 == 0:
@@ -379,7 +621,14 @@ def _apply_merge(
     }
 
 
-def _combine(method, arrays, weights, base_arr, density, t, scale) -> np.ndarray:
+def _combine(method, arrays, weights, base_arr, density, t, scale,
+             precomputed=None, start=0) -> np.ndarray:
+    """Combine one block of the aligned tensors.
+
+    `precomputed` carries whatever the method needed to know about the whole
+    tensor before any block could be handled; it is None for the methods
+    that are purely elementwise.
+    """
     if method == "linear":
         out = np.zeros_like(arrays[0])
         for w, a in zip(weights, arrays):
@@ -387,7 +636,7 @@ def _combine(method, arrays, weights, base_arr, density, t, scale) -> np.ndarray
         return out
 
     if method == "slerp":
-        return _slerp(arrays[0], arrays[1], t)
+        return _slerp(arrays[0], arrays[1], t, precomputed)
 
     # Both remaining methods work on task vectors rather than the weights.
     taskvecs = [a - base_arr for a in arrays]
@@ -399,12 +648,15 @@ def _combine(method, arrays, weights, base_arr, density, t, scale) -> np.ndarray
         return base_arr + np.float32(scale) * combined
 
     if method == "ties":
-        return base_arr + np.float32(scale) * _ties(taskvecs, weights, density)
+        cutoffs = precomputed["cutoffs"] if precomputed else None
+        return base_arr + np.float32(scale) * _ties(
+            taskvecs, weights, density, cutoffs
+        )
 
     raise AssertionError(f"unreachable: {method}")
 
 
-def _slerp(a: np.ndarray, b: np.ndarray, t: float) -> np.ndarray:
+def _slerp(a: np.ndarray, b: np.ndarray, t: float, stats=None) -> np.ndarray:
     """Spherical interpolation between two flattened weight tensors.
 
     The angle is measured between the normalised vectors but the
@@ -413,14 +665,22 @@ def _slerp(a: np.ndarray, b: np.ndarray, t: float) -> np.ndarray:
     collapses and the formula loses all its precision, so that case falls
     back to a straight linear blend -- which is what slerp converges to
     anyway as the angle goes to zero.
+
+    `stats` holds the two norms and the dot product measured over the whole
+    tensor. They cannot be computed from a single block, since the angle
+    between two vectors is not the angle between their first thousand
+    entries, so a chunked merge works them out in a pass of its own first.
     """
-    na = float(np.linalg.norm(a))
-    nb = float(np.linalg.norm(b))
+    if stats is None:
+        na, nb = float(np.linalg.norm(a)), float(np.linalg.norm(b))
+        dot = float(np.dot(a, b))
+    else:
+        na, nb, dot = stats["na"], stats["nb"], stats["dot"]
+
     if na == 0 or nb == 0:
         return (1 - np.float32(t)) * a + np.float32(t) * b
 
-    cos_omega = float(np.dot(a, b) / (na * nb))
-    cos_omega = max(-1.0, min(1.0, cos_omega))
+    cos_omega = max(-1.0, min(1.0, dot / (na * nb)))
     omega = np.arccos(cos_omega)
     sin_omega = np.sin(omega)
 
@@ -432,7 +692,8 @@ def _slerp(a: np.ndarray, b: np.ndarray, t: float) -> np.ndarray:
     return ka * a + kb * b
 
 
-def _ties(taskvecs: list[np.ndarray], weights: list[float], density: float) -> np.ndarray:
+def _ties(taskvecs: list[np.ndarray], weights: list[float], density: float,
+          cutoffs: list[float] | None = None) -> np.ndarray:
     """TIES: trim each task vector, elect a sign, then average the agreers.
 
     Fine-tunes interfere in two ways -- they disagree about the direction of
@@ -440,18 +701,29 @@ def _ties(taskvecs: list[np.ndarray], weights: list[float], density: float) -> n
     the negligible part; the sign election resolves the disagreements by
     letting total magnitude vote, so a parameter one model nudged and another
     shoved does not average out to nothing.
+
+    Trimming is the one part that is not elementwise: which entries survive
+    depends on how they rank against the whole task vector. `cutoffs` supplies
+    those thresholds when the caller has already measured them across every
+    block; without it, each vector is ranked here, which needs all of it.
     """
     trimmed = []
-    for tv in taskvecs:
+    for i, tv in enumerate(taskvecs):
         if density >= 1:
             trimmed.append(tv)
             continue
-        k = max(1, int(round(tv.size * density)))
-        if k >= tv.size:
+        if cutoffs is not None:
+            cutoff = cutoffs[i]
+        else:
+            k = max(1, int(round(tv.size * density)))
+            if k >= tv.size:
+                trimmed.append(tv)
+                continue
+            # The k largest by magnitude survive; everything else becomes zero.
+            cutoff = np.partition(np.abs(tv), tv.size - k)[tv.size - k]
+        if cutoff == float("-inf"):
             trimmed.append(tv)
             continue
-        # The k largest by magnitude survive; everything else becomes zero.
-        cutoff = np.partition(np.abs(tv), tv.size - k)[tv.size - k]
         trimmed.append(np.where(np.abs(tv) >= cutoff, tv, np.float32(0)))
 
     w = [np.float32(x) for x in weights]
