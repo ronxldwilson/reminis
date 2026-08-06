@@ -361,24 +361,41 @@ class Gemma4(Arch):
             for part in ("ffn_gate_up_exps", "ffn_down_exps")
         )
 
-        rows = []
+        # Which tokens each expert was chosen by. Decoding routes one token
+        # and the grouping is a formality; a prompt routes all of them at
+        # once, and then an expert two tokens share is one matrix multiply
+        # over two rows rather than two over one row each. At 128 tokens
+        # that is the difference between 1,024 multiplies against this
+        # layer's experts and at most 128 of them.
+        groups = {}
         for token in range(n_tokens):
-            row = h[token:token + 1]
-            acc = None
             for slot in range(k):
-                e = int(chosen[token, slot])
-                fused = b.matmul_weight(
-                    row, model.store.expert(p + "ffn_gate_up_exps.weight", e))
-                half = fused.shape[-1] // 2
-                hidden = self._gelu(model, fused[..., :half]) * fused[..., half:]
-                piece = b.matmul_weight(
-                    hidden, model.store.expert(p + "ffn_down_exps.weight", e))
+                groups.setdefault(int(chosen[token, slot]), []).append((token, slot))
+
+        acc = [None] * n_tokens
+        for expert, pairs in groups.items():
+            if len(pairs) == 1:
+                token, slot = pairs[0]
+                rows = h[token:token + 1]
+            else:
+                rows = xp.take(
+                    h, xp.array(np.array([t for t, _ in pairs], dtype=np.int32)),
+                    axis=0)
+
+            fused = b.matmul_weight(
+                rows, model.store.expert(p + "ffn_gate_up_exps.weight", expert))
+            half = fused.shape[-1] // 2
+            hidden = self._gelu(model, fused[..., :half]) * fused[..., half:]
+            out = b.matmul_weight(
+                hidden, model.store.expert(p + "ffn_down_exps.weight", expert))
+
+            for i, (token, slot) in enumerate(pairs):
                 # The routing weight as a slice of the device array, not as
                 # a number this process has looked at.
-                piece = piece * weight[token, slot]
-                acc = piece if acc is None else acc + piece
-            rows.append(acc)
-        return rows[0] if n_tokens == 1 else xp.concatenate(rows, axis=0)
+                piece = out[i:i + 1] * weight[token, slot]
+                acc[token] = piece if acc[token] is None else acc[token] + piece
+
+        return acc[0] if n_tokens == 1 else xp.concatenate(acc, axis=0)
 
     # -- the block -------------------------------------------------------
 
