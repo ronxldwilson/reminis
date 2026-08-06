@@ -44,8 +44,14 @@ def sha256_metadata(gguf_path: str) -> dict[str, str]:
     return hashes
 
 
-def test_model(gguf_path: Path) -> dict:
-    """Run full round-trip test with SHA256 verification on a single model."""
+def check_model(gguf_path: Path) -> dict:
+    """Run full round-trip test with SHA256 verification on a single model.
+
+    Named `check_` rather than `test_` on purpose: it takes a model file
+    and returns a report, so pytest would collect it, find no fixture for
+    `gguf_path`, and report a missing-fixture error that reads like a
+    broken test. `main()` below is what supplies the models.
+    """
     name = gguf_path.stem
     db_path = str(TMP_DIR / f"{name}.db")
     rt_path = str(TMP_DIR / f"{name}.roundtrip.gguf")
@@ -121,7 +127,7 @@ def sha256_safetensors(path: Path) -> dict[str, str]:
     return hashes
 
 
-def test_safetensors_model(path: Path) -> dict:
+def check_safetensors_model(path: Path) -> dict:
     """Round-trip a safetensors model through SQLite and verify every tensor."""
     name = path.name if path.is_dir() else path.stem
     db_path = str(TMP_DIR / f"{name}.st.db")
@@ -263,7 +269,7 @@ def main():
     all_passed = True
 
     for model_path in models:
-        result = test_model(model_path)
+        result = check_model(model_path)
         results.append(result)
 
         status = "PASS" if result["passed"] else "FAIL"
@@ -282,7 +288,7 @@ def main():
                 print(f"  !! {tensor_name}: {error}")
 
     for st_path in st_models:
-        result = test_safetensors_model(st_path)
+        result = check_safetensors_model(st_path)
         results.append(result)
 
         status = "PASS" if result["passed"] else "FAIL"

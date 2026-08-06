@@ -19,6 +19,10 @@ from reminis.merge import _ties, merge_models
 
 MODELS_DIR = Path(__file__).parent.parent / "models"
 TMP_DIR = Path(__file__).parent / "tmp_merge"
+# `main()` creates this, but pytest calls the tests directly and never runs
+# it. The directory is ignored by git, so on a fresh checkout it is simply
+# absent and every test here fails on the first sqlite3.connect.
+TMP_DIR.mkdir(parents=True, exist_ok=True)
 
 FAILURES = []
 
