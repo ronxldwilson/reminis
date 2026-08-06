@@ -339,30 +339,46 @@ class Gemma4(Arch):
         Gemma fuses each expert's gate and up projections into a single
         matrix, so one read yields both halves and they are split after the
         multiply rather than gathered separately.
+
+        Only one thing here is allowed to leave the device: the expert
+        numbers, because a blob cannot be read without them. Everything
+        else -- the routing weights above all -- stays where it is. Pulling
+        each weight across as a Python float cost a device synchronisation
+        per expert per layer, which on this model is 240 of them per token,
+        and the token has nothing else to wait for while they happen.
         """
         b = model.backend
         xp = b.xp
         n_tokens = h.shape[0]
         k = model.cfg.n_experts_used
         chosen = np.asarray(b.to_numpy(idx)).astype(int).reshape(n_tokens, k)
-        w = b.to_numpy(weight).reshape(n_tokens, k)
 
-        out = None
+        # Every read this layer needs is known once the routing is, so ask
+        # for all of them before waiting on the first.
+        model.store.prefetch_experts(
+            (f"{p}{part}.weight", int(e))
+            for e in np.unique(chosen)
+            for part in ("ffn_gate_up_exps", "ffn_down_exps")
+        )
+
+        rows = []
         for token in range(n_tokens):
             row = h[token:token + 1]
             acc = None
             for slot in range(k):
                 e = int(chosen[token, slot])
-                gate_up = model.store.expert(p + "ffn_gate_up_exps.weight", e)
-                fused = b.matmul_weight(row, gate_up)
+                fused = b.matmul_weight(
+                    row, model.store.expert(p + "ffn_gate_up_exps.weight", e))
                 half = fused.shape[-1] // 2
-                gate, up = fused[..., :half], fused[..., half:]
-                hidden = self._gelu(model, gate) * up
-                down = model.store.expert(p + "ffn_down_exps.weight", e)
-                piece = b.matmul_weight(hidden, down) * float(w[token, slot])
+                hidden = self._gelu(model, fused[..., :half]) * fused[..., half:]
+                piece = b.matmul_weight(
+                    hidden, model.store.expert(p + "ffn_down_exps.weight", e))
+                # The routing weight as a slice of the device array, not as
+                # a number this process has looked at.
+                piece = piece * weight[token, slot]
                 acc = piece if acc is None else acc + piece
-            out = acc if out is None else xp.concatenate([out, acc], axis=0)
-        return out
+            rows.append(acc)
+        return rows[0] if n_tokens == 1 else xp.concatenate(rows, axis=0)
 
     # -- the block -------------------------------------------------------
 

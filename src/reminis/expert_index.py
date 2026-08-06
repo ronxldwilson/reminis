@@ -44,6 +44,11 @@ import numpy as np
 EXPERT_TENSORS = (
     "ffn_gate_exps.weight",
     "ffn_up_exps.weight",
+    # Gemma stores the gate and up projections of each expert as one
+    # matrix of twice the width. Leaving it out of this list indexed half
+    # of such a model and left the larger half being decoded per token,
+    # which is the cost the index exists to remove.
+    "ffn_gate_up_exps.weight",
     "ffn_down_exps.weight",
 )
 
