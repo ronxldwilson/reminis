@@ -62,25 +62,20 @@ from reminis.dtypes import (
     is_quantized_dtype,
     to_float32_any,
 )
+from reminis import arch as arch_registry
 from reminis.expert_index import read_layouts as read_expert_layouts
 from reminis.ggml_affine import AFFINE_GROUP, can_repack, nearest_bits
 from reminis.ggml_affine import repack as ggml_repack
 
-# Architectures whose block structure this file actually implements. The
-# value is the rotary layout llama.cpp uses for that architecture, and it is
-# not cosmetic: applying the wrong one produces confident gibberish.
+# Which architectures this can run, and what each does differently, lives
+# in `arch.py`. Adding a model means adding an entry there rather than
+# threading another special case through this file.
 #
+# The rotary layout that comes back with it is not cosmetic:
 #   "norm" rotates adjacent pairs (0,1), (2,3), ...   -- llama, mistral
 #   "neox" rotates halves,  i with i + head_dim/2     -- qwen2
-SUPPORTED_ARCHS = {
-    "gpt-oss": "neox",
-    "llama": "norm",
-    "mistral": "norm",
-    "granite": "norm",
-    "granitemoe": "norm",
-    "qwen2": "neox",
-    "qwen2moe": "neox",
-}
+SUPPORTED_ARCHS = {name: arch_registry.get(name).rope_style
+                   for name in arch_registry.names()}
 
 
 class UnsupportedModel(Exception):
@@ -571,8 +566,19 @@ class Config:
                 f"this model's architecture is '{self.arch or 'unknown'}'.\n"
                 f"Inspect it instead:  reminis view <db>"
             )
-        self.rope_style = SUPPORTED_ARCHS[self.arch]
+        self.spec = arch_registry.get(self.arch)
+        self.rope_style = self.spec.rope_style
         a = self.arch
+
+        # An architecture may record a hyperparameter in a form the parser
+        # below cannot read -- an array where it expects a number. It says
+        # so here, before anything reads the metadata. The substitutions are
+        # for that parser only: `configure` is handed the metadata as it was
+        # actually written, since it is the thing that reads the arrays.
+        raw_meta = meta
+        overrides = self.spec.prepare_meta(meta)
+        if overrides:
+            meta = {**meta, **overrides}
 
         def num(key, default=None):
             value = meta.get(f"{a}.{key}")
@@ -667,6 +673,11 @@ class Config:
 
         # Tied embeddings: many small models have no separate output matrix.
         self.tied_output = not store.has("output.weight")
+
+        # Anything this architecture derives for itself, including fields
+        # the shared parser above has no notion of.
+        self.logit_softcap = 0.0
+        self.spec.configure(self, raw_meta, store)
 
 
 # ---------------------------------------------------------------- tokenizer
@@ -769,11 +780,35 @@ def build_tokenizer(meta: dict):
     if model == "gpt2":
         return BPETokenizer(meta)
     if model in ("llama", "spm"):
+        # SentencePiece proper merges by score. Some conversions keep the
+        # SentencePiece alphabet but carry a merge list instead, and fill
+        # every score with the same placeholder -- which is a merge-ranked
+        # BPE wearing a SentencePiece vocabulary, and has to be encoded as
+        # one. A single distinct score means the scores decide nothing.
+        if _scores_are_inert(meta) and _parse_array(meta, "tokenizer.ggml.merges"):
+            return PieceBPETokenizer(meta)
         return SPMTokenizer(meta)
+    if model in ("gemma4", "gemma3", "gemma2", "gemma"):
+        return PieceBPETokenizer(meta)
     raise UnsupportedModel(
         f"This model's tokenizer is '{model or 'missing'}'. reminis run "
-        f"implements byte-level BPE ('gpt2') and SentencePiece ('llama')."
+        f"implements byte-level BPE ('gpt2'), SentencePiece ('llama') and "
+        f"merge-ranked SentencePiece ('gemma')."
     )
+
+
+def _scores_are_inert(meta: dict) -> bool:
+    """Whether the token scores carry no information.
+
+    A conversion that drops SentencePiece's scores writes the same
+    placeholder for every token. Merging by them would then be merging by
+    nothing, in whatever order the vocabulary happens to be in.
+    """
+    try:
+        scores = _numeric_array(meta, "tokenizer.ggml.scores")
+    except Exception:
+        return False
+    return bool(scores) and len(set(scores)) == 1
 
 
 def _numeric_array(meta: dict, key: str) -> list:
@@ -1064,6 +1099,117 @@ class BPETokenizer:
 
     def decode_one(self, token_id: int) -> str:
         return self.decode([token_id])
+
+
+class PieceBPETokenizer(BPETokenizer):
+    """BPE over a SentencePiece vocabulary, as Gemma's is stored.
+
+    It is BPE -- an ordered merge list decides everything -- but the
+    alphabet is SentencePiece's rather than GPT-2's, and the difference is
+    not cosmetic:
+
+      * a space is the character `▁`, not GPT-2's `Ġ`, and the merges are
+        written in terms of it;
+      * a byte with no piece of its own appears as the literal text
+        `<0xE2>` rather than as a character in a remapped Unicode range.
+
+    So the byte-level mapping the parent class applies is exactly wrong
+    here, and both directions are overridden. What is inherited is the part
+    that is genuinely shared: merge ranks, the merge loop, and the handling
+    of control tokens.
+    """
+
+    SPACE = "▁"
+
+    def __init__(self, meta: dict):
+        super().__init__(meta)
+        # A vocabulary this size is worth one pass to find the byte pieces,
+        # rather than formatting a string per byte on every fallback.
+        self._byte_piece = {}
+        for value in range(256):
+            piece = f"<0x{value:02X}>"
+            if piece in self.ids:
+                self._byte_piece[value] = piece
+        self._piece_byte = {p: v for v, p in self._byte_piece.items()}
+        # SentencePiece models differ on whether an implicit space is added
+        # in front of the text; Gemma's says not to.
+        self.add_space_prefix = str(
+            meta.get("tokenizer.ggml.add_space_prefix", "True")
+        ).lower() == "true"
+
+    def _split(self, text: str) -> list[str]:
+        """Words, each carrying its own leading space.
+
+        Merging the whole text at once would be quadratic in its length and
+        would also let a merge straddle a space that no training example
+        ever presented as one piece. Splitting before each space marker is
+        what SentencePiece itself does.
+        """
+        parts, current = [], ""
+        for char in text:
+            if char == self.SPACE and current:
+                parts.append(current)
+                current = char
+            else:
+                current += char
+        if current:
+            parts.append(current)
+        return parts
+
+    def encode(self, text: str, add_special: bool = True) -> list[int]:
+        ids = []
+        if add_special and self.add_bos and self.bos_id is not None:
+            ids.append(self.bos_id)
+
+        chunks = (
+            self._special_pattern.split(text) if self._special_pattern else [text]
+        )
+        for chunk in chunks:
+            if not chunk:
+                continue
+            if chunk in self.ids and chunk in self.specials:
+                ids.append(self.ids[chunk])
+                continue
+            marked = chunk.replace(" ", self.SPACE)
+            if self.add_space_prefix and not marked.startswith(self.SPACE):
+                marked = self.SPACE + marked
+            for word in self._split(marked):
+                for token in self._bpe(word):
+                    token_id = self.ids.get(token)
+                    if token_id is not None:
+                        ids.append(token_id)
+                        continue
+                    # No piece for this text: spell it out a byte at a
+                    # time, which the vocabulary always has room for.
+                    for value in token.encode("utf-8"):
+                        piece = self._byte_piece.get(value)
+                        if piece is not None:
+                            ids.append(self.ids[piece])
+        return ids
+
+    def decode(self, ids: list[int]) -> str:
+        # Byte pieces have to be gathered into runs before decoding, since a
+        # multi-byte character is spelled as several of them and neither
+        # half is valid UTF-8 alone.
+        out, pending = [], bytearray()
+
+        def flush():
+            if pending:
+                out.append(pending.decode("utf-8", errors="replace"))
+                pending.clear()
+
+        for i in ids:
+            if not 0 <= i < len(self.tokens):
+                continue
+            piece = self.tokens[i]
+            value = self._piece_byte.get(piece)
+            if value is not None:
+                pending.append(value)
+                continue
+            flush()
+            out.append(piece.replace(self.SPACE, " "))
+        flush()
+        return "".join(out)
 
 
 def _parse_array(meta: dict, key: str) -> list:
@@ -1395,6 +1541,12 @@ class Model:
 
     def _block(self, x, layer: int, cache: "KVCache", offset: int):
         cfg = self.cfg
+        # An architecture whose block is a different computation rather than
+        # a variation on this one supplies its own.
+        own = cfg.spec.block(self, x, layer, cache, offset)
+        if own is not None:
+            return own
+
         b = self.backend
         xp = b.xp
         attn_norm, ffn_norm, p = self._layer_weights(layer)
@@ -1655,6 +1807,7 @@ class Model:
                 logits = logits.reshape(-1)
             if self.cfg.logit_scale != 1.0:
                 logits = logits / self.cfg.logit_scale
+            logits = self.cfg.spec.logits(self, logits)
             b.eval(logits)
 
         # Sampling happens in numpy whatever the backend: the vocabulary-sized
