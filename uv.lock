@@ -1179,7 +1179,7 @@ wheels = [
 
 [[package]]
 name = "reminis"
-version = "0.25.0"
+version = "0.26.0"
 source = { editable = "." }
 dependencies = [
     { name = "gguf" },
@@ -1464,7 +1464,7 @@ wheels = [
 
 [[package]]
 name = "zstandard"
-version = "0.25.0"
+version = "0.26.0"
 source = { registry = "https://pypi.org/simple" }
 sdist = { url = "https://files.pythonhosted.org/packages/fd/aa/3e0508d5a5dd96529cdc5a97011299056e14c6505b678fd58938792794b1/zstandard-0.25.0.tar.gz", hash = "sha256:7713e1179d162cf5c7906da876ec2ccb9c3a9dcbdffef0cc7f70c3667a205f0b", size = 711513, upload-time = "2025-09-14T22:15:54.002Z" }
 wheels = [
