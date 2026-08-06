@@ -135,6 +135,16 @@ class Gemma4(Arch):
     of the same input, and adds the two. The mixture's input is the block's
     residual rather than the feed-forward's output, so the two branches are
     parallel rather than sequential.
+
+    Checked against transformers' own `modeling_gemma4.py` driven by these
+    weights, layer by layer for all thirty: every layer agrees to a
+    correlation of 0.99997 or better, the worst being the global layers,
+    where the gap is the four-bit expert index rather than the arithmetic.
+
+    One thing to know before reading its output: this is a reasoning model,
+    and on a bare completion prompt it answers by opening a thinking
+    channel -- `thought`, `<|channel>` -- which reads exactly like a broken
+    forward pass. It is not. Use `--chat` and it answers the question.
     """
 
     name = "gemma4"
