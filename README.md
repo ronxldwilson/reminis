@@ -381,6 +381,39 @@ The cause is the wall reminis met too: `recommendedMaxWorkingSetSize = 12713 MB`
 
 So the claim here is about **fitting, not speed**: on a 16 GB machine, llama.cpp did not run this model in the configurations tried and reminis did. Reading it as "reminis is faster than llama.cpp on gpt-oss" would be wrong twice over, because the 37.3 tok/s is a 3-bit index against llama.cpp's MXFP4 and those are not the same model. Where the two can be compared precision-matched, on Mistral-7B above, llama.cpp is ahead.
 
+### Does it generalize? Gemma 4, and half the multiple
+
+One model is an anecdote. `gemma-4-26B-A4B` is the second, and the index is worth **0.3 → 7.3 tok/s** on it — real, and not the 53× that gpt-oss gave.
+
+Warm page cache, 48 generated tokens, `--pack --chat`:
+
+| | tok/s |
+|---|---|
+| Index covering only `ffn_down_exps` | 0.3 |
+| No expert cache | 4.5 |
+| `--experts 3000` | 6.1 |
+| **`--experts 5500`** | **7.1 – 7.9** |
+| `--experts all` (7,680 experts, 9.52 GB) | 0.9 |
+
+The first row is the bug that made this worth measuring twice. `prepare` looked for expert weights under `ffn_gate_exps` and `ffn_up_exps` — the names a model that stores those separately uses. Gemma fuses them into one matrix of twice the width, `ffn_gate_up_exps`, which matched nothing. So the larger half of every expert was being decoded from Q5_1 on every token while the smaller half was a seek, and the index was doing half its job. That difference is the whole 24×.
+
+The rest of the gap to gpt-oss is shape:
+
+| | gpt-oss-20b | gemma-4-26B-A4B |
+|---|---|---|
+| Routed per token | 4 of 32 | 8 of 128 |
+| Layers | 24 | 30 |
+| Expert fetches per token | 96 | **240** |
+| Expert width | 2880 | **704** |
+| Expert bytes per token | 1269 MB | 758 MB |
+| Whole index at 3 bits | 8.4 GB, **pins** | 9.52 GB, **does not** |
+
+Two and a half times the trips for a third of the arithmetic each. The bandwidth per token is comparable; what differs is that gpt-oss's index stays resident on this machine and Gemma's does not. At 4 bits the full index is 12.13 GB against the same `recommendedMaxWorkingSetSize = 12713 MB`, so it is built at `--bits 3` — the identical wall, met again for the identical reason.
+
+And the last row repeats the finding above: **holding all of it is worse than holding most of it**, because past a point the index and the OS page cache compete for the same 16 GB. On gpt-oss that point was somewhere under 1,400 experts; here it is around 5,500 of 7,680.
+
+Two things about measuring this are worth passing on. Every number here moves by about **2×** with the state of the OS page cache, so comparisons are only worth anything taken warm and back to back — the first set taken in a cold session read low across the board and made a change look effective that was not. And on a bare completion prompt this model answers by opening a thinking channel — `thought`, `<|channel>` — which reads exactly like a broken forward pass. It is a reasoning model. Use `--chat`.
+
 ### Compressing the key/value cache
 
 The weights are a fixed cost; the cache grows with every token. At long context it is the cache, not the model, that decides whether a prompt fits — so `--kv-bits` compresses it.
@@ -894,9 +927,22 @@ Implemented, and enforced rather than assumed:
 - **Attention sinks** — a learned per-head logit that joins the softmax denominator without contributing a value, letting a head attend to nothing in particular.
 - **Sliding-window attention** — layers that see only the most recent N keys, alternating with full-attention layers on whatever pattern the metadata records.
 - **Float weights** — F32, F16, BF16.
-- **Two tokenizer families**, both rebuilt from the database. Byte-level BPE (`gpt2`) matches `transformers` exactly across three vocabularies. SentencePiece (`llama`) matches llama.cpp exactly on 14 strings including special tokens, byte fallback and whitespace edges — it has no merge list at all, merging instead by a score attached to each token, so the vocabulary itself encodes the merge order.
+- **Gemma 4**, which is not a variation on the block above but a different one: head count, head width, rotary base and rotary width all vary per layer; one layer in six attends globally and has no value projection at all, because value *is* key; and a 128-expert mixture runs *beside* the dense feed-forward rather than instead of it, on a separately normalised copy of the same input. Checked layer by layer against transformers' own `modeling_gemma4.py` driven by these weights — all thirty layers agree to a correlation of 0.99997 or better.
+- **Three tokenizer families**, all rebuilt from the database. Byte-level BPE (`gpt2`) matches `transformers` exactly across three vocabularies. SentencePiece (`llama`) matches llama.cpp exactly on 14 strings including special tokens, byte fallback and whitespace edges — it has no merge list at all, merging instead by a score attached to each token, so the vocabulary itself encodes the merge order. And the hybrid Gemma ships: BPE by merge rank over a SentencePiece alphabet, where a space is `▁` and an unmapped byte is the literal text `<0xE2>`. Its scores are all one placeholder, so merging by them would be merging by nothing — which is how it is told apart from real SentencePiece.
 
 Anything else raises. A state-space model is refused by name; a quantized tensor is refused before it can be decoded as though its blocks were floats. A forward pass that guesses produces fluent nonsense, which is worse than an error.
+
+Adding one of these is not an edit to the forward pass. `arch.py` holds what each architecture does *differently*, and an architecture supplies only what it needs:
+
+| | |
+|---|---|
+| `rope_style` | which of the two rotary layouts, and nothing else for the llama family |
+| `prepare_meta` | when the GGUF records a hyperparameter in a form the shared parser cannot read — an array where it expects a number |
+| `configure` | fields it derives for itself |
+| `block` | when the block is genuinely a different computation, rather than the shared one with a flag set |
+| `logits` | what happens after the output projection |
+
+Anything omitted falls back to the shared implementation, so the seven llama-family architectures are three lines each. Gemma 4 was the first model added through it and the first that could not have been added without it.
 
 ## Tracking a training run
 
@@ -1128,6 +1174,9 @@ The checks are written to fail for the right reason. Where a property could pass
 - [x] SentencePiece tokenizers, verified against llama.cpp token for token
 - [x] Key/value cache compression (`--kv-bits`), for when the context is the constraint
 - [x] A materialized index over MoE experts (`reminis prepare`): gpt-oss-20b from 0.71 to 37 tok/s
+- [x] The same index on a second MoE, to see whether it was the technique or the model: gemma-4-26B-A4B from 0.3 to 7.3 tok/s
+- [x] Architectures as a registry (`arch.py`) rather than special cases threaded through the forward pass
+- [x] Gemma 4: per-layer attention geometry, tied key/value on the global layers, a mixture beside the feed-forward
 - [x] Per-tensor history across steps (`reminis blame`)
 - [x] Binary-search for regressions (`reminis bisect`)
 - [x] Unsloth integration (`setup_unsloth` convenience + documentation)
