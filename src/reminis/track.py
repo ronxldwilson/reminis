@@ -393,6 +393,35 @@ class TrainingLog:
             (step, limit),
         ).fetchall()
 
+    def param_history(self, param: str) -> list[tuple]:
+        """Every step that touched a parameter, oldest first.
+
+        Returns [(step, grad_norm, grad_mean, grad_max,
+                  weight_norm_before, weight_norm_after, rolled_back), ...].
+        """
+        return self.conn.execute(
+            "SELECT step, grad_norm, grad_mean, grad_max, "
+            "weight_norm_before, weight_norm_after, rolled_back "
+            "FROM param_updates WHERE param = ? ORDER BY step",
+            (param,),
+        ).fetchall()
+
+    def param_names(self) -> list[str]:
+        """All parameter names that appear in the log."""
+        return [
+            r[0] for r in self.conn.execute(
+                "SELECT DISTINCT param FROM param_updates ORDER BY param"
+            )
+        ]
+
+    def snapshot_steps(self) -> list[int]:
+        """Snapshot steps in ascending order."""
+        return [
+            r[0] for r in self.conn.execute(
+                "SELECT step FROM snapshots ORDER BY step"
+            )
+        ]
+
 
 def state_dict_to_sqlite(state_dict: dict, db_path: str) -> str:
     """Write a model's parameters into a reminis model database.

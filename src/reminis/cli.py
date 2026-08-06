@@ -310,6 +310,40 @@ def main():
         help="Also compress the key/value cache to this many bits",
     )
 
+    # blame: when did a tensor last change?
+    p_blame = sub.add_parser(
+        "blame",
+        help="Show when a tensor was updated and by how much",
+        description="The transpose of `reminis log --step N`: given a tensor, "
+                    "show every step that touched it.",
+    )
+    p_blame.add_argument("log", help="Path to the training log database")
+    p_blame.add_argument(
+        "param", nargs="?",
+        help="Parameter name (or substring). Without it, lists all parameters.",
+    )
+    p_blame.add_argument(
+        "--top", type=int, default=20,
+        help="How many steps to show (default: 20, 0 for all)",
+    )
+
+    # bisect: binary-search for the step that broke something
+    p_bisect = sub.add_parser(
+        "bisect",
+        help="Binary-search a training run for the step that broke something",
+        description="Like git bisect: restore the midpoint snapshot, run a test, "
+                    "exit code decides which half to keep. 0 = good, non-zero = bad, "
+                    "125 = skip.",
+    )
+    p_bisect.add_argument("log", help="Path to the training log database")
+    p_bisect.add_argument("--good", type=int, required=True, help="A known-good snapshot step")
+    p_bisect.add_argument("--bad", type=int, required=True, help="A known-bad snapshot step")
+    p_bisect.add_argument(
+        "--test", required=True, metavar="CMD",
+        help="Shell command to test a restored model. {db} is replaced with the "
+             "path to the restored database. Exit 0 = good, 125 = skip, other = bad.",
+    )
+
     # apply: apply a delta pack to a base model
     p_apply = sub.add_parser("apply", help="Apply a delta pack to a base model")
     p_apply.add_argument("base", help="Path to the base model database")
@@ -453,6 +487,12 @@ def main():
             backend=None if args.backend == "auto" else args.backend,
             kv_bits=args.kv_bits,
         )
+
+    elif args.command == "blame":
+        _show_blame(args.log, args.param, args.top)
+
+    elif args.command == "bisect":
+        _run_bisect(args.log, args.good, args.bad, args.test)
 
     elif args.command == "apply":
         from reminis.diff import apply_delta
@@ -786,3 +826,155 @@ def _show_info(db_path: str):
     print(backend_report())
 
     conn.close()
+
+
+def _show_blame(log_path: str, param: str | None, top: int):
+    """Show every step that touched a parameter."""
+    from reminis.track import TrainingLog
+
+    if not Path(log_path).exists():
+        print(f"Error: {log_path} not found")
+        sys.exit(1)
+
+    log = TrainingLog(log_path)
+    try:
+        if param is None:
+            names = log.param_names()
+            print(f"Parameters in {log_path} ({len(names)}):\n")
+            for name in names:
+                count = log.conn.execute(
+                    "SELECT COUNT(*) FROM param_updates WHERE param = ?", (name,)
+                ).fetchone()[0]
+                print(f"  {name:<60s} {count:>5} steps")
+            return
+
+        names = log.param_names()
+        exact = [n for n in names if n == param]
+        if not exact:
+            matches = [n for n in names if param in n]
+            if not matches:
+                print(f"No parameter matching '{param}'.")
+                print(f"List all with: reminis blame {log_path}")
+                sys.exit(1)
+            if len(matches) > 1:
+                print(f"'{param}' matches {len(matches)} parameters:\n")
+                for m in matches:
+                    print(f"  {m}")
+                print(f"\nNarrow it down or use the full name.")
+                return
+            param = matches[0]
+
+        rows = log.param_history(param)
+        if not rows:
+            print(f"No updates recorded for '{param}'.")
+            sys.exit(1)
+
+        snap_steps = set(log.snapshot_steps())
+
+        print(f"Parameter: {param}")
+        print(f"Updated at {len(rows)} steps\n")
+        print(f"  {'STEP':>6}  {'|grad|':>10}  {'mean':>10}  {'max':>10}  "
+              f"{'|w| before':>10}  {'|w| after':>10}  {'':>4}")
+        print("  " + "-" * 72)
+
+        display = rows if top == 0 else rows[-top:]
+        if top and len(rows) > top:
+            print(f"  ... ({len(rows) - top} earlier steps omitted, use --top 0 for all)")
+
+        for step, gnorm, gmean, gmax, wbefore, wafter, rolled in display:
+            snap = "snap" if step in snap_steps else ""
+            rb = " [rolled back]" if rolled else ""
+            print(
+                f"  {step:>6}  {gnorm:>10.4f}  {gmean:>10.6f}  {gmax:>10.4f}  "
+                f"{wbefore if wbefore else 0:>10.4f}  {wafter if wafter else 0:>10.4f}  "
+                f"{snap}{rb}"
+            )
+
+        biggest = max(rows, key=lambda r: r[1])
+        print(f"\n  Largest gradient at step {biggest[0]} (|grad| = {biggest[1]:.4f})")
+        if snap_steps:
+            print(f"  Snapshots at: {sorted(snap_steps)}")
+    finally:
+        log.close()
+
+
+def _run_bisect(log_path: str, good: int, bad: int, test_cmd: str):
+    """Binary-search through snapshots for the step that broke something."""
+    import shutil
+    import subprocess
+    import tempfile
+
+    from reminis.track import TrainingLog, rollback_to_step
+
+    if not Path(log_path).exists():
+        print(f"Error: {log_path} not found")
+        sys.exit(1)
+
+    log = TrainingLog(log_path)
+    try:
+        all_snaps = log.snapshot_steps()
+        if not all_snaps:
+            print("No snapshots in this log.")
+            sys.exit(1)
+
+        if good not in all_snaps:
+            print(f"No snapshot at step {good}. Available: {all_snaps}")
+            sys.exit(1)
+        if bad not in all_snaps:
+            print(f"No snapshot at step {bad}. Available: {all_snaps}")
+            sys.exit(1)
+
+        lo_good = min(good, bad)
+        hi_bad = max(good, bad)
+        candidates = [s for s in all_snaps if lo_good <= s <= hi_bad]
+
+        if len(candidates) < 2:
+            print(f"Need at least two snapshots between good ({good}) and bad ({bad}).")
+            sys.exit(1)
+
+        print(f"Bisecting between step {lo_good} (good) and step {hi_bad} (bad)")
+        print(f"{len(candidates)} snapshots in range: {candidates}\n")
+
+        lo_idx = 0
+        hi_idx = len(candidates) - 1
+
+        tmpdir = Path(tempfile.mkdtemp(prefix="reminis-bisect-"))
+        try:
+            while hi_idx - lo_idx > 1:
+                mid_idx = (lo_idx + hi_idx) // 2
+                mid_step = candidates[mid_idx]
+                remaining = hi_idx - lo_idx - 1
+                print(f"  Testing step {mid_step} ({remaining} steps left to search)...")
+
+                db_path = str(tmpdir / f"bisect-{mid_step}.db")
+                rollback_to_step(log, mid_step, db_path, verbose=False)
+
+                cmd = test_cmd.replace("{db}", db_path)
+                result = subprocess.run(cmd, shell=True)
+                Path(db_path).unlink(missing_ok=True)
+
+                if result.returncode == 0:
+                    print(f"    step {mid_step}: good")
+                    lo_idx = mid_idx
+                elif result.returncode == 125:
+                    print(f"    step {mid_step}: skip")
+                    candidates.pop(mid_idx)
+                    hi_idx = min(hi_idx, len(candidates) - 1)
+                else:
+                    print(f"    step {mid_step}: bad (exit {result.returncode})")
+                    hi_idx = mid_idx
+
+            first_bad = candidates[hi_idx]
+            last_good = candidates[lo_idx]
+            print(f"\n  First bad snapshot: step {first_bad}")
+            print(f"  Last good snapshot: step {last_good}")
+            if first_bad - last_good > 1:
+                print(f"  (the actual regression is somewhere between "
+                      f"step {last_good} and step {first_bad} -- snapshots "
+                      f"are not per-step, so this is as precise as it gets)")
+            print(f"\n  Inspect the bad step:  reminis log {log_path} --step {first_bad}")
+            print(f"  Restore the good one: reminis rollback {log_path} {last_good} -o restored.db")
+        finally:
+            shutil.rmtree(tmpdir, ignore_errors=True)
+    finally:
+        log.close()

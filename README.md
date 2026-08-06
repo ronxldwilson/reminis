@@ -41,6 +41,8 @@ Where the small-machine story is real is *upstream* of inference: a 70B model ca
 | Keep a base and everything derived from it | `reminis registry` | One file. Bases stored outright, derived models as deltas. |
 | Know what a fine-tune actually changed | `reminis diff` | Per-tensor change counts, L2 norms, max deltas — a report, not a hash mismatch. |
 | Find the step where training went wrong | `reminis log`, `reminis rollback` | Loss spikes and per-parameter gradient norms as SQL, then a hash-verified rewind to a snapshot. |
+| See when a tensor changed | `reminis blame` | Per-parameter history across all steps — the transpose of `log --step`. |
+| Binary-search for a regression | `reminis bisect` | Like `git bisect`: restore midpoint snapshots, run a test, converge on the step that broke it. |
 | Combine two fine-tunes | `reminis merge` | Linear, slerp, task arithmetic, or TIES, with provenance recorded in the result. |
 | Subtract a capability | `reminis merge --scale -1` | The base with a fine-tune's task vector removed. |
 | Understand a model you were handed | `reminis view`, `reminis info` | Architecture diagram, MoE routing, per-tensor statistics, in a browser. |
@@ -103,6 +105,12 @@ reminis run soup.db "The capital of France is"
 # See what a tracked training run did, and rewind to a snapshot
 reminis log run.log.db
 reminis rollback run.log.db 500 -o restored.db
+
+# When did a specific tensor change, and by how much?
+reminis blame run.log.db model.layers.18.mlp.gate_proj.weight
+
+# Binary-search for the step that broke something
+reminis bisect run.log.db --good 0 --bad 5000 --test './eval.sh {db}'
 
 # Convert back to GGUF
 reminis export model.db -o model_restored.gguf
@@ -940,6 +948,41 @@ $ reminis log run.log.db
 
 `reminis log run.log.db --step N` shows per-parameter detail for one step. Snapshots are stored as delta packs against the previous snapshot, and `reminis rollback run.log.db <step> -o restored.db` restores one, verified against the hash recorded during training.
 
+`reminis blame run.log.db <param>` is the transpose of `--step`: given a tensor, show every step that touched it. Without a parameter name it lists everything recorded. This is the question `most_changed_params` answers globally — blame answers it for one tensor across time.
+
+`reminis bisect run.log.db --good 0 --bad 5000 --test './eval.sh {db}'` binary-searches the snapshot chain for the step that broke something, with the same shape as `git bisect`. It restores the midpoint, runs the test (exit 0 = good, non-zero = bad, 125 = skip), and narrows the range. When snapshots are sparse, it says "between step A and step B" rather than implying step-level precision it does not have.
+
+### Unsloth
+
+Unsloth wraps HuggingFace `SFTTrainer`, which is a `Trainer`, so both `TrackedOptimizer` and `make_callback` work. Unsloth uses standard `torch.optim` optimizers and materialises gradients as `param.grad`, which is what `TrackedOptimizer.step()` reads.
+
+```python
+from unsloth import FastLanguageModel
+from reminis.track import TrainingLog
+from reminis.integrations import setup_unsloth
+
+model, tokenizer = FastLanguageModel.from_pretrained(...)
+model = FastLanguageModel.get_peft_model(model, ...)
+
+log = TrainingLog("run.log.db")
+hooks = setup_unsloth(
+    model, log,
+    snapshot_every=100,
+    track_params=lambda n: "lora" in n.lower(),
+)
+
+trainer = SFTTrainer(
+    model=model,
+    ...,
+    optimizers=(hooks["tracked_optimizer"], None) if hooks["tracked_optimizer"] else (None, None),
+    callbacks=[hooks["callback"]],
+)
+trainer.train()
+log.close()
+```
+
+When no optimizer is passed to `setup_unsloth`, let `SFTTrainer` create its own and pass only the callback — you get loss, epoch, and snapshots but not per-parameter gradient statistics. To get gradients, create the optimizer yourself and pass it in.
+
 ### What tracking costs
 
 Measured on SmolLM2-135M (134.5M parameters, fp32, CPU):
@@ -1042,7 +1085,7 @@ The references they check against — transformers for logits, peft for LoRA ada
 | `test_sweep` | Precision sweeps: agreement maths, resident-size prediction, reference choice |
 | `test_quantize` | Q8_0 and Q4_0 block layouts, checked against the gguf package's dequantizer |
 | `test_safetensors`, `test_lora_adapter` | Safetensors both directions, peft agreement |
-| `test_track`, `test_registry` | Training logs, rollback, many models in one file |
+| `test_track`, `test_blame_bisect`, `test_registry` | Training logs, blame, bisect, rollback, many models in one file |
 | `test_viewer` | The architecture diagram, by running the page's own JS under node |
 | `test_merge` | Four merge methods, chunking against whole-tensor results, refusals |
 | `test_infer` | Tokenizers against `transformers` and llama.cpp, logits against torch, KV cache, MoE, quantization |
@@ -1085,9 +1128,11 @@ The checks are written to fail for the right reason. Where a property could pass
 - [x] SentencePiece tokenizers, verified against llama.cpp token for token
 - [x] Key/value cache compression (`--kv-bits`), for when the context is the constraint
 - [x] A materialized index over MoE experts (`reminis prepare`): gpt-oss-20b from 0.71 to 37 tok/s
+- [x] Per-tensor history across steps (`reminis blame`)
+- [x] Binary-search for regressions (`reminis bisect`)
+- [x] Unsloth integration (`setup_unsloth` convenience + documentation)
 - [ ] Faster repacking at load: 83 s for a 7B, all of it numpy
 - [ ] Running attention-free architectures (Mamba / state space, RWKV)
-- [ ] Unsloth integration
 
 ## License
 

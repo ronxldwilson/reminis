@@ -187,3 +187,70 @@ def make_callback(log, snapshot_every: int | None = None, tracked_optimizer=None
             return control
 
     return ReminisCallback()
+
+
+def setup_unsloth(model, log, optimizer=None, snapshot_every=None, every_n_steps=1,
+                  track_params=None, track_weights=True):
+    """Wire reminis tracking into an unsloth training run.
+
+    Unsloth wraps SFTTrainer, which is a HuggingFace Trainer, so the existing
+    TrackedOptimizer and TrainerCallback both work. This function handles the
+    wiring and returns the pieces the caller passes to SFTTrainer.
+
+    Args:
+        model: The model returned by FastLanguageModel.get_peft_model() or
+            similar. Its named_parameters() are used for gradient capture.
+        log: A TrainingLog instance.
+        optimizer: A torch.optim.Optimizer. If None, the caller must let
+            SFTTrainer create its own and pass the returned TrackedOptimizer
+            via the ``optimizers=`` argument.
+        snapshot_every: Take a snapshot every N steps (None disables).
+        every_n_steps: How often to record gradient statistics (default 1).
+        track_params: Optional predicate ``name -> bool`` to limit recording.
+            For a LoRA run, ``lambda n: 'lora' in n.lower()`` keeps the log
+            focused on trainable parameters.
+        track_weights: Also record weight norms (default True).
+
+    Returns:
+        A dict with keys:
+            ``tracked_optimizer``: the TrackedOptimizer wrapping the optimizer,
+                or None if no optimizer was provided.
+            ``callback``: a TrainerCallback to pass to SFTTrainer's
+                ``callbacks=`` list.
+
+    Example::
+
+        from unsloth import FastLanguageModel
+        from reminis.track import TrainingLog
+        from reminis.integrations import setup_unsloth
+
+        model, tokenizer = FastLanguageModel.from_pretrained(...)
+        model = FastLanguageModel.get_peft_model(model, ...)
+
+        log = TrainingLog("run.log.db")
+        hooks = setup_unsloth(model, log, snapshot_every=100,
+                              track_params=lambda n: "lora" in n.lower())
+
+        trainer = SFTTrainer(
+            model=model,
+            ...,
+            optimizers=(hooks["tracked_optimizer"], None) if hooks["tracked_optimizer"] else (None, None),
+            callbacks=[hooks["callback"]],
+        )
+        trainer.train()
+        log.close()
+    """
+    tracked = None
+    if optimizer is not None:
+        tracked = TrackedOptimizer(
+            optimizer, log, list(model.named_parameters()),
+            every_n_steps=every_n_steps,
+            track_params=track_params,
+            track_weights=track_weights,
+        )
+
+    callback = make_callback(
+        log, snapshot_every=snapshot_every, tracked_optimizer=tracked,
+    )
+
+    return {"tracked_optimizer": tracked, "callback": callback}
