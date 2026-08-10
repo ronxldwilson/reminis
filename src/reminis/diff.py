@@ -8,6 +8,7 @@ distributed as a small migration instead of a full model copy.
 import hashlib
 import json
 import sqlite3
+import threading
 import time
 import zlib
 from pathlib import Path
@@ -28,10 +29,20 @@ ZSTD_LEVEL = 1
 
 _compressor = zstandard.ZstdCompressor(level=ZSTD_LEVEL)
 _decompressor = zstandard.ZstdDecompressor()
+_local = threading.local()
 
 
 def _compress(data: bytes) -> bytes:
     return _compressor.compress(data)
+
+
+def _get_decompressor() -> zstandard.ZstdDecompressor:
+    """A per-thread decompressor, since ZstdDecompressor is not thread-safe."""
+    d = getattr(_local, "decompressor", None)
+    if d is None:
+        d = zstandard.ZstdDecompressor()
+        _local.decompressor = d
+    return d
 
 
 def _decompress(data: bytes, encoding: str) -> bytes:
@@ -43,7 +54,7 @@ def _decompress(data: bytes, encoding: str) -> bytes:
     """
     if encoding.endswith("_zlib"):
         return zlib.decompress(data)
-    return _decompressor.decompress(data)
+    return _get_decompressor().decompress(data)
 
 DELTA_SCHEMA = """
 CREATE TABLE IF NOT EXISTS delta_meta (
@@ -260,6 +271,36 @@ def _weights_hash(conn: sqlite3.Connection) -> str:
     return h.hexdigest()
 
 
+def _weights_hash_threaded(db_path: str) -> str:
+    """Hash weight data with I/O on a background thread.
+
+    SHA-256 and SQLite blob reads both release the GIL, so a reader thread
+    keeps blobs ready while the main thread hashes the previous one.
+    """
+    from queue import Queue
+    from threading import Thread
+
+    q = Queue(maxsize=8)
+
+    def _reader():
+        c = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+        for (blob,) in c.execute("SELECT data FROM tensors ORDER BY name"):
+            q.put(blob)
+        c.close()
+        q.put(None)
+
+    t = Thread(target=_reader, daemon=True)
+    t.start()
+    h = hashlib.sha256()
+    while True:
+        blob = q.get()
+        if blob is None:
+            break
+        h.update(blob)
+    t.join()
+    return h.hexdigest()
+
+
 def _tensor_delta_stats(a_blob: bytes, b_blob: bytes, dtype: str):
     """Compute change statistics between two tensors of the same dtype.
 
@@ -346,7 +387,7 @@ def _unframe(payload: bytes, count: int) -> list[bytes]:
         offset += 4
         if offset + size > len(payload):
             raise ValueError("Truncated bit-plane payload")
-        parts.append(_decompressor.decompress(payload[offset:offset + size]))
+        parts.append(_get_decompressor().decompress(payload[offset:offset + size]))
         offset += size
     return parts
 
@@ -799,6 +840,10 @@ def apply_delta(
     Returns:
         Path to the resulting database.
     """
+    import os
+    import shutil
+    from concurrent.futures import ThreadPoolExecutor
+
     base_path, delta_path = Path(base_db), Path(delta_db)
     for p in (base_path, delta_path):
         if not p.exists():
@@ -807,47 +852,75 @@ def apply_delta(
     t0 = time.time()
     Path(output_db).unlink(missing_ok=True)
 
-    # Start from a copy of the base so untouched tensors carry over.
-    import shutil
-    shutil.copyfile(base_path, output_db)
-
-    out_conn = sqlite3.connect(output_db)
     delta_conn = sqlite3.connect(str(delta_path))
-
     meta = dict(delta_conn.execute("SELECT key, value FROM delta_meta"))
 
+    # Phase 1: copy the base file and hash it in parallel.
+    # Both operations read the same source and both release the GIL, so
+    # they overlap almost completely on an SSD.
     if verify:
-        actual = _weights_hash(out_conn)
-        expected = meta.get("base_weights_hash")
-        if expected and actual != expected:
-            out_conn.close()
+        expected_base = meta.get("base_weights_hash")
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            hash_future = pool.submit(_weights_hash_threaded, str(base_path))
+            copy_future = pool.submit(shutil.copyfile, base_path, output_db)
+            copy_future.result()
+            actual = hash_future.result()
+        if expected_base and actual != expected_base:
             delta_conn.close()
             Path(output_db).unlink(missing_ok=True)
             raise ValueError(
                 "Base model does not match the one this delta pack was built from.\n"
-                f"  expected weights hash: {expected[:16]}...\n"
+                f"  expected weights hash: {expected_base[:16]}...\n"
                 f"  actual weights hash:   {actual[:16]}...\n"
                 "Applying it would produce a corrupt model."
             )
         if verbose:
             print(f"Base verified against pack ({meta.get('base_file', 'unknown')})")
+    else:
+        shutil.copyfile(base_path, output_db)
+
+    out_conn = sqlite3.connect(output_db)
 
     # Drop tensors the target no longer has.
     removed = json.loads(meta.get("tensors_removed", "[]"))
     for name in removed:
         out_conn.execute("DELETE FROM tensors WHERE name = ?", (name,))
 
-    applied = 0
     rows = delta_conn.execute(
         "SELECT tensor_name, shape, dtype, dtype_id, n_elements, encoding, data FROM deltas"
     ).fetchall()
+    delta_conn.close()
 
-    for name, shape, dtype, dtype_id, n_elements, encoding, payload in rows:
-        existing = out_conn.execute(
+    # Phase 2: decode deltas in parallel, write sequentially.
+    # Decompression (zstd) and XOR (numpy) both release the GIL, so worker
+    # threads get real parallelism. Read base blobs from the original file
+    # to avoid contention with the output connection.
+    base_conn = sqlite3.connect(f"file:{base_db}?mode=ro", uri=True)
+    base_blobs = {}
+    for name, _shape, _dtype, _dtype_id, _n_elements, encoding, _payload in rows:
+        if encoding.startswith("replace"):
+            continue
+        existing = base_conn.execute(
             "SELECT data FROM tensors WHERE name = ?", (name,)
         ).fetchone()
-        new_blob = _decode_tensor(encoding, payload, existing[0] if existing else None, dtype, name)
+        base_blobs[name] = existing[0] if existing else None
+    base_conn.close()
 
+    def _decode_one(args):
+        name, encoding, payload, dtype = args
+        return _decode_tensor(encoding, payload, base_blobs.get(name), dtype, name)
+
+    work = [
+        (name, encoding, payload, dtype)
+        for name, _shape, dtype, _dtype_id, _n_elements, encoding, payload in rows
+    ]
+    workers = min(os.cpu_count() or 4, len(work), 8)
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        decoded = list(pool.map(_decode_one, work))
+    base_blobs.clear()
+
+    for i, (name, shape, dtype, dtype_id, n_elements, _encoding, _payload) in enumerate(rows):
+        new_blob = decoded[i]
         out_conn.execute(
             "INSERT INTO tensors (name, shape, dtype, dtype_id, n_elements, n_bytes, data) "
             "VALUES (?,?,?,?,?,?,?) "
@@ -856,20 +929,17 @@ def apply_delta(
             "n_bytes=excluded.n_bytes, data=excluded.data",
             (name, shape, dtype, dtype_id, n_elements, len(new_blob), new_blob),
         )
-        applied += 1
+    del decoded
 
     out_conn.commit()
-    delta_conn.close()
 
     is_lossy = meta.get("lossy") == "true"
 
+    # Phase 3: verify the result with pipelined hashing.
     if verify:
-        # For a lossless pack this is the target hash. For a lossy one it is
-        # the hash of what the pack deterministically reconstructs, so the
-        # apply step stays exactly verifiable either way.
         expected = meta.get("reconstructed_weights_hash") or meta.get("target_weights_hash")
         if expected:
-            actual = _weights_hash(out_conn)
+            actual = _weights_hash_threaded(output_db)
             if actual != expected:
                 out_conn.close()
                 raise ValueError(
@@ -887,7 +957,7 @@ def apply_delta(
     out_conn.close()
 
     if verbose:
-        print(f"Applied {applied} tensor updates -> {output_db}")
+        print(f"Applied {len(rows)} tensor updates -> {output_db}")
         if is_lossy:
             err = float(meta.get("max_rel_error", "0"))
             print(

@@ -1,0 +1,474 @@
+"""Pre-release gate: fast tests that must pass before any version ships.
+
+Runs in under two minutes against SmolLM-135M.f16 (258 MB). Covers every
+subsystem that has been burned by a release: conversion, diff, apply,
+quantize, merge, registry, viewer, and the bit-plane encoding.
+
+    uv run python tests/test_prerelease.py
+
+The full test suite (`tests/test_roundtrip.py`, `test_infer.py`, etc.)
+round-trips every model in `models/` and trains real networks; that is a
+thorough check but takes hours. This script is the fast alternative that
+catches the common regressions.
+"""
+
+import json
+import shutil
+import sqlite3
+import sys
+import tempfile
+from pathlib import Path
+
+import numpy as np
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
+
+MODELS = Path(__file__).resolve().parents[1] / "models"
+SMALL_DB = MODELS / "SmolLM-135M.f16.db"
+SMALL_GGUF = MODELS / "SmolLM-135M.f16.gguf"
+
+passed = 0
+failed = 0
+skipped = 0
+
+
+def section(title):
+    print(f"\n{'=' * 70}\n{title}\n{'=' * 70}")
+
+
+def ok(label):
+    global passed
+    passed += 1
+    print(f"  ok: {label}")
+
+
+def fail(label):
+    global failed
+    failed += 1
+    print(f"  FAIL: {label}")
+
+
+def skip(label):
+    global skipped
+    skipped += 1
+    print(f"  skip: {label}")
+
+
+def check(condition, label):
+    if condition:
+        ok(label)
+    else:
+        fail(label)
+
+
+# ── 1. Bit-plane encoding (no model needed) ─────────────────────────────
+
+def test_bitplane():
+    section("Bit-plane encoding")
+    from reminis.diff import (
+        _decode_bitplane, _decode_tensor, _encode_bitplane, _encode_delta,
+        _merge_planes, _split_planes,
+    )
+
+    rng = np.random.default_rng(0)
+    for width in (2, 4):
+        data = rng.integers(0, 256, size=500 * width, dtype=np.uint8).tobytes()
+        planes = _split_planes(data, width)
+        check(_merge_planes(planes, width) == data,
+              f"split/merge round-trip at width {width}")
+
+    for dtype in ("F16", "BF16"):
+        delta = rng.integers(0, 256, size=4096, dtype=np.uint8)
+        payload = _encode_bitplane(delta, dtype)
+        check(payload is not None, f"{dtype} encoder produces output")
+        back = _decode_bitplane(payload, dtype, "t")
+        check(back == delta.tobytes(), f"{dtype} encode/decode round-trip")
+
+    check(_encode_bitplane(rng.integers(0, 256, 1024, dtype=np.uint8), "F32") is None,
+          "F32 is declined")
+    check(_encode_bitplane(rng.integers(0, 256, 1024, dtype=np.uint8), "Q4_K") is None,
+          "quantized dtype is declined")
+
+
+# ── 2. Quantizer block layout (no model needed) ─────────────────────────
+
+def test_quantize_blocks():
+    section("Quantizer block layout")
+    from reminis.quantize import BLOCK, FORMATS, quantize_q4_0, quantize_q8_0
+
+    rng = np.random.default_rng(1)
+    x = rng.normal(size=BLOCK * 100).astype(np.float32)
+
+    check(len(quantize_q8_0(x)) == 100 * FORMATS["Q8_0"][0],
+          "Q8_0 block size correct")
+    check(len(quantize_q4_0(x)) == 100 * FORMATS["Q4_0"][0],
+          "Q4_0 block size correct")
+
+    from gguf.constants import GGMLQuantizationType
+    from gguf.quants import dequantize
+
+    for fmt, fn in (("Q8_0", quantize_q8_0), ("Q4_0", quantize_q4_0)):
+        blob = fn(x)
+        t = getattr(GGMLQuantizationType, fmt)
+        back = dequantize(np.frombuffer(blob, dtype=np.uint8), t).astype(np.float32).reshape(-1)
+        check(np.isfinite(back).all(), f"{fmt} all finite")
+        check(len(back) == len(x), f"{fmt} length preserved")
+
+    zeros = np.zeros(BLOCK * 4, dtype=np.float32)
+    for fmt, fn in (("Q8_0", quantize_q8_0), ("Q4_0", quantize_q4_0)):
+        t = getattr(GGMLQuantizationType, fmt)
+        back = dequantize(np.frombuffer(fn(zeros), dtype=np.uint8), t).astype(np.float32).reshape(-1)
+        check(np.all(back == 0), f"{fmt} zero block stays zero")
+
+
+# ── 3. Viewer (no model needed) ─────────────────────────────────────────
+
+def test_viewer():
+    section("Viewer")
+    from reminis.converter import SCHEMA
+
+    with tempfile.TemporaryDirectory() as tmp:
+        db = str(Path(tmp) / "m.db")
+        conn = sqlite3.connect(db)
+        conn.executescript(SCHEMA)
+        conn.execute(
+            "INSERT INTO model_meta (key, value, type) VALUES (?, ?, ?)",
+            ("general.architecture", "llama", "string"),
+        )
+        data = np.zeros(128, dtype=np.float16).tobytes()
+        conn.execute(
+            "INSERT INTO tensors (name, shape, dtype, dtype_id, n_elements, n_bytes, data) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            ("test.weight", "[128]", "F16", 1, 128, len(data), data),
+        )
+        conn.commit()
+        conn.close()
+
+        from reminis.viewer import generate_viewer
+        html = generate_viewer(db, str(Path(tmp) / "out.html"))
+        check(Path(html).exists(), "viewer generates HTML")
+        check(Path(html).stat().st_size > 1000, "HTML is non-trivial")
+
+
+# ── 4. GGUF round-trip (needs SmolLM GGUF) ──────────────────────────────
+
+def test_gguf_roundtrip():
+    section("GGUF round-trip")
+    if not SMALL_GGUF.exists():
+        skip(f"{SMALL_GGUF.name} not present")
+        return
+
+    from reminis.converter import gguf_to_sqlite, sqlite_to_gguf
+    import hashlib
+    from gguf.gguf_reader import GGUFReader
+
+    def tensor_hashes(path):
+        reader = GGUFReader(str(path), mode="r")
+        return {t.name: hashlib.sha256(t.data.tobytes()).hexdigest()
+                for t in reader.tensors}
+
+    with tempfile.TemporaryDirectory() as tmp:
+        db = str(Path(tmp) / "m.db")
+        rt = str(Path(tmp) / "m.gguf")
+
+        orig = tensor_hashes(SMALL_GGUF)
+        gguf_to_sqlite(str(SMALL_GGUF), db, verbose=False)
+        sqlite_to_gguf(db, rt, verbose=False)
+        back = tensor_hashes(Path(rt))
+
+        mismatches = [n for n in orig if orig.get(n) != back.get(n)]
+        check(len(mismatches) == 0,
+              f"lossless round-trip ({len(orig)} tensors, 0 mismatches)")
+
+
+# ── 5. Diff + apply (needs SmolLM DB) ───────────────────────────────────
+
+def test_diff_apply():
+    section("Diff and apply")
+    if not SMALL_DB.exists():
+        skip(f"{SMALL_DB.name} not present")
+        return
+
+    from reminis.diff import _weights_hash, apply_delta, diff_models
+
+    with tempfile.TemporaryDirectory() as tmp:
+        target = str(Path(tmp) / "target.db")
+        delta = str(Path(tmp) / "delta.db")
+        result = str(Path(tmp) / "result.db")
+
+        shutil.copyfile(SMALL_DB, target)
+
+        conn = sqlite3.connect(target)
+        touched = [r[0] for r in conn.execute(
+            "SELECT name FROM tensors WHERE dtype IN ('F16','F32') LIMIT 3"
+        ).fetchall()]
+        rng = np.random.default_rng(0)
+        for name in touched:
+            row = conn.execute("SELECT dtype, data FROM tensors WHERE name = ?", (name,)).fetchone()
+            dtype, blob = row
+            np_dtype = np.float32 if dtype == "F32" else np.float16
+            arr = np.frombuffer(blob, dtype=np_dtype).astype(np.float32)
+            noise = rng.normal(0, 0.01, size=arr.shape).astype(np.float32)
+            new = (arr + noise).astype(np_dtype)
+            conn.execute("UPDATE tensors SET data = ? WHERE name = ?", (new.tobytes(), name))
+        conn.commit()
+        conn.close()
+
+        summary = diff_models(str(SMALL_DB), target, delta, verbose=False)
+        check(summary["changed"] == len(touched),
+              f"diff detected {len(touched)} changed tensors")
+
+        apply_delta(str(SMALL_DB), delta, result, verify=True, verbose=False)
+
+        conn_t = sqlite3.connect(target)
+        conn_r = sqlite3.connect(result)
+        check(_weights_hash(conn_t) == _weights_hash(conn_r),
+              "apply produces byte-identical result")
+        conn_t.close()
+        conn_r.close()
+
+    # Wrong base is rejected
+    with tempfile.TemporaryDirectory() as tmp:
+        target = str(Path(tmp) / "target.db")
+        delta = str(Path(tmp) / "delta.db")
+        wrong = str(Path(tmp) / "wrong.db")
+
+        shutil.copyfile(SMALL_DB, target)
+        conn = sqlite3.connect(target)
+        name = conn.execute("SELECT name FROM tensors WHERE dtype='F16' LIMIT 1").fetchone()[0]
+        row = conn.execute("SELECT data FROM tensors WHERE name = ?", (name,)).fetchone()
+        arr = np.frombuffer(row[0], dtype=np.float16).copy()
+        arr[0] += 1.0
+        conn.execute("UPDATE tensors SET data = ? WHERE name = ?", (arr.tobytes(), name))
+        conn.commit()
+        conn.close()
+
+        diff_models(str(SMALL_DB), target, delta, verbose=False)
+
+        shutil.copyfile(SMALL_DB, wrong)
+        conn = sqlite3.connect(wrong)
+        conn.execute("UPDATE tensors SET data = ? WHERE name = ?",
+                     (np.zeros_like(arr).tobytes(), name))
+        conn.commit()
+        conn.close()
+
+        try:
+            apply_delta(wrong, delta, str(Path(tmp) / "bad.db"), verify=True, verbose=False)
+            fail("mismatched base was accepted")
+        except ValueError as e:
+            check("does not match" in str(e), "mismatched base rejected")
+
+
+# ── 6. Quantize model (needs SmolLM DB) ─────────────────────────────────
+
+def test_quantize_model():
+    section("Quantize model")
+    if not SMALL_DB.exists():
+        skip(f"{SMALL_DB.name} not present")
+        return
+
+    from reminis.quantize import quantize_model
+
+    with tempfile.TemporaryDirectory() as tmp:
+        for bits in (8, 4):
+            out = str(Path(tmp) / f"q{bits}.db")
+            stats = quantize_model(str(SMALL_DB), out, bits=bits, verbose=False)
+            check(stats["quantized"] > 0, f"Q{bits}: tensors were quantized")
+            check(stats["copied"] > 0, f"Q{bits}: norms copied through")
+
+            a = sqlite3.connect(str(SMALL_DB))
+            b = sqlite3.connect(out)
+            n_a = a.execute("SELECT COUNT(*) FROM tensors").fetchone()[0]
+            n_b = b.execute("SELECT COUNT(*) FROM tensors").fetchone()[0]
+            check(n_a == n_b, f"Q{bits}: all tensors present")
+            a.close()
+            b.close()
+
+
+# ── 7. Merge (needs SmolLM DB) ───────────────────────────────────────────
+
+def test_merge():
+    section("Merge")
+    if not SMALL_DB.exists():
+        skip(f"{SMALL_DB.name} not present")
+        return
+
+    from reminis.merge import merge_models
+
+    with tempfile.TemporaryDirectory() as tmp:
+        out = str(Path(tmp) / "merged.db")
+        merge_models([str(SMALL_DB), str(SMALL_DB)], out,
+                     method="linear", verbose=False)
+
+        a = sqlite3.connect(str(SMALL_DB))
+        b = sqlite3.connect(out)
+        n_a = a.execute("SELECT COUNT(*) FROM tensors").fetchone()[0]
+        n_b = b.execute("SELECT COUNT(*) FROM tensors").fetchone()[0]
+        check(n_a == n_b, "linear merge preserves tensor count")
+        a.close()
+        b.close()
+
+
+# ── 8. Registry (needs SmolLM DB) ────────────────────────────────────────
+
+def test_registry():
+    section("Registry")
+    if not SMALL_DB.exists():
+        skip(f"{SMALL_DB.name} not present")
+        return
+
+    from reminis.registry import Registry
+
+    with tempfile.TemporaryDirectory() as tmp:
+        reg_path = str(Path(tmp) / "reg.db")
+        reg = Registry(reg_path, create=True)
+        reg.add_base(str(SMALL_DB), "base", verbose=False)
+        models = reg.list_models()
+        check(len(models) == 1, "registry holds the added model")
+        check(models[0]["name"] == "base", "model name is correct")
+
+        out = str(Path(tmp) / "exported.db")
+        reg.materialize("base", out, verbose=False)
+        a = sqlite3.connect(str(SMALL_DB))
+        b = sqlite3.connect(out)
+        n_a = a.execute("SELECT COUNT(*) FROM tensors").fetchone()[0]
+        n_b = b.execute("SELECT COUNT(*) FROM tensors").fetchone()[0]
+        check(n_a == n_b, "materialized export has all tensors")
+        a.close()
+        b.close()
+
+        reg.remove("base")
+        check(len(reg.list_models()) == 0, "model removed")
+        reg.close()
+
+
+# ── 9. Lossy (low-rank) delta (needs SmolLM DB) ─────────────────────────
+
+def test_lowrank():
+    section("Lossy (low-rank) delta")
+    if not SMALL_DB.exists():
+        skip(f"{SMALL_DB.name} not present")
+        return
+
+    from reminis.diff import apply_delta, diff_models
+
+    with tempfile.TemporaryDirectory() as tmp:
+        target = str(Path(tmp) / "target.db")
+        delta = str(Path(tmp) / "delta.db")
+        result = str(Path(tmp) / "result.db")
+
+        shutil.copyfile(SMALL_DB, target)
+
+        conn = sqlite3.connect(target)
+        row = conn.execute(
+            "SELECT name, shape, dtype, data FROM tensors "
+            "WHERE dtype IN ('F16','F32') AND shape LIKE '[%,%' LIMIT 1"
+        ).fetchone()
+        if row is None:
+            skip("no 2D float tensor for low-rank test")
+            conn.close()
+            return
+
+        name, shape_json, dtype, blob = row
+        np_dtype = np.float32 if dtype == "F32" else np.float16
+        shape = json.loads(shape_json)
+        arr = np.frombuffer(blob, dtype=np_dtype).astype(np.float32)
+        m, n = shape[1], shape[0]
+
+        rng = np.random.default_rng(7)
+        u = rng.normal(0, 0.01, (m, 2)).astype(np.float32)
+        v = rng.normal(0, 0.01, (2, n)).astype(np.float32)
+        perturbed = (arr.reshape(m, n) + u @ v).astype(np_dtype)
+        conn.execute("UPDATE tensors SET data = ? WHERE name = ?",
+                     (perturbed.tobytes(), name))
+        conn.commit()
+        conn.close()
+
+        summary = diff_models(str(SMALL_DB), target, delta,
+                              lossy_tolerance=0.01, verbose=False)
+        check(summary["lossy"], "low-rank encoding was used")
+
+        apply_delta(str(SMALL_DB), delta, result, verify=True, verbose=False)
+        ok("lossy apply + verify succeeded")
+
+
+# ── 10. Inference (needs SmolLM DB) ──────────────────────────────────────
+
+def test_inference():
+    section("Inference")
+    if not SMALL_DB.exists():
+        skip(f"{SMALL_DB.name} not present")
+        return
+
+    from reminis.infer import generate
+
+    result = generate(str(SMALL_DB), "The capital of France is",
+                      max_tokens=8, temperature=0.0, verbose=False)
+    text = result.get("completion", "")
+    check(len(text.strip()) > 0, "model generates text")
+    check(all(ord(c) < 0x3000 for c in text),
+          "output is not mojibake (block layout OK)")
+
+
+# ── 11. Threaded weights hash consistency ────────────────────────────────
+
+def test_threaded_hash():
+    section("Threaded weights hash")
+    if not SMALL_DB.exists():
+        skip(f"{SMALL_DB.name} not present")
+        return
+
+    from reminis.diff import _weights_hash, _weights_hash_threaded
+
+    conn = sqlite3.connect(str(SMALL_DB))
+    h_seq = _weights_hash(conn)
+    conn.close()
+
+    h_threaded = _weights_hash_threaded(str(SMALL_DB))
+    check(h_seq == h_threaded, "threaded hash matches sequential hash")
+
+
+# ── runner ────────────────────────────────────────────────────────────────
+
+ALL_TESTS = [
+    test_bitplane,
+    test_quantize_blocks,
+    test_viewer,
+    test_gguf_roundtrip,
+    test_diff_apply,
+    test_quantize_model,
+    test_merge,
+    test_registry,
+    test_lowrank,
+    test_inference,
+    test_threaded_hash,
+]
+
+
+def main():
+    import time
+    t0 = time.perf_counter()
+
+    print("reminis pre-release test suite")
+    print(f"model: {SMALL_DB.name} ({'present' if SMALL_DB.exists() else 'MISSING'})")
+
+    for test in ALL_TESTS:
+        try:
+            test()
+        except Exception as exc:
+            fail(f"{test.__name__} raised: {exc}")
+
+    elapsed = time.perf_counter() - t0
+    print(f"\n{'=' * 70}")
+    print(f"  {passed} passed, {failed} failed, {skipped} skipped  ({elapsed:.1f}s)")
+    print(f"{'=' * 70}")
+
+    if failed:
+        print("\nPRE-RELEASE CHECK FAILED")
+        sys.exit(1)
+    else:
+        print("\nPRE-RELEASE CHECK PASSED")
+
+
+if __name__ == "__main__":
+    main()
