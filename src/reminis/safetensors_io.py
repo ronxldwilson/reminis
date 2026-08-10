@@ -151,13 +151,13 @@ def safetensors_to_sqlite(
     if verbose:
         print(f"Reading {src} ({len(shards)} shard{'s' if len(shards) != 1 else ''}) ...")
 
+    from reminis.converter import open_for_bulk_write
+
     t0 = time.time()
     Path(db_path).unlink(missing_ok=True)
-    conn = sqlite3.connect(db_path)
-    conn.execute("PRAGMA journal_mode=WAL")
-    conn.execute("PRAGMA synchronous=NORMAL")
-    conn.execute("PRAGMA cache_size=-64000")
+    conn = open_for_bulk_write(db_path)
     conn.executescript(SCHEMA)
+    conn.execute("BEGIN")
 
     meta_rows = [
         ("reminis.source_format", "safetensors", "string"),
@@ -249,13 +249,12 @@ def safetensors_to_sqlite(
                         f"{dtype:6s} {shown:8.1f} {unit}"
                     )
 
-    for key, value, type_name in meta_rows:
-        conn.execute(
-            "INSERT OR REPLACE INTO model_meta (key, value, type) VALUES (?, ?, ?)",
-            (key, value, type_name),
-        )
+    conn.executemany(
+        "INSERT OR REPLACE INTO model_meta (key, value, type) VALUES (?, ?, ?)",
+        meta_rows,
+    )
 
-    conn.commit()
+    conn.execute("COMMIT")
     conn.close()
 
     elapsed = time.time() - t0

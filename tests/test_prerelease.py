@@ -412,6 +412,95 @@ def test_inference():
 
 # ── 11. Threaded weights hash consistency ────────────────────────────────
 
+def test_gguf_fast_parser():
+    """The fast header parser must agree with the reference reader exactly."""
+    section("Fast GGUF header parser")
+    if not SMALL_GGUF.exists():
+        skip(f"{SMALL_GGUF.name} not present")
+        return
+
+    import mmap
+
+    from gguf.constants import GGUFValueType
+    from gguf.gguf_reader import GGUFReader
+
+    from reminis.converter import (
+        META_TYPE_MAP, _extract_field_value, _parse_gguf_header,
+    )
+
+    reader = GGUFReader(str(SMALL_GGUF), mode="r")
+    ref_meta = {}
+    for key, field in reader.fields.items():
+        main = field.types[0] if field.types else GGUFValueType.STRING
+        ref_meta[key] = (str(_extract_field_value(field)),
+                         META_TYPE_MAP.get(main, "unknown"))
+    ref_tensors = {
+        t.name: ([int(x) for x in t.shape], t.tensor_type.name,
+                 int(t.tensor_type), int(t.n_elements), int(t.n_bytes),
+                 int(t.data_offset))
+        for t in reader.tensors
+    }
+
+    with open(SMALL_GGUF, "rb") as fh:
+        with mmap.mmap(fh.fileno(), 0, access=mmap.ACCESS_READ) as buf:
+            meta, tensors, data_offset = _parse_gguf_header(buf)
+
+    fast_meta = {k: (v, t) for k, v, t in meta}
+    fast_tensors = {
+        t["name"]: (t["shape"], t["dtype"], t["dtype_id"], t["n_elements"],
+                    t["n_bytes"], data_offset + t["rel_offset"])
+        for t in tensors
+    }
+
+    check(ref_meta == fast_meta,
+          f"metadata matches the reference reader ({len(ref_meta)} fields)")
+    check(ref_tensors == fast_tensors,
+          f"tensor records match the reference reader ({len(ref_tensors)} tensors)")
+
+
+def test_convert_fallback():
+    """A file the fast parser declines still converts, and to the same bytes."""
+    section("Conversion fallback")
+    if not SMALL_GGUF.exists():
+        skip(f"{SMALL_GGUF.name} not present")
+        return
+
+    import hashlib
+
+    import reminis.converter as converter
+
+    def snapshot(db):
+        c = sqlite3.connect(db)
+        meta = dict((k, (v, t)) for k, v, t
+                    in c.execute("SELECT key, value, type FROM model_meta"))
+        tensors = {
+            n: (s, d, i, e, b, hashlib.sha256(x).hexdigest())
+            for n, s, d, i, e, b, x in c.execute(
+                "SELECT name, shape, dtype, dtype_id, n_elements, n_bytes, data "
+                "FROM tensors")
+        }
+        c.close()
+        return meta, tensors
+
+    with tempfile.TemporaryDirectory() as tmp:
+        fast_db = str(Path(tmp) / "fast.db")
+        converter.gguf_to_sqlite(str(SMALL_GGUF), fast_db, verbose=False)
+
+        original = converter._parse_gguf_header
+        converter._parse_gguf_header = lambda buf: (_ for _ in ()).throw(
+            ValueError("forced fallback"))
+        try:
+            slow_db = str(Path(tmp) / "slow.db")
+            converter.gguf_to_sqlite(str(SMALL_GGUF), slow_db, verbose=False)
+        finally:
+            converter._parse_gguf_header = original
+
+        fast_meta, fast_tensors = snapshot(fast_db)
+        slow_meta, slow_tensors = snapshot(slow_db)
+        check(fast_meta == slow_meta, "fallback writes the same metadata")
+        check(fast_tensors == slow_tensors, "fallback writes the same tensors")
+
+
 def test_threaded_hash():
     section("Threaded weights hash")
     if not SMALL_DB.exists():
@@ -441,6 +530,8 @@ ALL_TESTS = [
     test_registry,
     test_lowrank,
     test_inference,
+    test_gguf_fast_parser,
+    test_convert_fallback,
     test_threaded_hash,
 ]
 

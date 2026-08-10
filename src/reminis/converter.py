@@ -7,7 +7,9 @@ code all read it that way.
 """
 
 import json
+import mmap
 import sqlite3
+import struct
 import time
 from pathlib import Path
 
@@ -15,9 +17,44 @@ import numpy as np
 
 from gguf.gguf_reader import GGUFReader
 from gguf import GGUFWriter
-from gguf.constants import GGMLQuantizationType, GGUFValueType, GGML_QUANT_SIZES
+from gguf.constants import (
+    GGML_QUANT_SIZES,
+    GGMLQuantizationType,
+    GGUFValueType,
+)
 
 from reminis.dtypes import DTYPE_SYSTEM_GGUF, DTYPE_SYSTEM_SAFETENSORS, dtype_system
+
+# Writing a model is one bulk load into a file that does not exist yet, so
+# the usual durability machinery protects nothing: there is no earlier state
+# of this database to lose, and a crash mid-convert leaves a file you delete
+# and rebuild. Turning the journal off and letting the OS schedule the writes
+# took the write phase of a 2.5 GB model from 13.9s to 0.8s.
+#
+# The page size is the one setting that outlives this connection -- it is
+# stamped into the file header -- so it was chosen by measuring reads as well
+# as writes. On a 2.5 GB model, 64 KB pages beat SQLite's 4 KB default on
+# every axis: 5.5x the write throughput, 3.6x sequential read, and 2.8x on
+# the small random byte-range reads the expert index does.
+BULK_WRITE_PRAGMAS = (
+    "PRAGMA page_size=65536",
+    "PRAGMA journal_mode=OFF",
+    "PRAGMA synchronous=OFF",
+    "PRAGMA cache_size=-256000",
+)
+
+
+def open_for_bulk_write(db_path: str) -> sqlite3.Connection:
+    """A connection tuned for writing a whole model into a fresh file.
+
+    ``isolation_level=None`` hands transaction control to us, so the load
+    runs inside one explicit BEGIN/COMMIT rather than sqlite3's implicit
+    per-statement one.
+    """
+    conn = sqlite3.connect(db_path, isolation_level=None)
+    for pragma in BULK_WRITE_PRAGMAS:
+        conn.execute(pragma)
+    return conn
 
 
 SCHEMA = """
@@ -90,6 +127,173 @@ def _extract_field_value(field):
     return part
 
 
+# struct format, width, and numpy dtype for every scalar GGUF value type.
+_GGUF_SCALARS = {
+    GGUFValueType.UINT8:   ("<B", 1, np.uint8),
+    GGUFValueType.INT8:    ("<b", 1, np.int8),
+    GGUFValueType.UINT16:  ("<H", 2, np.uint16),
+    GGUFValueType.INT16:   ("<h", 2, np.int16),
+    GGUFValueType.UINT32:  ("<I", 4, np.uint32),
+    GGUFValueType.INT32:   ("<i", 4, np.int32),
+    GGUFValueType.FLOAT32: ("<f", 4, np.float32),
+    GGUFValueType.BOOL:    ("<?", 1, np.bool_),
+    GGUFValueType.UINT64:  ("<Q", 8, np.uint64),
+    GGUFValueType.INT64:   ("<q", 8, np.int64),
+    GGUFValueType.FLOAT64: ("<d", 8, np.float64),
+}
+
+GGUF_MAGIC_LE = 0x46554747  # 'GGUF'
+GGUF_SUPPORTED_VERSIONS = (2, 3)
+GGUF_DEFAULT_ALIGNMENT = 32
+
+
+def _gguf_value(buf, offs: int, gtype: GGUFValueType) -> tuple[str, int]:
+    """One metadata value, already rendered the way the database stores it.
+
+    Returns (text, offset just past the value). The text is what
+    ``str(_extract_field_value(field))`` produces for the same field, because
+    that is the string every database written before this parser existed
+    holds and a round-trip has to keep reproducing.
+    """
+    if gtype == GGUFValueType.STRING:
+        (n,) = struct.unpack_from("<Q", buf, offs)
+        offs += 8
+        return bytes(buf[offs:offs + n]).decode("utf-8", errors="replace"), offs + n
+
+    scalar = _GGUF_SCALARS.get(gtype)
+    if scalar is not None:
+        fmt, width, _ = scalar
+        (value,) = struct.unpack_from(fmt, buf, offs)
+        return str(value), offs + width
+
+    if gtype != GGUFValueType.ARRAY:
+        raise ValueError(f"Unknown/unhandled field type {gtype}")
+
+    raw_elem, count = struct.unpack_from("<IQ", buf, offs)
+    offs += 12
+    # An empty array carries no element type to speak of, and the reader
+    # reports it as '[]' rather than guessing one.
+    if count == 0:
+        return "[]", offs
+    elem = GGUFValueType(raw_elem)
+
+    if elem == GGUFValueType.STRING:
+        values = []
+        append = values.append
+        unpack_from = struct.unpack_from
+        for _ in range(count):
+            (n,) = unpack_from("<Q", buf, offs)
+            offs += 8
+            append(bytes(buf[offs:offs + n]).decode("utf-8", errors="replace"))
+            offs += n
+        return "[" + ", ".join(map(repr, values)) + "]", offs
+
+    scalar = _GGUF_SCALARS.get(elem)
+    if scalar is None:
+        # Nested arrays are legal in the format and absent from every model
+        # anyone ships. Refusing sends the caller to the reference reader.
+        raise ValueError(f"Unhandled array element type {elem}")
+    _, width, np_dtype = scalar
+    values = np.frombuffer(buf, dtype=np_dtype, count=count, offset=offs).tolist()
+    offs += width * count
+    # Each element of a numeric array arrives from the reference reader as a
+    # one-element numpy array, so its repr is '[v]' and the whole field reads
+    # '[[1], [1], ...]'. Odd, and load-bearing: it is what is already stored.
+    return "[" + ", ".join(["[" + repr(v) + "]" for v in values]) + "]", offs
+
+
+def _parse_gguf_header(buf) -> tuple[list, list, int]:
+    """Read a GGUF header straight out of its bytes.
+
+    ``GGUFReader`` builds a numpy view per value, which costs two memmap
+    slices for every string in the file. A 128k-token vocabulary is 400k
+    such slices, and on Llama-3.2-1B that alone was 7.3s of a 20.6s
+    conversion. Reading the same bytes with ``struct`` and one
+    ``np.frombuffer`` per numeric array does it in a fraction of that.
+
+    Returns (metadata rows, tensor records, offset of the data block).
+    Raises on anything it does not recognise, so the caller can fall back to
+    the reference reader rather than guess.
+    """
+    magic, version = struct.unpack_from("<II", buf, 0)
+    if magic != GGUF_MAGIC_LE:
+        raise ValueError("GGUF magic invalid")
+    if version not in GGUF_SUPPORTED_VERSIONS:
+        raise ValueError(f"Unsupported GGUF version {version}")
+
+    tensor_count, kv_count = struct.unpack_from("<QQ", buf, 8)
+    offs = 24
+
+    meta = [
+        ("GGUF.version", str(version), "uint32"),
+        ("GGUF.tensor_count", str(tensor_count), "uint64"),
+        ("GGUF.kv_count", str(kv_count), "uint64"),
+    ]
+    alignment = GGUF_DEFAULT_ALIGNMENT
+    seen = {key for key, _, _ in meta}
+
+    for _ in range(kv_count):
+        (klen,) = struct.unpack_from("<Q", buf, offs)
+        offs += 8
+        key = bytes(buf[offs:offs + klen]).decode("utf-8")
+        offs += klen
+        (raw_type,) = struct.unpack_from("<I", buf, offs)
+        offs += 4
+        gtype = GGUFValueType(raw_type)
+        text, offs = _gguf_value(buf, offs, gtype)
+        if key in seen:
+            raise KeyError(f"Duplicate {key} already in list")
+        seen.add(key)
+        if key == "general.alignment":
+            if gtype != GGUFValueType.UINT32:
+                raise ValueError("Bad type for general.alignment field")
+            alignment = int(text)
+            if alignment == 0 or (alignment & (alignment - 1)) != 0:
+                raise ValueError("Invalid alignment: must be a non-zero power of two")
+        meta.append((key, text, META_TYPE_MAP.get(gtype, "unknown")))
+
+    tensors = []
+    names = set()
+    for _ in range(tensor_count):
+        (nlen,) = struct.unpack_from("<Q", buf, offs)
+        offs += 8
+        name = bytes(buf[offs:offs + nlen]).decode("utf-8")
+        offs += nlen
+        (n_dims,) = struct.unpack_from("<I", buf, offs)
+        offs += 4
+        dims = list(struct.unpack_from(f"<{n_dims}Q", buf, offs))
+        offs += 8 * n_dims
+        (raw_dtype,) = struct.unpack_from("<I", buf, offs)
+        offs += 4
+        (rel_offset,) = struct.unpack_from("<Q", buf, offs)
+        offs += 8
+
+        if name in names:
+            raise ValueError(f"Found duplicated tensor with name {name}")
+        names.add(name)
+
+        quant = GGMLQuantizationType(raw_dtype)
+        block_size, type_size = GGML_QUANT_SIZES[quant]
+        n_elements = 1
+        for d in dims:
+            n_elements *= int(d)
+        n_bytes = n_elements * type_size // block_size
+        tensors.append({
+            "name": name,
+            "shape": [int(d) for d in dims],
+            "dtype": quant.name,
+            "dtype_id": int(quant),
+            "n_elements": n_elements,
+            "n_bytes": n_bytes,
+            "rel_offset": int(rel_offset),
+        })
+
+    padding = offs % alignment
+    if padding:
+        offs += alignment - padding
+    return meta, tensors, offs
+
+
 def gguf_to_sqlite(gguf_path: str, db_path: str | None = None, verbose: bool = True) -> str:
     """Convert a GGUF file to a SQLite database.
 
@@ -113,70 +317,156 @@ def gguf_to_sqlite(gguf_path: str, db_path: str | None = None, verbose: bool = T
         print(f"Reading {gguf_path} ...")
 
     t0 = time.time()
-    reader = GGUFReader(str(gguf_path), mode="r")
 
-    conn = sqlite3.connect(db_path)
-    conn.execute("PRAGMA journal_mode=WAL")
-    conn.execute("PRAGMA synchronous=NORMAL")
-    conn.execute("PRAGMA cache_size=-64000")
-    conn.executescript(SCHEMA)
+    # A fresh file, so the bulk-write pragmas apply and no tensor of a
+    # previous model can survive into this one.
+    Path(db_path).unlink(missing_ok=True)
 
-    # Store metadata
-    meta_count = 0
-    for key, field in reader.fields.items():
-        main_type = field.types[0] if field.types else GGUFValueType.STRING
-        type_name = META_TYPE_MAP.get(main_type, "unknown")
-        value = _extract_field_value(field)
-        conn.execute(
-            "INSERT OR REPLACE INTO model_meta (key, value, type) VALUES (?, ?, ?)",
-            (key, str(value), type_name),
-        )
-        meta_count += 1
+    with open(gguf_path, "rb") as handle:
+        with mmap.mmap(handle.fileno(), 0, access=mmap.ACCESS_READ) as buf:
+            try:
+                meta_rows, tensors, data_offset = _parse_gguf_header(buf)
+            except Exception as exc:
+                # Anything the fast parser does not recognise goes to the
+                # reference reader rather than being guessed at.
+                if verbose:
+                    print(f"  (reading with the reference GGUF reader: {exc})")
+                return _gguf_to_sqlite_via_reader(gguf_path, db_path, verbose, t0)
 
-    # Record which dtype system the dtype_id column belongs to, so a later
-    # export never mistakes a GGML enum value for a safetensors one.
-    for key, value in (
-        ("reminis.source_format", "gguf"),
-        ("reminis.dtype_system", DTYPE_SYSTEM_GGUF),
-    ):
-        conn.execute(
-            "INSERT OR REPLACE INTO model_meta (key, value, type) VALUES (?, ?, 'string')",
-            (key, value),
-        )
+            meta_rows = list(meta_rows) + [
+                # Which dtype system the dtype_id column belongs to, so a
+                # later export never mistakes a GGML enum value for a
+                # safetensors one.
+                ("reminis.source_format", "gguf", "string"),
+                ("reminis.dtype_system", DTYPE_SYSTEM_GGUF, "string"),
+            ]
 
-    if verbose:
-        print(f"  Stored {meta_count} metadata fields")
+            conn = open_for_bulk_write(db_path)
+            try:
+                conn.executescript(SCHEMA)
+                conn.execute("BEGIN")
+                conn.executemany(
+                    "INSERT OR REPLACE INTO model_meta (key, value, type) VALUES (?, ?, ?)",
+                    meta_rows,
+                )
+                if verbose:
+                    print(f"  Stored {len(meta_rows)} metadata fields")
 
-    # Store tensors
-    total_bytes = 0
-    for i, tensor in enumerate(reader.tensors):
-        name = tensor.name
-        shape = [int(x) for x in tensor.shape]
-        dtype_enum = tensor.tensor_type
-        dtype_name = dtype_enum.name
-        n_elements = int(tensor.n_elements)
-        n_bytes = int(tensor.n_bytes)
-        raw_data = tensor.data.tobytes()
+                total_bytes = sum(t["n_bytes"] for t in tensors)
+                view = memoryview(buf)
 
-        conn.execute(
-            "INSERT OR REPLACE INTO tensors (name, shape, dtype, dtype_id, n_elements, n_bytes, data) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?)",
-            (name, json.dumps(shape), dtype_name, dtype_enum.value, n_elements, n_bytes, raw_data),
-        )
-        total_bytes += n_bytes
+                def rows():
+                    # A memoryview onto the mapping, so a tensor's bytes go
+                    # from the file's pages into the database page without a
+                    # full copy into a Python bytes object on the way.
+                    #
+                    # Each slice is an export of the mapping, and a mapping
+                    # with exports outstanding refuses to close. By the time
+                    # the generator is resumed sqlite has finished with the
+                    # previous row, so that is the moment to hand it back.
+                    previous = None
+                    try:
+                        for i, t in enumerate(tensors):
+                            if previous is not None:
+                                previous.release()
+                                previous = None
+                            start = data_offset + t["rel_offset"]
+                            blob = view[start:start + t["n_bytes"]]
+                            previous = blob
+                            if verbose:
+                                size_kb = t["n_bytes"] / 1024
+                                unit = "KB" if size_kb < 1024 else "MB"
+                                shown = size_kb if unit == "KB" else size_kb / 1024
+                                print(f"  [{i+1}/{len(tensors)}] {t['name']:50s} "
+                                      f"{str(t['shape']):20s} {t['dtype']:8s} "
+                                      f"{shown:8.1f} {unit}")
+                            yield (t["name"], json.dumps(t["shape"]), t["dtype"],
+                                   t["dtype_id"], t["n_elements"], t["n_bytes"], blob)
+                    finally:
+                        if previous is not None:
+                            previous.release()
 
-        if verbose:
-            size_kb = n_bytes / 1024
-            unit = "KB" if size_kb < 1024 else "MB"
-            size_display = size_kb if unit == "KB" else size_kb / 1024
-            print(f"  [{i+1}/{len(reader.tensors)}] {name:50s} {str(shape):20s} {dtype_name:8s} {size_display:8.1f} {unit}")
-
-    conn.commit()
-    conn.close()
+                try:
+                    conn.executemany(
+                        "INSERT OR REPLACE INTO tensors (name, shape, dtype, dtype_id, "
+                        "n_elements, n_bytes, data) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                        rows(),
+                    )
+                    conn.execute("COMMIT")
+                finally:
+                    view.release()
+            finally:
+                conn.close()
 
     elapsed = time.time() - t0
     total_mb = total_bytes / (1024 * 1024)
 
+    if verbose:
+        print(f"\nDone. {len(tensors)} tensors ({total_mb:.1f} MB) stored in {db_path}")
+        print(f"Time: {elapsed:.1f}s ({total_mb / elapsed:.1f} MB/s)")
+
+    return db_path
+
+
+def _gguf_to_sqlite_via_reader(gguf_path, db_path: str, verbose: bool, t0: float) -> str:
+    """The original conversion, through the ``gguf`` package's own reader.
+
+    Kept as the fallback for files the fast header parser declines, so a
+    format extension it has never seen still converts rather than failing.
+    """
+    reader = GGUFReader(str(gguf_path), mode="r")
+
+    conn = open_for_bulk_write(db_path)
+    try:
+        conn.executescript(SCHEMA)
+        conn.execute("BEGIN")
+
+        meta_rows = []
+        for key, field in reader.fields.items():
+            main_type = field.types[0] if field.types else GGUFValueType.STRING
+            meta_rows.append((key, str(_extract_field_value(field)),
+                              META_TYPE_MAP.get(main_type, "unknown")))
+        meta_rows += [
+            ("reminis.source_format", "gguf", "string"),
+            ("reminis.dtype_system", DTYPE_SYSTEM_GGUF, "string"),
+        ]
+        conn.executemany(
+            "INSERT OR REPLACE INTO model_meta (key, value, type) VALUES (?, ?, ?)",
+            meta_rows,
+        )
+        if verbose:
+            print(f"  Stored {len(meta_rows)} metadata fields")
+
+        total_bytes = 0
+        for tensor in reader.tensors:
+            total_bytes += int(tensor.n_bytes)
+
+        def rows():
+            for i, tensor in enumerate(reader.tensors):
+                shape = [int(x) for x in tensor.shape]
+                n_bytes = int(tensor.n_bytes)
+                if verbose:
+                    size_kb = n_bytes / 1024
+                    unit = "KB" if size_kb < 1024 else "MB"
+                    shown = size_kb if unit == "KB" else size_kb / 1024
+                    print(f"  [{i+1}/{len(reader.tensors)}] {tensor.name:50s} "
+                          f"{str(shape):20s} {tensor.tensor_type.name:8s} "
+                          f"{shown:8.1f} {unit}")
+                yield (tensor.name, json.dumps(shape), tensor.tensor_type.name,
+                       tensor.tensor_type.value, int(tensor.n_elements), n_bytes,
+                       tensor.data.tobytes())
+
+        conn.executemany(
+            "INSERT OR REPLACE INTO tensors (name, shape, dtype, dtype_id, "
+            "n_elements, n_bytes, data) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            rows(),
+        )
+        conn.execute("COMMIT")
+    finally:
+        conn.close()
+
+    elapsed = time.time() - t0
+    total_mb = total_bytes / (1024 * 1024)
     if verbose:
         print(f"\nDone. {len(reader.tensors)} tensors ({total_mb:.1f} MB) stored in {db_path}")
         print(f"Time: {elapsed:.1f}s ({total_mb / elapsed:.1f} MB/s)")

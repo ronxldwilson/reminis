@@ -137,9 +137,11 @@ def quantize_model(
                          "pass a different -o/--output.")
 
     src = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
-    out = sqlite3.connect(output_path)
-    from reminis.converter import SCHEMA
+    Path(output_path).unlink(missing_ok=True)
+    from reminis.converter import SCHEMA, open_for_bulk_write
+    out = open_for_bulk_write(output_path)
     out.executescript(SCHEMA)
+    out.execute("BEGIN")
 
     out.executemany(
         "INSERT OR REPLACE INTO model_meta (key, value, type) VALUES (?,?,?)",
@@ -179,7 +181,7 @@ def quantize_model(
             print(f"\r  {stats['quantized'] + stats['copied']:>4} tensors, "
                   f"{stats['new_bytes'] / 1e6:8.1f} MB written", end="", flush=True)
 
-    out.commit()
+    out.execute("COMMIT")
     out.close()
     src.close()
 
