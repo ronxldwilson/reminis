@@ -412,6 +412,46 @@ def test_inference():
 
 # ── 11. Threaded weights hash consistency ────────────────────────────────
 
+def test_encode_candidates_parallel():
+    """Compressing the candidates on threads must not change a single byte.
+
+    zstd's compressor objects are not thread-safe, and a shared one does not
+    fail when used from several threads -- it produces corrupt or differing
+    output. Both the encoding chosen and the payload are compared against
+    the single-threaded result here, over every shape of delta.
+    """
+    section("Parallel candidate encoding")
+    from concurrent.futures import ThreadPoolExecutor
+
+    import reminis.diff as diff
+
+    rng = np.random.default_rng(5)
+    n = 40000
+    base = rng.integers(0, 256, n, dtype=np.uint8).tobytes()
+
+    mostly_same = bytearray(base)
+    for i in range(0, n, 3):
+        mostly_same[i] ^= 0x11
+
+    cases = []
+    for dtype in ("F16", "BF16", "F32", "Q4_K"):
+        cases.append((f"{dtype} mostly unchanged", base, bytes(mostly_same), dtype))
+        cases.append((f"{dtype} fully random", base,
+                      rng.integers(0, 256, n, dtype=np.uint8).tobytes(), dtype))
+        cases.append((f"{dtype} identical", base, base, dtype))
+        cases.append((f"{dtype} size mismatch", base, base[: n // 2], dtype))
+
+    pool = ThreadPoolExecutor(max_workers=2)
+    try:
+        for label, a, b, dtype in cases:
+            enc_serial, payload_serial = diff._encode_delta(a, b, dtype, None)
+            enc_pooled, payload_pooled = diff._encode_delta(a, b, dtype, pool)
+            check(enc_serial == enc_pooled and payload_serial == payload_pooled,
+                  f"{label}: pooled encode is byte-identical ({enc_serial})")
+    finally:
+        pool.shutdown()
+
+
 def test_diff_tensor_set_changes():
     """A pack must record the same hashes however the tensor sets line up.
 
@@ -669,6 +709,7 @@ ALL_TESTS = [
     test_registry,
     test_lowrank,
     test_inference,
+    test_encode_candidates_parallel,
     test_diff_tensor_set_changes,
     test_quantize_chunking,
     test_gguf_fast_parser,

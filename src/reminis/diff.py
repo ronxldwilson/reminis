@@ -7,6 +7,7 @@ distributed as a small migration instead of a full model copy.
 
 import hashlib
 import json
+import os
 import sqlite3
 import threading
 import time
@@ -32,8 +33,19 @@ _decompressor = zstandard.ZstdDecompressor()
 _local = threading.local()
 
 
+def _get_compressor() -> zstandard.ZstdCompressor:
+    """A per-thread compressor. ZstdCompressor is no more thread-safe than
+    the decompressor, and sharing one across the candidate threads below
+    corrupts its output rather than failing."""
+    c = getattr(_local, "compressor", None)
+    if c is None:
+        c = zstandard.ZstdCompressor(level=ZSTD_LEVEL)
+        _local.compressor = c
+    return c
+
+
 def _compress(data: bytes) -> bytes:
-    return _compressor.compress(data)
+    return _get_compressor().compress(data)
 
 
 def _get_decompressor() -> zstandard.ZstdDecompressor:
@@ -408,9 +420,13 @@ def _merge_planes(planes: list[bytes], width: int) -> bytes:
 
 def _frame(parts: list[bytes]) -> bytes:
     """Length-prefix each compressed stream so decode needs no side channel."""
+    return _frame_chunks([_compress(part) for part in parts])
+
+
+def _frame_chunks(chunks: list[bytes]) -> bytes:
+    """The framing half of _frame, for callers that compressed elsewhere."""
     out = bytearray()
-    for part in parts:
-        chunk = _compress(part)
+    for chunk in chunks:
         out += len(chunk).to_bytes(4, "little")
         out += chunk
     return bytes(out)
@@ -465,7 +481,7 @@ def _decode_bitplane(payload: bytes, dtype: str, name: str) -> bytes:
     return _merge_planes(planes, width)
 
 
-def _encode_delta(a_blob: bytes, b_blob: bytes, dtype: str) -> tuple[str, bytes]:
+def _encode_delta(a_blob: bytes, b_blob: bytes, dtype: str, pool=None) -> tuple[str, bytes]:
     """Pick the smaller of a compressed XOR delta or a compressed replacement.
 
     XOR is used rather than arithmetic subtraction because it is exactly
@@ -480,21 +496,36 @@ def _encode_delta(a_blob: bytes, b_blob: bytes, dtype: str) -> tuple[str, bytes]
     Returns (encoding_name, payload). 'xor_zstd' payloads are XORed against the
     base tensor on apply; 'replace_zstd' payloads overwrite it outright.
     """
-    replacement = _compress(b_blob)
-
     if len(a_blob) != len(b_blob):
-        return "replace_zstd", replacement
+        return "replace_zstd", _compress(b_blob)
 
     a_arr = np.frombuffer(a_blob, dtype=np.uint8)
     b_arr = np.frombuffer(b_blob, dtype=np.uint8)
     delta = np.bitwise_xor(a_arr, b_arr)
+    delta_bytes = delta.tobytes()
 
-    candidates = [("xor_zstd", _compress(delta.tobytes())),
-                  ("replace_zstd", replacement)]
+    # The candidates are independent of one another, and so are the two
+    # planes inside the bit-plane one, so all of them are compressed at
+    # once when a pool is offered. They are submitted flat rather than
+    # letting the bit-plane job submit its own: a task that waits on tasks
+    # in the pool it is running in deadlocks once the pool is full.
+    width = _PLANE_WIDTH.get(dtype)
+    planes = (_split_planes(delta_bytes, width)
+              if width is not None and len(delta_bytes) % width == 0 else None)
 
-    planes = _encode_bitplane(delta, dtype)
+    if pool is None:
+        chunks = [_compress(b_blob), _compress(delta_bytes)]
+        if planes is not None:
+            chunks += [_compress(p) for p in planes]
+    else:
+        jobs = [pool.submit(_compress, b_blob), pool.submit(_compress, delta_bytes)]
+        if planes is not None:
+            jobs += [pool.submit(_compress, p) for p in planes]
+        chunks = [job.result() for job in jobs]
+
+    candidates = [("xor_zstd", chunks[1]), ("replace_zstd", chunks[0])]
     if planes is not None:
-        candidates.append(("bitplane_zstd", planes))
+        candidates.append(("bitplane_zstd", _frame_chunks(chunks[2:])))
 
     # Ties go to the earliest candidate, which keeps a tensor that gains
     # nothing from the split on the plain encoding older readers understand.
@@ -507,6 +538,7 @@ def _choose_encoding(
     dtype: str,
     shape: list,
     lossy_tolerance: float | None,
+    pool=None,
 ):
     """Pick the smallest encoding for one tensor.
 
@@ -516,7 +548,7 @@ def _choose_encoding(
 
     Returns (encoding, payload, rank, rel_error).
     """
-    encoding, payload = _encode_delta(a_blob, b_blob, dtype)
+    encoding, payload = _encode_delta(a_blob, b_blob, dtype, pool)
 
     if lossy_tolerance is None:
         return encoding, payload, None, None
@@ -615,6 +647,24 @@ def diff_models(
     hash_a = _BackgroundHash() if hashing_inline else None
     hash_b = _BackgroundHash() if hashing_inline else None
 
+    # Encoding a tensor means compressing it three or four ways and keeping
+    # the smallest. Those are independent, so they run at once.
+    #
+    # Two workers, not one per core. zstd at level 1 is quick enough that
+    # several hundred-megabyte streams at once run out of memory bandwidth
+    # long before cores: measured on the encode phase alone, two threads
+    # gave 1.50x and four gave the same 1.50x. In the whole diff, where two
+    # more threads are already busy hashing, going wider is actively worse
+    # -- 8.9s at two workers against 9.7s at four and 10.8s serial.
+    #
+    # Tensors are still encoded one at a time. The largest one's working
+    # set is both blobs, the delta, its planes and every candidate payload,
+    # which is gigabytes before a second tensor is considered.
+    encode_pool = None
+    if out_conn is not None:
+        from concurrent.futures import ThreadPoolExecutor
+        encode_pool = ThreadPoolExecutor(max_workers=2)
+
     for name in shared:
         row_a = conn_a.execute(
             "SELECT shape, dtype, dtype_id, n_elements, data FROM tensors WHERE name = ?", (name,)
@@ -648,7 +698,8 @@ def diff_models(
 
         if out_conn is not None:
             encoding, payload, rank, rel_error = _choose_encoding(
-                blob_a, blob_b, dtype_b, json.loads(shape_b), lossy_tolerance
+                blob_a, blob_b, dtype_b, json.loads(shape_b), lossy_tolerance,
+                encode_pool,
             )
             total_raw_bytes += len(blob_b)
             total_stored_bytes += len(payload)
@@ -720,6 +771,9 @@ def diff_models(
             "reminis_version": _version(),
         }
         out_conn.execute("COMMIT")
+        if encode_pool is not None:
+            encode_pool.shutdown()
+            encode_pool = None
 
         # A lossy pack cannot reproduce the target byte for byte, but its
         # reconstruction is deterministic -- so record the hash of what apply

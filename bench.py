@@ -108,17 +108,40 @@ def bench_diff(db_path):
 
 
 def bench_diff_changed(db_path):
-    """The workload that matters: a target where most tensors really moved.
+    """A fine-tune-shaped diff: same dtypes, weights moved a little.
 
-    diff_identical exercises the early-out path only, so on its own it would
-    happily report progress on a case nobody runs.
+    This is the workload delta packs exist for, and the only one that
+    exercises the encoder properly. A quantized target looks like a
+    plausible stand-in and is not one: its blobs are a different size from
+    the base's, so no XOR is possible and every tensor takes the plain
+    replacement path, which costs a fraction of the real thing.
+
+    The perturbation stirs the low mantissa bits directly rather than going
+    through float arithmetic -- far quicker to set up, and it produces the
+    pattern a fine-tune produces: exponents almost untouched, mantissas
+    noisy, which is what the bit-plane split is there for.
     """
     from reminis.diff import diff_models
-    from reminis.quantize import quantize_model
 
     with tempfile.TemporaryDirectory(prefix="reminis-bench-") as tmp:
-        target = os.path.join(tmp, "q8.db")
-        quantize_model(str(db_path), target, bits=8, verbose=False)
+        target = os.path.join(tmp, "finetune.db")
+        shutil.copyfile(str(db_path), target)
+
+        rng = np.random.default_rng(0)
+        conn = sqlite3.connect(target)
+        rows = conn.execute(
+            "SELECT name FROM tensors WHERE dtype IN ('F16', 'BF16')"
+        ).fetchall()
+        for (name,) in rows:
+            blob = conn.execute(
+                "SELECT data FROM tensors WHERE name = ?", (name,)
+            ).fetchone()[0]
+            words = np.frombuffer(blob, dtype=np.uint16).copy()
+            words ^= rng.integers(0, 64, words.shape, dtype=np.uint16)
+            conn.execute("UPDATE tensors SET data = ? WHERE name = ?",
+                         (words.tobytes(), name))
+        conn.commit()
+        conn.close()
 
         out = os.path.join(tmp, "delta.db")
         t0 = time.perf_counter()
