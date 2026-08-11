@@ -535,53 +535,81 @@ def sqlite_to_gguf(db_path: str, gguf_path: str | None = None, verbose: bool = T
     if verbose:
         print(f"  Wrote {meta_count} metadata fields")
 
-    # Write tensors
-    tensor_rows = conn.execute(
-        "SELECT name, shape, dtype, dtype_id, n_elements, n_bytes, data FROM tensors ORDER BY id"
-    ).fetchall()
-
+    # Describe every tensor without reading one. add_tensor() would hold the
+    # weights in the writer until the end -- 12 GB of them on a 20B model --
+    # and then write each through numpy's tofile, which measured 176 MB/s
+    # against a disk that reads at 2.8 GB/s. add_tensor_info() records the
+    # same header entry and leaves the bytes to us.
     NATIVE_DTYPES = {
         GGMLQuantizationType.F32: np.float32,
         GGMLQuantizationType.F16: np.float16,
     }
 
+    plan = []
     total_bytes = 0
-    for i, (name, shape_str, dtype_name, dtype_id, n_elements, n_bytes, data) in enumerate(tensor_rows):
+    for name, shape_str, dtype_name, dtype_id, n_elements, n_bytes in conn.execute(
+        "SELECT name, shape, dtype, dtype_id, n_elements, n_bytes FROM tensors ORDER BY id"
+    ):
         shape = json.loads(shape_str)
         quant_type = GGMLQuantizationType(dtype_id)
-
         np_dtype = NATIVE_DTYPES.get(quant_type)
+
         if np_dtype is not None:
-            tensor_data = np.frombuffer(data, dtype=np_dtype).reshape(shape[::-1])
-            writer.add_tensor(name, tensor_data)
+            # Shapes go to the writer in numpy order; it reverses them back.
+            writer.add_tensor_info(name, shape[::-1], np.dtype(np_dtype),
+                                   n_bytes, raw_dtype=quant_type)
         else:
-            raw_data = np.frombuffer(data, dtype=np.uint8)
+            byte_shape = list(shape[::-1])
             if len(shape) >= 2:
                 block_size, type_size = GGML_QUANT_SIZES[quant_type]
-                byte_last = (shape[0] // block_size) * type_size
-                byte_shape = shape[1:] + [byte_last]
-                raw_data = raw_data.reshape(byte_shape)
-            writer.add_tensor(name, raw_data, raw_dtype=quant_type)
+                byte_shape = shape[1:] + [(shape[0] // block_size) * type_size]
+            writer.add_tensor_info(name, byte_shape, np.dtype(np.uint8),
+                                   n_bytes, raw_dtype=quant_type)
+
+        plan.append((name, shape, dtype_name, n_bytes))
         total_bytes += n_bytes
+
+    writer.write_header_to_file()
+    writer.write_kv_data_to_file()
+    writer.write_ti_data_to_file()
+
+    # write_ti_data_to_file laid the offsets out as a running total of
+    # ggml_pad(nbytes), starting from the first aligned byte after the
+    # header. Writing the data has to follow exactly that, so the padding
+    # here is not cosmetic -- it is what the offsets already promised.
+    if writer.fout is None or len(writer.fout) != 1:
+        conn.close()
+        writer.close()
+        raise ValueError(
+            "This writer split the output across shards, which this export "
+            "path does not handle."
+        )
+    fout = writer.fout[0]
+    writer.write_padding(fout, fout.tell())
+
+    for i, (name, shape, dtype_name, n_bytes) in enumerate(plan):
+        (blob,) = conn.execute(
+            "SELECT data FROM tensors WHERE name = ?", (name,)
+        ).fetchone()
+        fout.write(blob)
+        writer.write_padding(fout, n_bytes)
+        del blob  # one tensor resident at a time, not the whole model
 
         if verbose:
             size_kb = n_bytes / 1024
             unit = "KB" if size_kb < 1024 else "MB"
             size_display = size_kb if unit == "KB" else size_kb / 1024
-            print(f"  [{i+1}/{len(tensor_rows)}] {name:50s} {str(shape):20s} {dtype_name:8s} {size_display:8.1f} {unit}")
+            print(f"  [{i+1}/{len(plan)}] {name:50s} {str(shape):20s} {dtype_name:8s} {size_display:8.1f} {unit}")
 
+    fout.flush()
     conn.close()
-
-    writer.write_header_to_file()
-    writer.write_kv_data_to_file()
-    writer.write_tensors_to_file(progress=verbose)
     writer.close()
 
     elapsed = time.time() - t0
     total_mb = total_bytes / (1024 * 1024)
 
     if verbose:
-        print(f"\nDone. {len(tensor_rows)} tensors ({total_mb:.1f} MB) written to {gguf_path}")
+        print(f"\nDone. {len(plan)} tensors ({total_mb:.1f} MB) written to {gguf_path}")
         print(f"Time: {elapsed:.1f}s ({total_mb / elapsed:.1f} MB/s)")
 
     return gguf_path

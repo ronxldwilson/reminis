@@ -68,11 +68,16 @@ def bench_weights_hash(db_path):
     conn = sqlite3.connect(str(db_path))
     t0 = time.perf_counter()
     h = hashlib.sha256()
+    hashed = 0
     for (blob,) in conn.execute("SELECT data FROM tensors ORDER BY name"):
         h.update(blob)
+        hashed += len(blob)
     elapsed = time.perf_counter() - t0
     conn.close()
-    total_mb = Path(db_path).stat().st_size / 1e6
+    # Bytes actually hashed, not the file size. A model with an expert index
+    # carries gigabytes this never reads, and dividing by the file made the
+    # rate look almost twice what it was.
+    total_mb = hashed / 1e6
     record("weights_hash", elapsed, "s", f"{total_mb:.0f} MB, {total_mb/elapsed:.0f} MB/s")
 
 
