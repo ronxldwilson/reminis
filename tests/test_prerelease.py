@@ -158,27 +158,67 @@ def test_gguf_roundtrip():
         skip(f"{SMALL_GGUF.name} not present")
         return
 
-    from reminis.converter import gguf_to_sqlite, sqlite_to_gguf
     import hashlib
+
     from gguf.gguf_reader import GGUFReader
+
+    from reminis.converter import (
+        _extract_field_value, gguf_to_sqlite, sqlite_to_gguf,
+    )
+
+    # Written by the reader on the way in and not part of the file itself.
+    READER_ONLY = {"GGUF.version", "GGUF.tensor_count", "GGUF.kv_count"}
 
     def tensor_hashes(path):
         reader = GGUFReader(str(path), mode="r")
         return {t.name: hashlib.sha256(t.data.tobytes()).hexdigest()
                 for t in reader.tensors}
 
+    def metadata(path):
+        reader = GGUFReader(str(path), mode="r")
+        return {
+            key: (str(_extract_field_value(field)), list(field.types))
+            for key, field in reader.fields.items()
+            if key not in READER_ONLY
+        }
+
     with tempfile.TemporaryDirectory() as tmp:
         db = str(Path(tmp) / "m.db")
         rt = str(Path(tmp) / "m.gguf")
 
         orig = tensor_hashes(SMALL_GGUF)
+        orig_meta = metadata(SMALL_GGUF)
         gguf_to_sqlite(str(SMALL_GGUF), db, verbose=False)
         sqlite_to_gguf(db, rt, verbose=False)
         back = tensor_hashes(Path(rt))
+        back_meta = metadata(Path(rt))
 
         mismatches = [n for n in orig if orig.get(n) != back.get(n)]
         check(len(mismatches) == 0,
-              f"lossless round-trip ({len(orig)} tensors, 0 mismatches)")
+              f"tensors survive the round-trip ({len(orig)}, 0 mismatches)")
+
+        # Tensors alone are not enough to call a round-trip lossless. Export
+        # dropped every array field through 0.31.1, which took the tokenizer
+        # with it: the weights matched, and llama.cpp would not load the file
+        # because it could not find the merges.
+        dropped = sorted(set(orig_meta) - set(back_meta))
+        check(not dropped,
+              f"no metadata field is dropped ({len(orig_meta)} fields)"
+              + (f" -- lost {dropped}" if dropped else ""))
+
+        changed = sorted(k for k in set(orig_meta) & set(back_meta)
+                         if orig_meta[k] != back_meta[k])
+        check(not changed,
+              "metadata values and types are unchanged"
+              + (f" -- differ: {changed[:5]}" if changed else ""))
+
+        for needed in ("tokenizer.ggml.tokens", "tokenizer.ggml.merges"):
+            if needed in orig_meta:
+                check(needed in back_meta, f"{needed} survives export")
+
+        # The strongest statement available: the file is the file.
+        check(Path(rt).read_bytes() == Path(SMALL_GGUF).read_bytes(),
+              "exported file is byte-identical to the original")
 
 
 # ── 5. Diff + apply (needs SmolLM DB) ───────────────────────────────────
@@ -604,15 +644,16 @@ def test_gguf_fast_parser():
     from gguf.gguf_reader import GGUFReader
 
     from reminis.converter import (
-        META_TYPE_MAP, _extract_field_value, _parse_gguf_header,
+        _extract_field_value, _meta_type_name, _parse_gguf_header,
     )
 
     reader = GGUFReader(str(SMALL_GGUF), mode="r")
     ref_meta = {}
     for key, field in reader.fields.items():
         main = field.types[0] if field.types else GGUFValueType.STRING
+        elem = field.types[1] if len(field.types) > 1 else None
         ref_meta[key] = (str(_extract_field_value(field)),
-                         META_TYPE_MAP.get(main, "unknown"))
+                         _meta_type_name(main, elem))
     ref_tensors = {
         t.name: ([int(x) for x in t.shape], t.tensor_type.name,
                  int(t.tensor_type), int(t.n_elements), int(t.n_bytes),

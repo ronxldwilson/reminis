@@ -9,6 +9,39 @@ rather than compared against a number from earlier in the day.
 `bench.py` produces these figures; `tests/test_prerelease.py` is the gate every
 release below had to pass.
 
+## 0.32.0 -- exported models keep their tokenizer
+
+`reminis export` dropped every array-typed metadata field, and had since
+arrays were first skipped:
+
+```python
+elif type_name == "array":
+    pass  # arrays are complex; skip for now to avoid corruption
+```
+
+For a llama-family model that is the tokenizer. An exported GGUF carried
+correct weights, no vocabulary and no merges, and llama.cpp refused it with
+`error loading model vocabulary: cannot find tokenizer merges in model file`.
+Found by running a full cycle -- convert, generate, export, generate again --
+rather than by any test.
+
+Arrays are now written back. The element type had nowhere to live, since a
+stored `[[1], [1]]` reads the same whether it was int32 or uint32, so the
+`type` column now records it as `array:int32`, `array:string` and so on. A
+database written before this carries a bare `array` and still exports, with
+the element type inferred from the values -- exact for strings and floats,
+and int32 for whole numbers.
+
+On SmolLM-135M the exported file is now byte-identical to the file it was
+converted from, and llama.cpp generates the same text from both.
+
+**The tests said this was fine.** `test_roundtrip.py` compared tensor hashes
+and passed 22/22 while every one of those files had lost its tokenizer; the
+pre-release GGUF check had inherited the same blind spot. Both now compare
+metadata field by field, and the pre-release one asserts the exported file is
+byte-identical. Checked against the old code, where they fail on exactly the
+five dropped fields while the tensor check still reports success.
+
 ## 0.31.0 -- streaming GGUF export
 
 Exporting wrote every tensor into the `gguf` writer and only then flushed the

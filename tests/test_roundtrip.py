@@ -44,6 +44,29 @@ def sha256_metadata(gguf_path: str) -> dict[str, str]:
     return hashes
 
 
+# GGUFReader synthesises these from the file header; they are not fields the
+# file itself carries, so an export is not expected to reproduce them.
+READER_ONLY_FIELDS = {"GGUF.version", "GGUF.tensor_count", "GGUF.kv_count"}
+
+
+def metadata_fields(path: str) -> dict:
+    """Every metadata field, as (rendered value, type chain).
+
+    This suite compared tensors and nothing else, and so reported a lossless
+    round-trip for files that had silently lost their tokenizer -- export
+    dropped every array-typed field through 0.31.1. Weights matching is not
+    the same as the model still loading.
+    """
+    from reminis.converter import _extract_field_value
+
+    reader = GGUFReader(path, mode="r")
+    return {
+        key: (str(_extract_field_value(field)), list(field.types))
+        for key, field in reader.fields.items()
+        if key not in READER_ONLY_FIELDS
+    }
+
+
 def check_model(gguf_path: Path) -> dict:
     """Run full round-trip test with SHA256 verification on a single model.
 
@@ -60,6 +83,7 @@ def check_model(gguf_path: Path) -> dict:
     t0 = time.time()
     orig_hashes = sha256_tensors(str(gguf_path))
     hash_time = time.time() - t0
+    orig_meta = metadata_fields(str(gguf_path))
 
     # Convert GGUF -> SQLite
     t0 = time.time()
@@ -75,6 +99,16 @@ def check_model(gguf_path: Path) -> dict:
     t0 = time.time()
     rt_hashes = sha256_tensors(rt_path)
     verify_time = time.time() - t0
+
+    # Compare metadata as well as tensors: a file whose weights match but
+    # whose tokenizer was dropped is not a lossless round-trip.
+    rt_meta = metadata_fields(rt_path)
+    meta_mismatches = []
+    for key in orig_meta:
+        if key not in rt_meta:
+            meta_mismatches.append((key, "META_MISSING"))
+        elif orig_meta[key] != rt_meta[key]:
+            meta_mismatches.append((key, "META_CHANGED"))
 
     # Compare
     mismatches = []
@@ -107,8 +141,9 @@ def check_model(gguf_path: Path) -> dict:
         "rt_mb": rt_size,
         "convert_s": convert_time,
         "export_s": export_time,
-        "mismatches": mismatches,
-        "passed": len(mismatches) == 0,
+        "mismatches": mismatches + meta_mismatches,
+        "meta_fields": len(orig_meta),
+        "passed": len(mismatches) == 0 and len(meta_mismatches) == 0,
     }
 
 

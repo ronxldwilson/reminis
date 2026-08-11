@@ -6,6 +6,7 @@ format, because that is GGUF's convention and the diff, low-rank, and viewer
 code all read it that way.
 """
 
+import ast
 import json
 import mmap
 import sqlite3
@@ -142,40 +143,85 @@ _GGUF_SCALARS = {
     GGUFValueType.FLOAT64: ("<d", 8, np.float64),
 }
 
+# Every value type by the name the `type` column uses, so an export can map
+# a stored name back to the type it was written as.
+META_NAME_TO_TYPE = {name: gtype for gtype, name in META_TYPE_MAP.items()}
+
+
+def _meta_type_name(gtype: GGUFValueType, elem: GGUFValueType | None) -> str:
+    """The `type` column's value for one metadata field.
+
+    An array records what it holds -- ``array:string``, ``array:int32`` --
+    because the rendered value cannot say. '[[1], [1]]' is the same text
+    whether those were int32 or uint32, and an export writing the field back
+    has to pick one. Databases written before this carry a bare 'array' and
+    are handled by inferring the element type from the values, which is
+    right for strings and floats and picks int32 for whole numbers.
+    """
+    name = META_TYPE_MAP.get(gtype, "unknown")
+    if gtype == GGUFValueType.ARRAY and elem is not None:
+        return f"{name}:{META_TYPE_MAP.get(elem, 'unknown')}"
+    return name
+
+
+def _meta_array_values(text: str) -> list:
+    """The Python values behind a stored array field.
+
+    Both stored shapes parse: a string array is ``['a', 'b']`` and a numeric
+    one is ``[[1], [1]]``, each element wrapped because the reference reader
+    hands back one-element numpy arrays. repr and literal_eval are an exact
+    round trip for str, int and float, so nothing is lost going back.
+    """
+    values = ast.literal_eval(text)
+    if not isinstance(values, list):
+        raise ValueError("stored array field is not a list")
+    if values and all(isinstance(v, list) and len(v) == 1 for v in values):
+        return [v[0] for v in values]
+    return values
+
+
 GGUF_MAGIC_LE = 0x46554747  # 'GGUF'
 GGUF_SUPPORTED_VERSIONS = (2, 3)
 GGUF_DEFAULT_ALIGNMENT = 32
 
 
-def _gguf_value(buf, offs: int, gtype: GGUFValueType) -> tuple[str, int]:
+def _gguf_value(buf, offs: int, gtype: GGUFValueType):
     """One metadata value, already rendered the way the database stores it.
 
-    Returns (text, offset just past the value). The text is what
-    ``str(_extract_field_value(field))`` produces for the same field, because
-    that is the string every database written before this parser existed
-    holds and a round-trip has to keep reproducing.
+    Returns (text, offset just past the value, element type). The text is
+    what ``str(_extract_field_value(field))`` produces for the same field,
+    because that is the string every database written before this parser
+    existed holds and a round-trip has to keep reproducing.
+
+    The element type is None unless the field is an array. It is returned
+    because nothing else records it: the rendered text says an array held
+    integers but not whether they were int32 or uint32, and an export that
+    has to write the field back needs to know.
     """
     if gtype == GGUFValueType.STRING:
         (n,) = struct.unpack_from("<Q", buf, offs)
         offs += 8
-        return bytes(buf[offs:offs + n]).decode("utf-8", errors="replace"), offs + n
+        return bytes(buf[offs:offs + n]).decode("utf-8", errors="replace"), offs + n, None
 
     scalar = _GGUF_SCALARS.get(gtype)
     if scalar is not None:
         fmt, width, _ = scalar
         (value,) = struct.unpack_from(fmt, buf, offs)
-        return str(value), offs + width
+        return str(value), offs + width, None
 
     if gtype != GGUFValueType.ARRAY:
         raise ValueError(f"Unknown/unhandled field type {gtype}")
 
     raw_elem, count = struct.unpack_from("<IQ", buf, offs)
     offs += 12
-    # An empty array carries no element type to speak of, and the reader
-    # reports it as '[]' rather than guessing one.
-    if count == 0:
-        return "[]", offs
     elem = GGUFValueType(raw_elem)
+    # The reference reader reports an empty array as a bare '[]' of no
+    # element type, because it derives the type from the first element and
+    # there is none. The header does say, but reporting it here would make
+    # the two parsers disagree for no gain: an empty array is skipped on
+    # export, since the writer cannot encode one.
+    if count == 0:
+        return "[]", offs, None
 
     if elem == GGUFValueType.STRING:
         values = []
@@ -186,7 +232,7 @@ def _gguf_value(buf, offs: int, gtype: GGUFValueType) -> tuple[str, int]:
             offs += 8
             append(bytes(buf[offs:offs + n]).decode("utf-8", errors="replace"))
             offs += n
-        return "[" + ", ".join(map(repr, values)) + "]", offs
+        return "[" + ", ".join(map(repr, values)) + "]", offs, elem
 
     scalar = _GGUF_SCALARS.get(elem)
     if scalar is None:
@@ -199,7 +245,7 @@ def _gguf_value(buf, offs: int, gtype: GGUFValueType) -> tuple[str, int]:
     # Each element of a numeric array arrives from the reference reader as a
     # one-element numpy array, so its repr is '[v]' and the whole field reads
     # '[[1], [1], ...]'. Odd, and load-bearing: it is what is already stored.
-    return "[" + ", ".join(["[" + repr(v) + "]" for v in values]) + "]", offs
+    return "[" + ", ".join(["[" + repr(v) + "]" for v in values]) + "]", offs, elem
 
 
 def _parse_gguf_header(buf) -> tuple[list, list, int]:
@@ -240,7 +286,7 @@ def _parse_gguf_header(buf) -> tuple[list, list, int]:
         (raw_type,) = struct.unpack_from("<I", buf, offs)
         offs += 4
         gtype = GGUFValueType(raw_type)
-        text, offs = _gguf_value(buf, offs, gtype)
+        text, offs, elem = _gguf_value(buf, offs, gtype)
         if key in seen:
             raise KeyError(f"Duplicate {key} already in list")
         seen.add(key)
@@ -250,7 +296,7 @@ def _parse_gguf_header(buf) -> tuple[list, list, int]:
             alignment = int(text)
             if alignment == 0 or (alignment & (alignment - 1)) != 0:
                 raise ValueError("Invalid alignment: must be a non-zero power of two")
-        meta.append((key, text, META_TYPE_MAP.get(gtype, "unknown")))
+        meta.append((key, text, _meta_type_name(gtype, elem)))
 
     tensors = []
     names = set()
@@ -424,8 +470,9 @@ def _gguf_to_sqlite_via_reader(gguf_path, db_path: str, verbose: bool, t0: float
         meta_rows = []
         for key, field in reader.fields.items():
             main_type = field.types[0] if field.types else GGUFValueType.STRING
+            elem = field.types[1] if len(field.types) > 1 else None
             meta_rows.append((key, str(_extract_field_value(field)),
-                              META_TYPE_MAP.get(main_type, "unknown")))
+                              _meta_type_name(main_type, elem)))
         meta_rows += [
             ("reminis.source_format", "gguf", "string"),
             ("reminis.dtype_system", DTYPE_SYSTEM_GGUF, "string"),
@@ -643,5 +690,22 @@ def _write_meta_value(writer: GGUFWriter, key: str, value: str, type_name: str):
         writer.add_bool(key, value.lower() in ("true", "1"))
     elif type_name == "string":
         writer.add_string(key, value)
-    elif type_name == "array":
-        pass  # arrays are complex; skip for now to avoid corruption
+    elif type_name == "array" or type_name.startswith("array:"):
+        # Skipping these was silently dropping the tokenizer. Its vocabulary
+        # and merges are string arrays, so an exported file had correct
+        # weights and nothing to tokenize with, and llama.cpp refused it with
+        # "cannot find tokenizer merges in model file".
+        values = _meta_array_values(value)
+        if not values:
+            # The writer cannot encode an empty array -- it derives the
+            # element type from the first element. Nothing ships one.
+            return
+        sub_type = None
+        if ":" in type_name:
+            sub_type = META_NAME_TO_TYPE.get(type_name.split(":", 1)[1])
+        if sub_type is None:
+            # A database written before the element type was recorded. The
+            # values still say what they are, except that every whole number
+            # reads as int32.
+            sub_type = GGUFValueType.get_type(values[0])
+        writer.add_key_value(key, values, GGUFValueType.ARRAY, sub_type=sub_type)
