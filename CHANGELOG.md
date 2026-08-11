@@ -9,6 +9,19 @@ rather than compared against a number from earlier in the day.
 `bench.py` produces these figures; `tests/test_prerelease.py` is the gate every
 release below had to pass.
 
+## 0.32.1 -- README says what is now guaranteed
+
+The round-trip tables reported an exported file smaller than the one that went
+in -- 258.3 MB against 256.7 MB on SmolLM-135M f16 -- and that gap was the
+tokenizer going missing. The evidence was published in the README for the life
+of the project and nothing compared the two columns. Regenerated: they match
+exactly now, and the wording says the guarantee covers metadata rather than
+only weights.
+
+Closes the last item of #11. The safetensors export path was checked for the
+same fault and does not have it: it stores config values as JSON rather than a
+Python repr, so lists and nested dicts survive untouched.
+
 ## 0.32.0 -- exported models keep their tokenizer
 
 `reminis export` dropped every array-typed metadata field, and had since

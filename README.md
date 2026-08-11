@@ -120,7 +120,9 @@ reminis export model.db -o model_restored.gguf
 
 ### Architectures
 
-Every tensor is SHA256-hashed before and after the round-trip. These architectures are confirmed lossless:
+Every tensor is SHA256-hashed before and after the round-trip, and every metadata field is compared
+alongside it, so "lossless" means the whole file rather than only its weights. These architectures
+are confirmed lossless:
 
 | Architecture | Model | Tensors | Size | Convert | Export | Result |
 |---|---|---|---|---|---|---|
@@ -550,26 +552,34 @@ Note that `reminis export` currently drops array-valued metadata, so an exported
 
 ### Quantization coverage
 
-SHA256-verified lossless round-trip across 9 SmolLM-135M variants covering 13 quantization types:
+SHA256-verified lossless round-trip across 9 SmolLM-135M variants covering 13 quantization types.
+`GGUF MB` and `RT MB` match exactly: the exported file is byte-identical to the one that went in,
+metadata and tokenizer included.
 
 ```
 Model                               Dtypes                Tensors  GGUF MB    DB MB    RT MB  Conv(s)   Exp(s)   Result
 ---------------------------------------------------------------------------------------------------------------------------------------
-SmolLM-135M.IQ3_M                   F32,IQ3_S,IQ4_NL,Q4_K       272     86.0     86.1     84.3     1.73     0.05     PASS
-SmolLM-135M.IQ4_XS                  F32,IQ4_NL,IQ4_XS,Q5_K      272     87.1     87.1     85.4     1.81     0.06     PASS
-SmolLM-135M.Q2_K                    F32,IQ4_NL,Q3_K,Q8_0         272     84.1     84.2     82.4     1.64     0.05     PASS
-SmolLM-135M.Q3_K_M                  F32,IQ4_NL,Q4_K,Q5_0         272     89.2     89.3     87.5     1.67     0.06     PASS
-SmolLM-135M.Q4_K_M                  F32,Q4_K,Q5_0,Q6_K,Q8_0      272    100.6    100.7     98.9     1.71     0.05     PASS
-SmolLM-135M.Q5_K_M                  F32,Q5_1,Q5_K,Q6_K,Q8_0      272    106.9    106.9    105.2     1.83     0.07     PASS
-SmolLM-135M.Q6_K                    F32,Q6_K,Q8_0                 272    132.0    132.0    130.3     1.84     0.07     PASS
-SmolLM-135M.Q8_0                    F32,Q8_0                      272    138.1    138.2    136.4     1.92     0.08     PASS
-SmolLM-135M.f16                     F16,F32                       272    258.3    258.4    256.7     2.39     0.14     PASS
+SmolLM-135M.IQ3_M                   F32,IQ3_S,IQ4_NL,Q4_K,Q5_0,Q8_0      272     86.0     89.2     86.0     0.05     0.24     PASS
+SmolLM-135M.IQ4_XS                  F32,IQ4_NL,IQ4_XS,Q5_K,Q8_0      272     87.1     89.2     87.1     0.05     0.24     PASS
+SmolLM-135M.Q2_K                    F32,IQ4_NL,Q3_K,Q8_0      272     84.1     86.9     84.1     0.05     0.22     PASS
+SmolLM-135M.Q3_K_M                  F32,IQ4_NL,Q4_K,Q5_0,Q5_1,Q5_K,Q8_0      272     89.2     92.7     89.2     0.05     0.23     PASS
+SmolLM-135M.Q4_K_M                  F32,Q4_K,Q5_0,Q6_K,Q8_0      272    100.6    101.7    100.6     0.05     0.22     PASS
+SmolLM-135M.Q5_K_M                  F32,Q5_1,Q5_K,Q6_K,Q8_0      272    106.9    108.8    106.9     0.06     0.24     PASS
+SmolLM-135M.Q6_K                    F32,Q6_K,Q8_0             272    132.0    133.8    132.0     0.06     0.23     PASS
+SmolLM-135M.Q8_0                    F32,Q8_0                  272    138.1    141.2    138.1     0.06     0.22     PASS
+SmolLM-135M.f16                     F16,F32                   272    258.3    260.3    258.3     0.11     0.25     PASS
 ---------------------------------------------------------------------------------------------------------------------------------------
 9/9 models passed SHA256-verified lossless round-trip
 ALL TESTS PASSED - every tensor in every model matches byte-for-byte
 ```
 
-Every tensor in every model was hashed with SHA256 before and after the round-trip. Zero data loss.
+Every tensor in every model was hashed with SHA256 before and after the round-trip, and every
+metadata field checked with it. Zero data loss.
+
+Tensors alone were the guarantee until 0.32.0, and they were not enough: export dropped every
+array-valued metadata field, which for a llama-family model is the tokenizer. Weights matched,
+and llama.cpp would not load the result. The size columns showed it the whole time -- exported
+files came out about 1.7 MB short -- and nothing was comparing them.
 
 ### Choosing a precision by measuring, not by folklore
 
