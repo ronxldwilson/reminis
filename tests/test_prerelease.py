@@ -412,6 +412,65 @@ def test_inference():
 
 # ── 11. Threaded weights hash consistency ────────────────────────────────
 
+def test_quantize_chunking():
+    """Splitting a tensor across threads must change nothing about the bytes."""
+    section("Chunked quantization")
+    import reminis.quantize as quantize
+
+    rng = np.random.default_rng(11)
+    block = quantize.BLOCK
+    n = quantize.PARALLEL_MIN_BLOCKS + 777  # enough to span several chunks
+
+    cases = {
+        "normal": rng.normal(0, 0.02, block * n).astype(np.float32),
+        "all negative": -np.abs(rng.normal(0, 1, block * n)).astype(np.float32),
+        "with zero blocks": np.concatenate([
+            np.zeros(block * 64, dtype=np.float32),
+            rng.normal(0, 1, block * (n - 64)).astype(np.float32),
+        ]),
+    }
+
+    from concurrent.futures import ThreadPoolExecutor
+    pool = ThreadPoolExecutor(max_workers=4)
+    try:
+        for label, arr in cases.items():
+            for name, fn in (("Q8_0", quantize.quantize_q8_0),
+                             ("Q4_0", quantize.quantize_q4_0)):
+                chunked = quantize._quantize_chunked(arr, fn, pool)
+                check(chunked == fn(arr),
+                      f"{name}, {label}: chunked output matches one pass")
+    finally:
+        pool.shutdown()
+
+    # And end to end, through the real model path.
+    if SMALL_DB.exists():
+        with tempfile.TemporaryDirectory() as tmp:
+            parallel = str(Path(tmp) / "par.db")
+            quantize.quantize_model(str(SMALL_DB), parallel, bits=4, verbose=False)
+
+            saved = quantize.PARALLEL_MIN_BLOCKS
+            quantize.PARALLEL_MIN_BLOCKS = 1 << 62  # force the serial path
+            try:
+                serial = str(Path(tmp) / "ser.db")
+                quantize.quantize_model(str(SMALL_DB), serial, bits=4, verbose=False)
+            finally:
+                quantize.PARALLEL_MIN_BLOCKS = saved
+
+            import hashlib
+
+            def digest(db):
+                c = sqlite3.connect(db)
+                out = {
+                    n: hashlib.sha256(d).hexdigest()
+                    for n, d in c.execute("SELECT name, data FROM tensors")
+                }
+                c.close()
+                return out
+
+            check(digest(parallel) == digest(serial),
+                  "quantize_model: threaded and serial write the same tensors")
+
+
 def test_gguf_fast_parser():
     """The fast header parser must agree with the reference reader exactly."""
     section("Fast GGUF header parser")
@@ -530,6 +589,7 @@ ALL_TESTS = [
     test_registry,
     test_lowrank,
     test_inference,
+    test_quantize_chunking,
     test_gguf_fast_parser,
     test_convert_fallback,
     test_threaded_hash,

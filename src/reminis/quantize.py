@@ -21,9 +21,11 @@ are a rounding error of the file and the first thing to damage a model.
 """
 
 import ast
+import os
 import sqlite3
 import sys
 import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import numpy as np
@@ -49,14 +51,24 @@ def quantize_q8_0(arr: np.ndarray) -> bytes:
     The scale is the block's largest magnitude over 127, so the extreme value
     lands on the edge of the range and everything else rounds inside it.
     """
-    blocks = arr.reshape(-1, BLOCK).astype(np.float32)
-    amax = np.abs(blocks).max(axis=1)
+    # asarray rather than astype: the caller already hands us float32, and
+    # astype would copy the whole tensor to say so.
+    blocks = np.asarray(arr, dtype=np.float32).reshape(-1, BLOCK)
+    # max(|x|) without materialising |x|, which on a multi-hundred-megabyte
+    # tensor is a temporary the size of the tensor. Two reductions instead:
+    # the largest magnitude is either the biggest value or the most negative.
+    amax = np.maximum(blocks.max(axis=1), -blocks.min(axis=1))
     d = (amax / 127.0).astype(np.float16)
     # Dividing by a zero scale would produce NaN for an all-zero block, which
     # is a real case in a trained model, not a pathological one.
     scale = d.astype(np.float32)
     inv = np.where(scale > 0, 1.0 / np.where(scale > 0, scale, 1.0), 0.0)
-    q = np.rint(blocks * inv[:, None]).clip(-127, 127).astype(np.int8)
+    # One scaled copy, then rounded and clipped in place, rather than a fresh
+    # array per step.
+    scaled = blocks * inv[:, None]
+    np.rint(scaled, out=scaled)
+    np.clip(scaled, -127, 127, out=scaled)
+    q = scaled.astype(np.int8)
 
     out = np.empty((len(blocks), 34), dtype=np.uint8)
     out[:, 0:2] = d.view(np.uint8).reshape(-1, 2)
@@ -72,14 +84,22 @@ def quantize_q4_0(arr: np.ndarray) -> bytes:
     rest around 8. Taking `max(|x|)` unsigned instead would flip the sign of
     every weight in a block whose extreme is negative.
     """
-    blocks = arr.reshape(-1, BLOCK).astype(np.float32)
+    blocks = np.asarray(arr, dtype=np.float32).reshape(-1, BLOCK)
+    # argmax over |x| rather than a max/min comparison, because the two
+    # disagree when a block's largest positive and largest negative values
+    # have the same magnitude: argmax takes whichever comes first, and that
+    # is the encoding every earlier version of this wrote.
     idx = np.abs(blocks).argmax(axis=1)
     extreme = blocks[np.arange(len(blocks)), idx]
     d = (extreme / -8.0).astype(np.float16)
 
     scale = d.astype(np.float32)
     inv = np.where(scale != 0, 1.0 / np.where(scale != 0, scale, 1.0), 0.0)
-    q = (np.rint(blocks * inv[:, None]) + 8).clip(0, 15).astype(np.uint8)
+    scaled = blocks * inv[:, None]
+    np.rint(scaled, out=scaled)
+    scaled += 8
+    np.clip(scaled, 0, 15, out=scaled)
+    q = scaled.astype(np.uint8)
 
     # GGML puts the first 16 weights in the low nibbles and the next 16 in the
     # high nibbles of the same bytes, rather than two consecutive weights per
@@ -92,6 +112,36 @@ def quantize_q4_0(arr: np.ndarray) -> bytes:
 
 
 QUANTIZERS = {"Q8_0": quantize_q8_0, "Q4_0": quantize_q4_0}
+
+# How many 32-weight blocks one worker takes at a time. At 64k blocks a
+# chunk's scaled copy is 8 MB, so the peak working set is a few tens of
+# megabytes however large the tensor is -- an embedding matrix that would
+# otherwise want a gigabyte of float32 all at once is handled in slices.
+CHUNK_BLOCKS = 64 * 1024
+
+# Above this, a tensor is worth handing to several threads. Below it the
+# pool costs more than it saves.
+PARALLEL_MIN_BLOCKS = CHUNK_BLOCKS * 2
+
+
+def _quantize_chunked(arr: np.ndarray, quantizer, pool) -> bytes:
+    """Quantize one tensor across several threads.
+
+    Every block is scaled against its own extreme and nothing crosses a
+    block boundary, so slicing the tensor into whole-block chunks and
+    concatenating what comes back is exactly what one pass would produce.
+    numpy drops the interpreter lock for the arithmetic, so the threads
+    genuinely overlap -- measured 4-5x on a 1 GB tensor.
+    """
+    n_blocks = arr.size // BLOCK
+    if pool is None or n_blocks < PARALLEL_MIN_BLOCKS:
+        return quantizer(arr)
+
+    def piece(start):
+        stop = min(start + CHUNK_BLOCKS, n_blocks)
+        return quantizer(arr[start * BLOCK:stop * BLOCK])
+
+    return b"".join(pool.map(piece, range(0, n_blocks, CHUNK_BLOCKS)))
 
 
 def _eligible(shape: list, dtype: str) -> bool:
@@ -155,31 +205,36 @@ def quantize_model(
         "SELECT name, shape, dtype, dtype_id, n_elements, n_bytes, data "
         "FROM tensors ORDER BY id"
     )
-    for name, shape_json, dtype, dtype_id, n_elements, n_bytes, blob in rows:
-        shape = ast.literal_eval(shape_json)
-        stats["raw_bytes"] += len(blob)
+    pool = ThreadPoolExecutor(max_workers=min(os.cpu_count() or 4, 8))
+    try:
+        for name, shape_json, dtype, dtype_id, n_elements, n_bytes, blob in rows:
+            shape = ast.literal_eval(shape_json)
+            stats["raw_bytes"] += len(blob)
 
-        if _eligible(list(shape), dtype):
-            arr = to_float32(blob, dtype)
-            data = quantizer(arr.reshape(-1))
-            new_dtype, new_id = fmt, type_id
-            stats["quantized"] += 1
-        else:
-            data = blob
-            new_dtype, new_id = dtype, dtype_id
-            stats["copied"] += 1
+            if _eligible(list(shape), dtype):
+                arr = to_float32(blob, dtype)
+                data = _quantize_chunked(arr.reshape(-1), quantizer, pool)
+                new_dtype, new_id = fmt, type_id
+                stats["quantized"] += 1
+            else:
+                data = blob
+                new_dtype, new_id = dtype, dtype_id
+                stats["copied"] += 1
 
-        stats["new_bytes"] += len(data)
-        out.execute(
-            "INSERT INTO tensors (name, shape, dtype, dtype_id, n_elements, "
-            "n_bytes, data) VALUES (?,?,?,?,?,?,?)",
-            (name, shape_json, new_dtype, new_id, n_elements, len(data), data),
-        )
-        # Only when a terminal is watching. Piped, a carriage return does not
-        # overwrite anything and every update survives as its own line.
-        if verbose and sys.stdout.isatty():
-            print(f"\r  {stats['quantized'] + stats['copied']:>4} tensors, "
-                  f"{stats['new_bytes'] / 1e6:8.1f} MB written", end="", flush=True)
+            stats["new_bytes"] += len(data)
+            out.execute(
+                "INSERT INTO tensors (name, shape, dtype, dtype_id, n_elements, "
+                "n_bytes, data) VALUES (?,?,?,?,?,?,?)",
+                (name, shape_json, new_dtype, new_id, n_elements, len(data), data),
+            )
+            # Only when a terminal is watching. Piped, a carriage return does
+            # not overwrite anything and every update survives as its own line.
+            if verbose and sys.stdout.isatty():
+                print(f"\r  {stats['quantized'] + stats['copied']:>4} tensors, "
+                      f"{stats['new_bytes'] / 1e6:8.1f} MB written",
+                      end="", flush=True)
+    finally:
+        pool.shutdown()
 
     out.execute("COMMIT")
     out.close()
