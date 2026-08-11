@@ -107,6 +107,28 @@ def bench_diff(db_path):
                f"{summary['shared']} tensors, all identical")
 
 
+def bench_diff_changed(db_path):
+    """The workload that matters: a target where most tensors really moved.
+
+    diff_identical exercises the early-out path only, so on its own it would
+    happily report progress on a case nobody runs.
+    """
+    from reminis.diff import diff_models
+    from reminis.quantize import quantize_model
+
+    with tempfile.TemporaryDirectory(prefix="reminis-bench-") as tmp:
+        target = os.path.join(tmp, "q8.db")
+        quantize_model(str(db_path), target, bits=8, verbose=False)
+
+        out = os.path.join(tmp, "delta.db")
+        t0 = time.perf_counter()
+        summary = diff_models(str(db_path), target, out, verbose=False)
+        elapsed = time.perf_counter() - t0
+        record("diff_changed", elapsed, "s",
+               f"{summary['changed']} changed, pack "
+               f"{summary['delta_stored_bytes']/1e6:.0f} MB")
+
+
 # ── 6. Apply delta ───────────────────────────────────────────────────────
 
 def bench_apply_delta(db_path):
@@ -261,6 +283,7 @@ ALL_BENCHMARKS = {
     "quantize":          lambda db, gguf: bench_quantize(db),
     "dequantize":        lambda db, gguf: bench_dequantize(db),
     "diff":              lambda db, gguf: bench_diff(db),
+    "diff_changed":      lambda db, gguf: bench_diff_changed(db),
     "apply_delta":       lambda db, gguf: bench_apply_delta(db),
     "prefill":           lambda db, gguf: bench_prefill(db),
     "decode":            lambda db, gguf: bench_decode(db),

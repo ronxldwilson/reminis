@@ -271,6 +271,44 @@ def _weights_hash(conn: sqlite3.Connection) -> str:
     return h.hexdigest()
 
 
+class _BackgroundHash:
+    """A sha256 fed from another thread, so hashing overlaps producing the bytes.
+
+    hashlib drops the interpreter lock for updates of any size worth
+    threading, so a caller that is busy reading and comparing blobs can hand
+    them here and keep going.
+
+    The queue is bounded on purpose: the things being hashed are whole
+    tensors, and an unbounded one would happily hold the entire model in
+    memory while the hasher fell behind.
+    """
+
+    __slots__ = ("_queue", "_digest", "_thread")
+
+    def __init__(self, depth: int = 4):
+        from queue import Queue
+
+        self._queue = Queue(maxsize=depth)
+        self._digest = hashlib.sha256()
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+
+    def _run(self):
+        while True:
+            chunk = self._queue.get()
+            if chunk is None:
+                return
+            self._digest.update(chunk)
+
+    def update(self, data):
+        self._queue.put(data)
+
+    def hexdigest(self) -> str:
+        self._queue.put(None)
+        self._thread.join()
+        return self._digest.hexdigest()
+
+
 def _weights_hash_threaded(db_path: str) -> str:
     """Hash weight data with I/O on a background thread.
 
@@ -555,6 +593,24 @@ def diff_models(
     lowrank_count = 0
     worst_rel_error = 0.0
 
+    # A pack records the hash of both models' weights. Computing those with
+    # _weights_hash means reading each model a second time, after this loop
+    # has already held every byte of both -- on a 2.5 GB model that is 5 GB
+    # of reading to learn something the loop could have accumulated for
+    # free.
+    #
+    # It is only free when the two models hold the same tensors: the hash is
+    # defined over every tensor in name order, and this loop walks the
+    # intersection. When one side has a tensor the other lacks, the orders
+    # part company and the hashes are computed separately below.
+    # Each hash runs on its own thread, so the two overlap each other and
+    # the reading and comparing here. Hashing 5 GB is a second or two of
+    # pure sha256 whichever way it is arranged; this is what stops that
+    # being a second or two nothing else is happening.
+    hashing_inline = bool(output_path) and not only_in_a and not only_in_b
+    hash_a = _BackgroundHash() if hashing_inline else None
+    hash_b = _BackgroundHash() if hashing_inline else None
+
     for name in shared:
         row_a = conn_a.execute(
             "SELECT shape, dtype, dtype_id, n_elements, data FROM tensors WHERE name = ?", (name,)
@@ -565,6 +621,10 @@ def diff_models(
 
         shape_a, dtype_a, dtype_id_a, n_elements_a, blob_a = row_a
         shape_b, dtype_b, dtype_id_b, n_elements_b, blob_b = row_b
+
+        if hash_a is not None:
+            hash_a.update(blob_a)
+            hash_b.update(blob_b)
 
         if dtype_a != dtype_b or shape_a != shape_b:
             stats = {"identical": False, "numeric": False, "incompatible": True}
@@ -619,18 +679,32 @@ def diff_models(
             total_stored_bytes += len(payload)
             out_conn.execute(
                 "INSERT INTO deltas (tensor_name, shape, dtype, dtype_id, n_elements, "
-                "encoding, raw_bytes, stored_bytes, data) VALUES (?,?,?,?,?,?,?,?)",
+                "encoding, raw_bytes, stored_bytes, data) VALUES (?,?,?,?,?,?,?,?,?)",
                 (name, shape, dtype, dtype_id, n_elements, "replace_zstd", len(blob), len(payload), payload),
             )
 
     total_b_bytes = conn_b.execute("SELECT SUM(n_bytes) FROM tensors").fetchone()[0] or 0
 
     if out_conn is not None:
+        if hash_a is not None:
+            base_weights_hash = hash_a.hexdigest()
+            target_weights_hash = hash_b.hexdigest()
+        else:
+            # The tensor sets differ, so the loop above could not accumulate
+            # these in the right order. They are independent of each other,
+            # so read the two models at once rather than one after the other.
+            from concurrent.futures import ThreadPoolExecutor
+            with ThreadPoolExecutor(max_workers=2) as pool:
+                fut_a = pool.submit(_weights_hash_threaded, str(path_a))
+                fut_b = pool.submit(_weights_hash_threaded, str(path_b))
+                base_weights_hash = fut_a.result()
+                target_weights_hash = fut_b.result()
+
         meta = {
             "base_fingerprint": fp_a,
             "target_fingerprint": fp_b,
-            "base_weights_hash": _weights_hash(conn_a),
-            "target_weights_hash": _weights_hash(conn_b),
+            "base_weights_hash": base_weights_hash,
+            "target_weights_hash": target_weights_hash,
             "base_file": path_a.name,
             "target_file": path_b.name,
             "tensors_changed": str(len(changed)),

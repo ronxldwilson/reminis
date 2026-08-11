@@ -412,6 +412,86 @@ def test_inference():
 
 # ── 11. Threaded weights hash consistency ────────────────────────────────
 
+def test_diff_tensor_set_changes():
+    """A pack must record the same hashes however the tensor sets line up.
+
+    diff accumulates both weight hashes as it walks the shared tensors,
+    which is only equivalent to hashing each model separately when neither
+    side has a tensor the other lacks. Both arrangements are checked here,
+    against _weights_hash itself.
+
+    The added-tensor case also covers a bug that shipped through 0.28.0:
+    the insert for a target-only tensor named nine columns and bound eight,
+    so any diff that added a tensor raised OperationalError.
+    """
+    section("Diff across changing tensor sets")
+    if not SMALL_DB.exists():
+        skip(f"{SMALL_DB.name} not present")
+        return
+
+    from reminis.diff import _weights_hash, apply_delta, diff_models
+
+    def truth(db):
+        c = sqlite3.connect(db)
+        h = _weights_hash(c)
+        c.close()
+        return h
+
+    def pack_meta(p):
+        c = sqlite3.connect(p)
+        m = dict(c.execute("SELECT key, value FROM delta_meta"))
+        c.close()
+        return m
+
+    for label, mutate in (
+        ("same tensor set", None),
+        ("target adds and drops a tensor", "reshape"),
+    ):
+        with tempfile.TemporaryDirectory() as tmp:
+            target = str(Path(tmp) / "target.db")
+            shutil.copyfile(SMALL_DB, target)
+
+            conn = sqlite3.connect(target)
+            name = conn.execute(
+                "SELECT name FROM tensors WHERE dtype = 'F16' LIMIT 1"
+            ).fetchone()[0]
+            blob = conn.execute(
+                "SELECT data FROM tensors WHERE name = ?", (name,)
+            ).fetchone()[0]
+            arr = np.frombuffer(blob, dtype=np.float16).copy()
+            arr[:64] += np.float16(0.01)
+            conn.execute("UPDATE tensors SET data = ? WHERE name = ?",
+                         (arr.tobytes(), name))
+            if mutate == "reshape":
+                victim = conn.execute(
+                    "SELECT name FROM tensors WHERE dtype = 'F16' AND name != ? "
+                    "LIMIT 1", (name,)
+                ).fetchone()[0]
+                conn.execute("DELETE FROM tensors WHERE name = ?", (victim,))
+                added = np.ones(64, dtype=np.float16)
+                conn.execute(
+                    "INSERT INTO tensors (name, shape, dtype, dtype_id, "
+                    "n_elements, n_bytes, data) VALUES (?,?,?,?,?,?,?)",
+                    ("brand.new.weight", "[64]", "F16", 1, 64,
+                     added.nbytes, added.tobytes()),
+                )
+            conn.commit()
+            conn.close()
+
+            pack = str(Path(tmp) / "pack.db")
+            diff_models(str(SMALL_DB), target, pack, verbose=False)
+            meta = pack_meta(pack)
+            check(meta["base_weights_hash"] == truth(str(SMALL_DB)),
+                  f"{label}: base hash matches _weights_hash")
+            check(meta["target_weights_hash"] == truth(target),
+                  f"{label}: target hash matches _weights_hash")
+
+            result = str(Path(tmp) / "result.db")
+            apply_delta(str(SMALL_DB), pack, result, verify=True, verbose=False)
+            check(truth(result) == truth(target),
+                  f"{label}: pack rebuilds the target exactly")
+
+
 def test_quantize_chunking():
     """Splitting a tensor across threads must change nothing about the bytes."""
     section("Chunked quantization")
@@ -589,6 +669,7 @@ ALL_TESTS = [
     test_registry,
     test_lowrank,
     test_inference,
+    test_diff_tensor_set_changes,
     test_quantize_chunking,
     test_gguf_fast_parser,
     test_convert_fallback,
