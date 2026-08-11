@@ -579,11 +579,15 @@ def diff_models(
 
     out_conn = None
     if output_path:
+        # A pack is a file that did not exist a line ago, so it is written
+        # the way every other fresh database here is: one transaction, no
+        # journal to roll back to a state that was never wanted.
+        from reminis.converter import open_for_bulk_write
+
         Path(output_path).unlink(missing_ok=True)
-        out_conn = sqlite3.connect(output_path)
-        out_conn.execute("PRAGMA journal_mode=WAL")
-        out_conn.execute("PRAGMA synchronous=NORMAL")
+        out_conn = open_for_bulk_write(output_path)
         out_conn.executescript(DELTA_SCHEMA)
+        out_conn.execute("BEGIN")
 
     changed = []
     identical_count = 0
@@ -715,7 +719,7 @@ def diff_models(
             "max_rel_error": repr(worst_rel_error),
             "reminis_version": _version(),
         }
-        out_conn.commit()
+        out_conn.execute("COMMIT")
 
         # A lossy pack cannot reproduce the target byte for byte, but its
         # reconstruction is deterministic -- so record the hash of what apply
@@ -728,9 +732,10 @@ def diff_models(
             else meta["target_weights_hash"]
         )
 
+        out_conn.execute("BEGIN")
         for k, v in meta.items():
             out_conn.execute("INSERT OR REPLACE INTO delta_meta (key, value) VALUES (?,?)", (k, v))
-        out_conn.commit()
+        out_conn.execute("COMMIT")
         out_conn.close()
 
     conn_a.close()
