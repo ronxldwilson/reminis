@@ -40,3 +40,8 @@ Thumbs.db
 # Benchmark corpora, downloaded on demand. The URL lives in issue #14; the
 # repo does not carry the data, for the same reason it does not carry models.
 eval-data/
+
+# Benchmark result snapshots. Machine- and cache-specific, and regenerated
+# by `python bench.py --json <file>`; the numbers that matter live in
+# CHANGELOG.md.
+bench_*.json

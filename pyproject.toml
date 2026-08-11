@@ -1,6 +1,6 @@
 [project]
 name = "reminis"
-version = "0.31.0"
+version = "0.31.1"
 description = "Store LLM weights in a SQLite database. Convert GGUF and safetensors losslessly, query, diff, and package fine-tunes as delta packs."
 readme = "README.md"
 requires-python = ">=3.10"
@@ -56,6 +56,7 @@ reminis = "reminis.cli:main"
 [project.urls]
 Homepage = "https://github.com/ronxldwilson/reminis"
 Repository = "https://github.com/ronxldwilson/reminis"
+Changelog = "https://github.com/ronxldwilson/reminis/blob/main/CHANGELOG.md"
 
 [build-system]
 requires = ["hatchling"]
