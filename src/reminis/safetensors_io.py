@@ -151,7 +151,7 @@ def safetensors_to_sqlite(
     if verbose:
         print(f"Reading {src} ({len(shards)} shard{'s' if len(shards) != 1 else ''}) ...")
 
-    from reminis.converter import open_for_bulk_write
+    from reminis.db import INSERT_OR_REPLACE_TENSOR, open_for_bulk_write
 
     t0 = time.time()
     Path(db_path).unlink(missing_ok=True)
@@ -225,8 +225,7 @@ def safetensors_to_sqlite(
                     )
 
                 conn.execute(
-                    "INSERT OR REPLACE INTO tensors (name, shape, dtype, dtype_id, "
-                    "n_elements, n_bytes, data) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    INSERT_OR_REPLACE_TENSOR,
                     (
                         name,
                         json.dumps(logical_shape[::-1]),

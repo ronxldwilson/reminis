@@ -22,7 +22,6 @@ are a rounding error of the file and the first thing to damage a model.
 
 import ast
 import os
-import sqlite3
 import sys
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -32,6 +31,7 @@ import numpy as np
 
 from gguf.constants import GGMLQuantizationType
 
+from reminis.db import INSERT_TENSOR, open_read_only
 from reminis.dtypes import is_float_dtype, to_float32
 
 BLOCK = 32
@@ -186,7 +186,7 @@ def quantize_model(
         raise ValueError("Refusing to quantize a database over itself; "
                          "pass a different -o/--output.")
 
-    src = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+    src = open_read_only(db_path)
     Path(output_path).unlink(missing_ok=True)
     from reminis.converter import SCHEMA, open_for_bulk_write
     out = open_for_bulk_write(output_path)
@@ -223,8 +223,7 @@ def quantize_model(
 
             stats["new_bytes"] += len(data)
             out.execute(
-                "INSERT INTO tensors (name, shape, dtype, dtype_id, n_elements, "
-                "n_bytes, data) VALUES (?,?,?,?,?,?,?)",
+                INSERT_TENSOR,
                 (name, shape_json, new_dtype, new_id, n_elements, len(data), data),
             )
             # Only when a terminal is watching. Piped, a carriage return does

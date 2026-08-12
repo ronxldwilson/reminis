@@ -19,6 +19,7 @@ import zstandard
 
 from gguf.constants import GGMLQuantizationType
 
+from reminis.db import UPSERT_TENSOR, open_for_bulk_copy, open_read_only
 from reminis.dtypes import from_float32, is_float_dtype, to_float32
 
 # zstd level 1 measured at 547 MB/s on XOR delta data, versus 4 MB/s for zlib
@@ -333,7 +334,7 @@ def _weights_hash_threaded(db_path: str) -> str:
     q = Queue(maxsize=8)
 
     def _reader():
-        c = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+        c = open_read_only(db_path)
         for (blob,) in c.execute("SELECT data FROM tensors ORDER BY name"):
             q.put(blob)
         c.close()
@@ -1024,9 +1025,7 @@ def apply_delta(
     # inherited from the base file and cannot be set on a populated
     # database, so a base converted by 0.27.0 or later writes faster here
     # for free.
-    out_conn = sqlite3.connect(output_db, isolation_level=None)
-    out_conn.execute("PRAGMA journal_mode=OFF")
-    out_conn.execute("PRAGMA synchronous=OFF")
+    out_conn = open_for_bulk_copy(output_db)
 
     # Drop tensors the target no longer has.
     removed = json.loads(meta.get("tensors_removed", "[]"))
@@ -1042,7 +1041,7 @@ def apply_delta(
     # Decompression (zstd) and XOR (numpy) both release the GIL, so worker
     # threads get real parallelism. Read base blobs from the original file
     # to avoid contention with the output connection.
-    base_conn = sqlite3.connect(f"file:{base_db}?mode=ro", uri=True)
+    base_conn = open_read_only(base_db)
     base_blobs = {}
     for name, _shape, _dtype, _dtype_id, _n_elements, encoding, _payload in rows:
         if encoding.startswith("replace"):
@@ -1070,11 +1069,7 @@ def apply_delta(
     for i, (name, shape, dtype, dtype_id, n_elements, _encoding, _payload) in enumerate(rows):
         new_blob = decoded[i]
         out_conn.execute(
-            "INSERT INTO tensors (name, shape, dtype, dtype_id, n_elements, n_bytes, data) "
-            "VALUES (?,?,?,?,?,?,?) "
-            "ON CONFLICT(name) DO UPDATE SET shape=excluded.shape, dtype=excluded.dtype, "
-            "dtype_id=excluded.dtype_id, n_elements=excluded.n_elements, "
-            "n_bytes=excluded.n_bytes, data=excluded.data",
+            UPSERT_TENSOR,
             (name, shape, dtype, dtype_id, n_elements, len(new_blob), new_blob),
         )
     out_conn.execute("COMMIT")

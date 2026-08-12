@@ -32,33 +32,21 @@ from reminis.dtypes import DTYPE_SYSTEM_GGUF, DTYPE_SYSTEM_SAFETENSORS, dtype_sy
 # and rebuild. Turning the journal off and letting the OS schedule the writes
 # took the write phase of a 2.5 GB model from 13.9s to 0.8s.
 #
-# The page size is the one setting that outlives this connection -- it is
-# stamped into the file header -- so it was chosen by measuring reads as well
-# as writes. On a 2.5 GB model, 64 KB pages beat SQLite's 4 KB default on
-# every axis: 5.5x the write throughput, 3.6x sequential read, and 2.8x on
-# the small random byte-range reads the expert index does.
-BULK_WRITE_PRAGMAS = (
-    "PRAGMA page_size=65536",
-    "PRAGMA journal_mode=OFF",
-    "PRAGMA synchronous=OFF",
-    "PRAGMA cache_size=-256000",
+# These live in `db.py` now, alongside the settings for the other three ways
+# reminis opens a file. Re-exported because they were importable from here
+# for several releases.
+from reminis.db import (  # noqa: F401
+    BULK_WRITE_PRAGMAS,
+    INSERT_OR_REPLACE_TENSOR,
+    TENSOR_COLUMN_DDL,
+    open_for_bulk_write,
 )
 
 
-def open_for_bulk_write(db_path: str) -> sqlite3.Connection:
-    """A connection tuned for writing a whole model into a fresh file.
-
-    ``isolation_level=None`` hands transaction control to us, so the load
-    runs inside one explicit BEGIN/COMMIT rather than sqlite3's implicit
-    per-statement one.
-    """
-    conn = sqlite3.connect(db_path, isolation_level=None)
-    for pragma in BULK_WRITE_PRAGMAS:
-        conn.execute(pragma)
-    return conn
-
-
-SCHEMA = """
+# The tensor columns come from `db.py`, which the registry's own schema also
+# builds on. Only the uniqueness differs: one model per file here, so `name`
+# alone identifies a tensor.
+SCHEMA = f"""
 CREATE TABLE IF NOT EXISTS model_meta (
     key   TEXT PRIMARY KEY,
     value TEXT NOT NULL,
@@ -67,13 +55,8 @@ CREATE TABLE IF NOT EXISTS model_meta (
 
 CREATE TABLE IF NOT EXISTS tensors (
     id         INTEGER PRIMARY KEY AUTOINCREMENT,
-    name       TEXT UNIQUE NOT NULL,
-    shape      TEXT NOT NULL,
-    dtype      TEXT NOT NULL,
-    dtype_id   INTEGER NOT NULL,
-    n_elements INTEGER NOT NULL,
-    n_bytes    INTEGER NOT NULL,
-    data       BLOB NOT NULL
+{TENSOR_COLUMN_DDL},
+    UNIQUE (name)
 );
 
 CREATE INDEX IF NOT EXISTS idx_tensors_name ON tensors(name);
@@ -434,8 +417,7 @@ def gguf_to_sqlite(gguf_path: str, db_path: str | None = None, verbose: bool = T
 
                 try:
                     conn.executemany(
-                        "INSERT OR REPLACE INTO tensors (name, shape, dtype, dtype_id, "
-                        "n_elements, n_bytes, data) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                        INSERT_OR_REPLACE_TENSOR,
                         rows(),
                     )
                     conn.execute("COMMIT")
@@ -504,8 +486,7 @@ def _gguf_to_sqlite_via_reader(gguf_path, db_path: str, verbose: bool, t0: float
                        tensor.data.tobytes())
 
         conn.executemany(
-            "INSERT OR REPLACE INTO tensors (name, shape, dtype, dtype_id, "
-            "n_elements, n_bytes, data) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            INSERT_OR_REPLACE_TENSOR,
             rows(),
         )
         conn.execute("COMMIT")

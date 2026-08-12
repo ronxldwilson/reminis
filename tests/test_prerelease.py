@@ -149,6 +149,51 @@ def test_viewer():
         check(Path(html).exists(), "viewer generates HTML")
         check(Path(html).stat().st_size > 1000, "HTML is non-trivial")
 
+    test_viewer_stats_are_the_stored_values()
+
+
+def test_viewer_stats_are_the_stored_values():
+    """The numbers the viewer reports must be the numbers in the file.
+
+    Through 0.32.1 this decoded BF16 by reading its bytes as float16. The two
+    are both 16 bits, so nothing raised -- a stored 100.0 was reported as 3.39,
+    and every mean, min, max and heatmap cell of every BF16 model was wrong.
+    The check above passed throughout: it asserted the HTML existed.
+
+    Widening to float32 loses nothing for any of these dtypes, so the values
+    are asserted exactly rather than within a tolerance.
+    """
+    from reminis.dtypes import from_float32
+    from reminis.viewer import _compute_tensor_stats, _sample_heatmap
+
+    # Chosen so that misreading any one of these dtypes as another shifts the
+    # result well outside rounding: 100.0 read as float16 bits comes back 3.39.
+    values = np.array([1.5, -2.25, 100.0, 0.0], dtype=np.float32)
+
+    for dtype in ("F32", "F16", "BF16", "F64"):
+        blob = from_float32(values, dtype)
+        stats = _compute_tensor_stats(blob, dtype, len(values))
+
+        check("error" not in stats and "quantized" not in stats,
+              f"{dtype}: viewer decodes it as floats")
+        check(stats.get("min") == -2.25, f"{dtype}: min is -2.25, got {stats.get('min')}")
+        check(stats.get("max") == 100.0, f"{dtype}: max is 100.0, got {stats.get('max')}")
+        check(stats.get("mean") == 24.8125, f"{dtype}: mean is 24.8125, got {stats.get('mean')}")
+        check(stats.get("zeros_pct") == 25.0, f"{dtype}: one value in four is zero")
+        check(stats.get("n_elements") == 4, f"{dtype}: counts 4 elements")
+
+        # The heatmap decodes separately, so it needs its own assertion. It is
+        # normalised by the largest magnitude, which is the 100.0.
+        cells = _sample_heatmap(blob, dtype, [2, 2])
+        check(cells == [[0.015, -0.023], [1.0, 0.0]],
+              f"{dtype}: heatmap is the stored values, got {cells}")
+
+    # A quantized tensor still takes the shortcut rather than being decoded.
+    q = _compute_tensor_stats(b"\x00" * 34, "Q4_K", 256)
+    check(q.get("quantized") is True, "Q4_K reports as quantized, not as floats")
+    check(_sample_heatmap(b"\x00" * 34, "Q4_K", [16, 16]) is None,
+          "Q4_K draws no heatmap")
+
 
 # ── 4. GGUF round-trip (needs SmolLM GGUF) ──────────────────────────────
 
@@ -721,6 +766,67 @@ def test_convert_fallback():
         check(fast_tensors == slow_tensors, "fallback writes the same tensors")
 
 
+def test_tensor_sql_matches_the_schema():
+    """Every generated statement must agree with the table it writes to.
+
+    A delta pack insert named nine columns and bound eight for several
+    releases, failing only on the one path that added a tensor rather than
+    changing one. The statements are generated from `TENSOR_COLUMNS` now, so
+    the counts cannot drift -- but nothing yet checked that tuple against the
+    schema itself, which is the half that would still go wrong silently.
+    """
+    section("Tensor SQL agrees with the schema")
+    from reminis.converter import SCHEMA
+    from reminis.db import (
+        INSERT_OR_REPLACE_TENSOR,
+        INSERT_REGISTRY_TENSOR,
+        INSERT_TENSOR,
+        TENSOR_COLUMNS,
+        UPSERT_TENSOR,
+    )
+    from reminis.registry import REGISTRY_SCHEMA
+
+    statements = {
+        "INSERT_TENSOR": (INSERT_TENSOR, SCHEMA, len(TENSOR_COLUMNS)),
+        "INSERT_OR_REPLACE_TENSOR": (INSERT_OR_REPLACE_TENSOR, SCHEMA, len(TENSOR_COLUMNS)),
+        "UPSERT_TENSOR": (UPSERT_TENSOR, SCHEMA, len(TENSOR_COLUMNS)),
+        "INSERT_REGISTRY_TENSOR": (INSERT_REGISTRY_TENSOR, REGISTRY_SCHEMA,
+                                   len(TENSOR_COLUMNS) + 1),
+    }
+
+    for label, (sql, schema, expected) in statements.items():
+        check(sql.count("?") == expected,
+              f"{label} binds {expected} values")
+
+        # SQLite is the authority on whether the statement fits the table, so
+        # ask it rather than comparing strings: prepare against a real schema.
+        with tempfile.TemporaryDirectory() as tmp:
+            conn = sqlite3.connect(str(Path(tmp) / "s.db"))
+            conn.executescript(schema)
+            try:
+                conn.execute(sql, (None,) * expected)
+            except sqlite3.IntegrityError:
+                # NOT NULL rejects the dummy row, which means the statement
+                # itself parsed and bound cleanly. That is what is being
+                # checked here.
+                check(True, f"{label} matches its table")
+            except sqlite3.Error as e:
+                check(False, f"{label} matches its table -- {e}")
+            else:
+                check(False, f"{label}: NOT NULL should have rejected a null row")
+            conn.close()
+
+    # The column tuple must be the schema's tensor columns, in order. Anything
+    # added to one and not the other shows up here rather than at runtime.
+    with tempfile.TemporaryDirectory() as tmp:
+        conn = sqlite3.connect(str(Path(tmp) / "s.db"))
+        conn.executescript(SCHEMA)
+        cols = [r[1] for r in conn.execute("PRAGMA table_info(tensors)") if r[1] != "id"]
+        conn.close()
+    check(tuple(cols) == TENSOR_COLUMNS,
+          f"TENSOR_COLUMNS is the schema's column list ({cols})")
+
+
 def test_threaded_hash():
     section("Threaded weights hash")
     if not SMALL_DB.exists():
@@ -755,6 +861,7 @@ ALL_TESTS = [
     test_quantize_chunking,
     test_gguf_fast_parser,
     test_convert_fallback,
+    test_tensor_sql_matches_the_schema,
     test_threaded_hash,
 ]
 

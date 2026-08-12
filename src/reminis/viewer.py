@@ -8,16 +8,21 @@ from pathlib import Path
 
 import numpy as np
 
+from .dtypes import is_float_dtype, to_float32
+
 
 def _compute_tensor_stats(data_blob: bytes, dtype_name: str, n_elements: int) -> dict:
-    """Compute basic statistics for a tensor."""
+    """Compute basic statistics for a tensor.
+
+    Decoding goes through ``dtypes.to_float32`` rather than a local
+    ``np.frombuffer``: BF16 and F16 are both 16 bits, so reading one as the
+    other is not an error, it is silently wrong arithmetic. This function read
+    BF16 as float16 through 0.32.1 and reported 3.39 for a stored 100.0.
+    """
     try:
-        if dtype_name == "F32":
-            arr = np.frombuffer(data_blob, dtype=np.float32)
-        elif dtype_name in ("F16", "BF16"):
-            arr = np.frombuffer(data_blob, dtype=np.float16)
-        else:
+        if not is_float_dtype(dtype_name):
             return {"quantized": True, "n_bytes": len(data_blob)}
+        arr = to_float32(data_blob, dtype_name)
 
         return {
             "mean": float(np.mean(arr)),
@@ -35,12 +40,9 @@ def _compute_tensor_stats(data_blob: bytes, dtype_name: str, n_elements: int) ->
 def _sample_heatmap(data_blob: bytes, dtype_name: str, shape: list, size: int = 48) -> list | None:
     """Sample a 2D heatmap from tensor data."""
     try:
-        if dtype_name == "F32":
-            arr = np.frombuffer(data_blob, dtype=np.float32)
-        elif dtype_name in ("F16", "BF16"):
-            arr = np.frombuffer(data_blob, dtype=np.float16).astype(np.float32)
-        else:
+        if not is_float_dtype(dtype_name):
             return None
+        arr = to_float32(data_blob, dtype_name)
 
         if len(shape) < 2:
             return None

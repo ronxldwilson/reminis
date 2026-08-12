@@ -35,6 +35,8 @@ from pathlib import Path
 
 import numpy as np
 
+from reminis.db import INSERT_OR_REPLACE_TENSOR, open_for_append, open_for_bulk_write
+
 LOG_SCHEMA = """
 CREATE TABLE IF NOT EXISTS run_meta (
     key   TEXT PRIMARY KEY,
@@ -155,12 +157,9 @@ class TrainingLog:
     ):
         self.path = str(path)
         self.snapshot_dir = Path(snapshot_dir) if snapshot_dir else Path(self.path).parent
-        self.conn = sqlite3.connect(self.path)
-        # WAL plus a relaxed sync: this is a diagnostic log written inside a
-        # training loop, and the default fsync-per-commit cost would show up
-        # directly in step time.
-        self.conn.execute("PRAGMA journal_mode=WAL")
-        self.conn.execute("PRAGMA synchronous=NORMAL")
+        # A diagnostic log written from inside a training loop: the default
+        # fsync-per-commit would land directly in step time.
+        self.conn = open_for_append(self.path)
         self.conn.executescript(LOG_SCHEMA)
 
         self._prev_norms: dict[str, float] = {}
@@ -440,10 +439,9 @@ def state_dict_to_sqlite(state_dict: dict, db_path: str) -> str:
     }
 
     Path(db_path).unlink(missing_ok=True)
-    conn = sqlite3.connect(db_path)
-    conn.execute("PRAGMA journal_mode=WAL")
-    conn.execute("PRAGMA synchronous=NORMAL")
+    conn = open_for_bulk_write(db_path)
     conn.executescript(SCHEMA)
+    conn.execute("BEGIN")
 
     for name, tensor in state_dict.items():
         if str(getattr(tensor, "dtype", "")) == "torch.bfloat16":
@@ -472,8 +470,7 @@ def state_dict_to_sqlite(state_dict: dict, db_path: str) -> str:
             n_elements = int(arr.size)
 
         conn.execute(
-            "INSERT OR REPLACE INTO tensors (name, shape, dtype, dtype_id, "
-            "n_elements, n_bytes, data) VALUES (?,?,?,?,?,?,?)",
+            INSERT_OR_REPLACE_TENSOR,
             (name, json.dumps(shape[::-1]), dtype_name,
              SAFETENSORS_DTYPE_IDS[dtype_name], n_elements, len(blob), blob),
         )

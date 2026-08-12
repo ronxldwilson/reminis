@@ -41,6 +41,7 @@ from pathlib import Path
 
 import numpy as np
 
+from reminis.db import open_for_bulk_copy
 from reminis.backend import select as select_backend
 from reminis.dtypes import is_float_dtype, to_float32, from_float32
 
@@ -151,9 +152,7 @@ def merge_models(
     # along), and every input is attached beside it.
     Path(output_path).unlink(missing_ok=True)
     shutil.copyfile(paths[0], output_path)
-    conn = sqlite3.connect(output_path)
-    conn.execute("PRAGMA journal_mode=WAL")
-    conn.execute("PRAGMA synchronous=NORMAL")
+    conn = open_for_bulk_copy(output_path)
 
     aliases = []
     try:
@@ -175,6 +174,11 @@ def merge_models(
             Path(output_path).unlink(missing_ok=True)
             raise ValueError(_blocked_message(plan))
 
+        # One transaction around the writes. The connection is in autocommit
+        # so that ATTACH above is legal, which means without this every tensor
+        # would commit on its own. Opened after the attaches for the same
+        # reason: a database cannot be attached inside a transaction.
+        conn.execute("BEGIN")
         summary = _apply_merge(
             conn, aliases, plan["mergeable"], method, weights,
             use_base=bool(base), density=density, t=t, scale=scale,
@@ -183,6 +187,13 @@ def merge_models(
 
         _record_provenance(conn, paths, base, method, weights, density, t, scale)
         conn.commit()
+    except BaseException:
+        # There is no journal to roll back, so a half-written merge would
+        # otherwise be left on disk looking like a finished one. The output is
+        # derived and reproducible; the inputs are untouched.
+        conn.close()
+        Path(output_path).unlink(missing_ok=True)
+        raise
     finally:
         for alias in list(aliases) + (["base"] if base else []):
             try:

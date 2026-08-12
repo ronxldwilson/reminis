@@ -26,11 +26,11 @@ generated text, because sampling makes two runs diverge for reasons that have
 nothing to do with precision.
 """
 
-import sqlite3
 import time
 
 import numpy as np
 
+from reminis.db import open_read_only
 from reminis.backend import select as select_backend
 from reminis.infer import KVCache, Model, UnsupportedModel
 
@@ -60,7 +60,7 @@ def _predicted_bytes(db_path: str, bits) -> int:
     on the way to the backend. Group scales add about two bits per weight at
     the default group size, which is included.
     """
-    conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+    conn = open_read_only(db_path)
     try:
         total = conn.execute("SELECT SUM(n_elements) FROM tensors").fetchone()[0] or 0
     finally:

@@ -9,6 +9,85 @@ rather than compared against a number from earlier in the day.
 `bench.py` produces these figures; `tests/test_prerelease.py` is the gate every
 release below had to pass.
 
+## 0.32.2 -- the viewer's numbers, and one place that opens a database
+
+**Bug fix: the viewer reported wrong statistics for every BF16 model.** It
+decoded tensor bytes with its own `np.frombuffer` table rather than through
+`dtypes.to_float32`, and that table read BF16 as float16. The two are both 16
+bits wide, so nothing raised -- a stored 100.0 was reported as 3.39, and every
+mean, standard deviation, min, max and heatmap cell of a BF16 model was wrong.
+Safetensors models are predominantly BF16.
+
+`tests/test_safetensors.py` already carried a comment warning that reading
+BF16 as float16 is silent rather than fatal; the viewer had re-implemented the
+decode by hand and walked into exactly that. Both call sites now go through
+`to_float32`, which also fixes F64 tensors, previously reported as *quantized*
+with no statistics at all.
+
+The pre-release check for this asserted the HTML file existed and was over
+1000 bytes. It now stores known values as F32, F16, BF16 and F64 and asserts
+the reported minimum, maximum, mean, zero fraction, element count and heatmap
+cells come back exactly. Against the old code it fails 11 checks.
+
+### One place that decides how a database is opened
+
+Thirty `sqlite3.connect` calls and twenty-eight loose `PRAGMA` lines, so a
+setting measured on one path never reached the others. They now come from
+`db.py`, which names the four reasons reminis opens a file -- `open_for_bulk_write`
+for a fresh one, `open_for_bulk_copy` for a file copied moments earlier,
+`open_for_append` for a registry or training log, `open_read_only` for anything
+that must not be modified -- and records against each why its pragmas differ.
+
+Three callers had been left behind by earlier releases. The pack written by
+`lora`, the snapshot written by `track` and the export written by `registry`
+all unlink their target and write it whole, which is the case 0.27.0 tuned in
+the converter and 0.29.1 tuned for delta packs. All three still went through
+WAL with a rollback journal, and each `INSERT` still committed on its own:
+
+| writing 2472 MB into a fresh file | before | after |
+| --- | --- | --- |
+| WAL, `synchronous=NORMAL`, implicit commits | 7.15s (346 MB/s) | -- |
+| journal off, 64 KB pages, one transaction | -- | **1.12s (2209 MB/s)** |
+
+Best of three alternating runs; the spread was 7.15-7.41s against 1.12-1.41s.
+
+`merge` deletes a failed output rather than leaving it. It writes into a copy
+of its first input with no journal, so a merge that raises partway would
+otherwise leave a half-written file that reads like a finished one. Verified
+by failing a merge deliberately.
+
+No behaviour change beyond that: the same bytes are written, and the merge,
+lora, track, registry, diff, quantize, sweep, lowrank and blame/bisect suites
+all pass unchanged.
+
+### One definition of what a tensor is
+
+The tensor columns were declared in two schemas and written by eight separate
+`INSERT` statements, each spelling out its own placeholder list. That is the
+shape of the bug fixed in 0.29.0, where a pack insert named nine columns and
+bound eight and nothing caught it, because the only path reaching it added a
+tensor rather than changing one.
+
+Both now come from `TENSOR_COLUMNS` in `db.py`. The DDL shares a column block
+between the single-model schema and the registry's, which differ only in
+uniqueness -- `name` against `(model_id, name)` -- and the four statements
+(`INSERT_TENSOR`, `INSERT_OR_REPLACE_TENSOR`, `UPSERT_TENSOR`,
+`INSERT_REGISTRY_TENSOR`) are generated, so a placeholder list cannot disagree
+with a column list.
+
+Verified structurally rather than by eye: both schemas were built from the
+released code and from this one and compared through `table_info`,
+`index_list`, `index_info` and `foreign_key_list`. Identical.
+
+The pre-release gate now prepares each statement against a real schema and
+asserts `TENSOR_COLUMNS` is the table's column list, so a count mismatch or a
+column added to one side only fails at release rather than on the one code
+path that happens to reach it.
+
+The 18 distinct `SELECT ... FROM tensors` shapes were left alone. They select
+different subsets for good reasons, and routing them through a builder would
+trade readable SQL for indirection without removing a failure mode.
+
 ## 0.32.1 -- README says what is now guaranteed
 
 The round-trip tables reported an exported file smaller than the one that went

@@ -19,7 +19,6 @@ you can check.
 
 import hashlib
 import json
-import sqlite3
 import time
 from pathlib import Path
 
@@ -33,6 +32,7 @@ from reminis.diff import (
     _version,
     _weights_hash,
 )
+from reminis.db import open_for_bulk_write, open_read_only
 from reminis.dtypes import is_float_dtype
 from reminis.safetensors_io import load_tensors
 
@@ -193,13 +193,16 @@ def lora_to_delta_pack(
             f"Adapter has unpaired LoRA factors for: {', '.join(incomplete[:5])}"
         )
 
-    base_conn = sqlite3.connect(str(base_path))
+    base_conn = open_read_only(str(base_path))
     base_names = {r[0] for r in base_conn.execute("SELECT name FROM tensors")}
 
+    # A pack written from nothing into a path just unlinked, so it opens the
+    # way every other fresh file does. This wrote through WAL until 0.32.2,
+    # having missed the change delta packs got in 0.29.1.
     Path(output_path).unlink(missing_ok=True)
-    out_conn = sqlite3.connect(output_path)
-    out_conn.execute("PRAGMA journal_mode=WAL")
+    out_conn = open_for_bulk_write(output_path)
     out_conn.executescript(DELTA_SCHEMA)
+    out_conn.execute("BEGIN")
 
     unmatched = []
     written = 0
@@ -314,6 +317,7 @@ def lora_to_delta_pack(
         raise ValueError(f"No usable tensors found in {adapter}")
 
     out_conn.commit()
+    out_conn.execute("BEGIN")
 
     fingerprint = _model_fingerprint(base_conn)
     meta = {

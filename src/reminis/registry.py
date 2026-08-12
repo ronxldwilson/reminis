@@ -29,9 +29,17 @@ import shutil
 import sqlite3
 import tempfile
 import time
+
+from reminis.db import (
+    INSERT_REGISTRY_TENSOR,
+    INSERT_TENSOR,
+    TENSOR_COLUMN_DDL,
+    open_for_append,
+    open_for_bulk_write,
+)
 from pathlib import Path
 
-REGISTRY_SCHEMA = """
+REGISTRY_SCHEMA = f"""
 CREATE TABLE IF NOT EXISTS registry_meta (
     key   TEXT PRIMARY KEY,
     value TEXT NOT NULL
@@ -55,17 +63,13 @@ CREATE TABLE IF NOT EXISTS models (
     created_at    REAL NOT NULL
 );
 
--- Weights of base models, stored outright.
+-- Weights of base models, stored outright. Same columns as a single-model
+-- database, plus the model they belong to -- many models share this file, so
+-- a tensor is identified by (model_id, name) rather than by name.
 CREATE TABLE IF NOT EXISTS tensors (
     id         INTEGER PRIMARY KEY AUTOINCREMENT,
     model_id   INTEGER NOT NULL REFERENCES models(id),
-    name       TEXT NOT NULL,
-    shape      TEXT NOT NULL,
-    dtype      TEXT NOT NULL,
-    dtype_id   INTEGER NOT NULL,
-    n_elements INTEGER NOT NULL,
-    n_bytes    INTEGER NOT NULL,
-    data       BLOB NOT NULL,
+{TENSOR_COLUMN_DDL},
     UNIQUE (model_id, name)
 );
 
@@ -123,11 +127,7 @@ class Registry:
         if not exists and not create:
             raise FileNotFoundError(f"Registry not found: {self.path}")
 
-        self.conn = sqlite3.connect(self.path)
-        self.conn.execute("PRAGMA journal_mode=WAL")
-        self.conn.execute("PRAGMA synchronous=NORMAL")
-        self.conn.execute("PRAGMA cache_size=-64000")
-        self.conn.execute("PRAGMA foreign_keys=ON")
+        self.conn = open_for_append(self.path, foreign_keys=True)
 
         if exists:
             self._check_is_registry()
@@ -353,8 +353,7 @@ class Registry:
                 "FROM tensors ORDER BY id"
             ):
                 self.conn.execute(
-                    "INSERT INTO tensors (model_id, name, shape, dtype, dtype_id, "
-                    "n_elements, n_bytes, data) VALUES (?,?,?,?,?,?,?,?)",
+                    INSERT_REGISTRY_TENSOR,
                     (model_id, *row),
                 )
                 n_tensors += 1
@@ -604,10 +603,9 @@ class Registry:
         t0 = time.time()
         row = self._row(name)
         Path(output_db).unlink(missing_ok=True)
-        out = sqlite3.connect(output_db)
-        out.execute("PRAGMA journal_mode=WAL")
-        out.execute("PRAGMA synchronous=NORMAL")
+        out = open_for_bulk_write(output_db)
         out.executescript(SCHEMA)
+        out.execute("BEGIN")
 
         import hashlib
 
@@ -615,8 +613,7 @@ class Registry:
         n = 0
         for tensor_name, shape, dtype, dtype_id, n_elements, blob in self.tensors(name):
             out.execute(
-                "INSERT INTO tensors (name, shape, dtype, dtype_id, n_elements, "
-                "n_bytes, data) VALUES (?,?,?,?,?,?,?)",
+                INSERT_TENSOR,
                 (tensor_name, shape, dtype, dtype_id, n_elements, len(blob), blob),
             )
             h.update(blob)
