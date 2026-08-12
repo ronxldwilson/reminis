@@ -59,7 +59,14 @@ CREATE TABLE IF NOT EXISTS tensors (
     UNIQUE (name)
 );
 
-CREATE INDEX IF NOT EXISTS idx_tensors_name ON tensors(name);
+-- No index on `name`: UNIQUE(name) above already creates one, and every plan
+-- that used the explicit index is served identically by the implicit one.
+-- Dropped for clarity rather than speed -- a model has a few hundred tensors,
+-- so the duplicate cost 0.07 MB and no measurable time on a 2.5 GB file.
+-- Databases written earlier still carry it and are unaffected.
+--
+-- `dtype` is a real index: `reminis info` groups by it, and without one that
+-- is a scan of a table whose rows are multi-megabyte blobs.
 CREATE INDEX IF NOT EXISTS idx_tensors_dtype ON tensors(dtype);
 """
 
@@ -554,11 +561,14 @@ def sqlite_to_gguf(db_path: str, gguf_path: str | None = None, verbose: bool = T
         # metadata keys the original never had.
         if key.startswith(("GGUF.", "reminis.")):
             continue
-        try:
-            _write_meta_value(writer, key, value, type_name)
+        # Not wrapped in try/except. It was until 0.32.4, which meant a field
+        # that failed to encode was dropped from the exported model and the
+        # export still reported success -- the same silent-metadata-loss the
+        # array bug caused in 0.32.0, and it would have hidden that bug's
+        # return. An export that cannot write a field has produced a model
+        # missing part of itself, which is worth stopping for.
+        if _write_meta_value(writer, key, value, type_name):
             meta_count += 1
-        except Exception:
-            pass
 
     if verbose:
         print(f"  Wrote {meta_count} metadata fields")
@@ -643,8 +653,15 @@ def sqlite_to_gguf(db_path: str, gguf_path: str | None = None, verbose: bool = T
     return gguf_path
 
 
-def _write_meta_value(writer: GGUFWriter, key: str, value: str, type_name: str):
-    """Write a metadata value to the GGUF writer using the appropriate typed method."""
+def _write_meta_value(writer: GGUFWriter, key: str, value: str, type_name: str) -> bool:
+    """Write one metadata value with the writer method its type calls for.
+
+    Returns True when a field was written and False when one was deliberately
+    skipped, so the caller's count is of fields that actually reached the file
+    rather than of rows it looked at. Raises on a type it does not recognise:
+    returning quietly would drop the field from the exported model, which is
+    how a file ends up with correct weights and no tokenizer.
+    """
     # Use built-in helper methods for known keys
     helpers = {
         "general.name": ("add_name", str),
@@ -655,10 +672,10 @@ def _write_meta_value(writer: GGUFWriter, key: str, value: str, type_name: str):
     if key in helpers:
         entry = helpers[key]
         if entry is None:
-            return
+            return False  # architecture went in through the constructor
         method_name, cast = entry
         getattr(writer, method_name)(cast(value))
-        return
+        return True
 
     # Generic fallback by type
     if type_name in ("uint8", "uint16", "uint32", "uint64"):
@@ -671,7 +688,12 @@ def _write_meta_value(writer: GGUFWriter, key: str, value: str, type_name: str):
         writer.add_bool(key, value.lower() in ("true", "1"))
     elif type_name == "string":
         writer.add_string(key, value)
-    elif type_name == "array" or type_name.startswith("array:"):
+    elif not (type_name == "array" or type_name.startswith("array:")):
+        raise ValueError(
+            f"Cannot write metadata field '{key}': unknown type '{type_name}'. "
+            "Refusing rather than exporting a model with the field missing."
+        )
+    else:
         # Skipping these was silently dropping the tokenizer. Its vocabulary
         # and merges are string arrays, so an exported file had correct
         # weights and nothing to tokenize with, and llama.cpp refused it with
@@ -680,7 +702,7 @@ def _write_meta_value(writer: GGUFWriter, key: str, value: str, type_name: str):
         if not values:
             # The writer cannot encode an empty array -- it derives the
             # element type from the first element. Nothing ships one.
-            return
+            return False
         sub_type = None
         if ":" in type_name:
             sub_type = META_NAME_TO_TYPE.get(type_name.split(":", 1)[1])
@@ -690,3 +712,5 @@ def _write_meta_value(writer: GGUFWriter, key: str, value: str, type_name: str):
             # reads as int32.
             sub_type = GGUFValueType.get_type(values[0])
         writer.add_key_value(key, values, GGUFValueType.ARRAY, sub_type=sub_type)
+
+    return True

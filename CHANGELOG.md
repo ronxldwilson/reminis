@@ -9,6 +9,54 @@ rather than compared against a number from earlier in the day.
 `bench.py` produces these figures; `tests/test_prerelease.py` is the gate every
 release below had to pass.
 
+## 0.32.4 -- an export that cannot write a field stops
+
+**Bug fix: `export` silently dropped metadata it could not encode.** The loop
+writing metadata to a GGUF wrapped each field in `except Exception: pass`, so
+a field that failed to encode vanished and the export still reported success.
+That is precisely how 0.32.0 shipped models with no tokenizer -- and this
+would have hidden that bug coming back.
+
+A second path was quieter still: `_write_meta_value` recognised a fixed set of
+type names and an unrecognised one fell off the end of the function, writing
+nothing, while the caller counted it as written. So `Wrote N metadata fields`
+could name fields that never reached the file.
+
+Both are now loud. An unknown type raises and names the field, and the
+function returns whether it wrote anything, so the reported count is of fields
+that actually reached the file rather than rows the loop looked at. The empty
+array the writer genuinely cannot encode is the one deliberate skip and now
+reports itself as one.
+
+Checked against every model here before making it strict: no field on any of
+the 20 GGUF-sourced databases raises or falls through, so nothing that works
+today starts failing. The 28 fields stored as `json` come from safetensors
+imports, and `sqlite_to_gguf` rejects those databases before this loop.
+
+The viewer's two catches keep the reason instead of flattening it to `True`.
+A viewer over a few hundred tensors should not fail to render because one is
+odd, but a systematic decoding fault should read as the same message on every
+tensor rather than as a blank panel that looks like a property of the model.
+
+The remaining twelve `except Exception` are probes of optional runtimes --
+whether mlx has a GPU, whether cupy sees a device, whether a framework tensor
+has `.float()` -- where any failure does mean "not available". Those were left
+as they are.
+
+### The redundant index
+
+`idx_tensors_name` duplicated the index `UNIQUE (name)` already creates. Every
+query plan that used it is served identically by the implicit one, checked
+across lookup, ordered scan and covering-scan shapes.
+
+Removed for clarity, not for speed. **Measured, it cost nothing**: 0.07 MB and
+no time difference across three runs on a 2.5 GB model, because a model has a
+few hundred tensor names -- the largest here has 678, whose index is about
+0.03 MB. Databases written earlier still carry it and are unaffected.
+
+`idx_tensors_dtype` stays. `reminis info` groups by dtype, and without it that
+is a scan of a table whose rows are multi-megabyte blobs.
+
 ## 0.32.3 -- each command next to the flags it reads
 
 `main` was 495 lines: roughly 350 building 24 subparsers, then 140 of

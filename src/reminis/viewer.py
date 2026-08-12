@@ -33,8 +33,13 @@ def _compute_tensor_stats(data_blob: bytes, dtype_name: str, n_elements: int) ->
             "zeros_pct": float(np.sum(arr == 0) / len(arr) * 100),
             "n_elements": len(arr),
         }
-    except Exception:
-        return {"error": True, "n_bytes": len(data_blob)}
+    except Exception as exc:
+        # Still caught: a viewer over a few hundred tensors should not fail to
+        # render because one of them is odd. But the reason is kept rather than
+        # flattened to `True`, so a systematic decoding fault shows up as the
+        # same message on every tensor instead of a blank panel that looks
+        # like a property of the model.
+        return {"error": f"{type(exc).__name__}: {exc}", "n_bytes": len(data_blob)}
 
 
 def _sample_heatmap(data_blob: bytes, dtype_name: str, shape: list, size: int = 48) -> list | None:
@@ -60,6 +65,10 @@ def _sample_heatmap(data_blob: bytes, dtype_name: str, shape: list, size: int = 
 
         return [[round(float(v), 3) for v in row] for row in sampled]
     except Exception:
+        # No error channel here on purpose: None already means "no heatmap for
+        # this tensor", which is also the answer for a quantized or 1-D one.
+        # Anything that breaks the decode breaks it in _compute_tensor_stats
+        # too, and that is where the reason gets reported.
         return None
 
 

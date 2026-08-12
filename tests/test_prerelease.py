@@ -768,6 +768,64 @@ def test_convert_fallback():
         check(fast_tensors == slow_tensors, "fallback writes the same tensors")
 
 
+def test_export_refuses_to_drop_metadata():
+    """A field the exporter cannot write must stop the export, not vanish.
+
+    The loop wrapped `_write_meta_value` in `except Exception: pass` through
+    0.32.3, so a field that failed to encode was dropped and the export still
+    reported success. That is how 0.32.0 shipped models with no tokenizer, and
+    this would have hidden that bug's return. An unknown type also fell off
+    the end of the function writing nothing, while still being counted.
+    """
+    section("Export refuses to drop metadata")
+    from reminis.converter import _write_meta_value
+
+    class FakeWriter:
+        def __init__(self):
+            self.written = []
+
+        def __getattr__(self, name):
+            def record(*a, **k):
+                self.written.append((name, a))
+            return record
+
+    # An unrecognised type must raise, naming the field.
+    w = FakeWriter()
+    try:
+        _write_meta_value(w, "config.something", "1", "json")
+    except ValueError as exc:
+        check("config.something" in str(exc), "unknown type names the field it refused")
+        check(w.written == [], "unknown type wrote nothing")
+    except Exception as exc:
+        check(False, f"unknown type raised {type(exc).__name__}, wanted ValueError")
+    else:
+        check(False, "unknown metadata type was accepted silently")
+
+    # A malformed value must raise rather than be swallowed.
+    try:
+        _write_meta_value(FakeWriter(), "block_count", "not-a-number", "uint32")
+    except ValueError:
+        check(True, "malformed scalar raises")
+    else:
+        check(False, "malformed scalar was swallowed")
+
+    # The return value distinguishes written from deliberately skipped, so the
+    # reported count is of fields that reached the file.
+    check(_write_meta_value(FakeWriter(), "general.file_type", "1", "uint32") is True,
+          "a written field reports True")
+    check(_write_meta_value(FakeWriter(), "general.architecture", "llama", "string") is False,
+          "architecture reports False -- the constructor already wrote it")
+    check(_write_meta_value(FakeWriter(), "tokenizer.ggml.merges", "[]", "array:string") is False,
+          "an empty array reports False rather than counting as written")
+
+    # And the arrays that 0.32.0 was about still go through.
+    w = FakeWriter()
+    check(_write_meta_value(w, "tokenizer.ggml.tokens", "['a', 'b']", "array:string") is True,
+          "a string array reports True")
+    check(len(w.written) == 1 and w.written[0][0] == "add_key_value",
+          f"string array written via add_key_value, got {w.written}")
+
+
 def test_every_subcommand_reaches_a_handler():
     """Each subcommand must set `func`, and each handler must be callable.
 
@@ -919,6 +977,7 @@ ALL_TESTS = [
     test_quantize_chunking,
     test_gguf_fast_parser,
     test_convert_fallback,
+    test_export_refuses_to_drop_metadata,
     test_every_subcommand_reaches_a_handler,
     test_tensor_sql_matches_the_schema,
     test_threaded_hash,
