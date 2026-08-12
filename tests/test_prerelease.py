@@ -12,9 +12,11 @@ thorough check but takes hours. This script is the fast alternative that
 catches the common regressions.
 """
 
+import argparse
 import json
 import shutil
 import sqlite3
+import subprocess
 import sys
 import tempfile
 from pathlib import Path
@@ -766,6 +768,62 @@ def test_convert_fallback():
         check(fast_tensors == slow_tensors, "fallback writes the same tensors")
 
 
+def test_every_subcommand_reaches_a_handler():
+    """Each subcommand must set `func`, and each handler must be callable.
+
+    The dispatch used to be `elif args.command == "..."` at the bottom of a
+    495-line function, where a subcommand whose branch was missing parsed
+    fine and then did nothing at all. Attaching handlers with `set_defaults`
+    makes that a missing attribute instead -- but only if every subparser
+    actually got one, which is what this checks.
+    """
+    section("CLI dispatch")
+    import inspect
+
+    from reminis.cli import build_parser
+
+    parser = build_parser()
+    subparsers = [a for a in parser._actions
+                  if isinstance(a, argparse._SubParsersAction)]
+    check(len(subparsers) == 1, "one top-level subparser group")
+
+    commands = subparsers[0].choices
+    check(len(commands) >= 17, f"{len(commands)} subcommands found")
+
+    for name, sub in sorted(commands.items()):
+        handler = sub.get_default("func")
+        check(handler is not None, f"`{name}` reaches a handler")
+        if handler is None:
+            continue
+        check(callable(handler), f"`{name}` handler is callable")
+        # Every handler takes (args, parser): the parser so it can call
+        # parser.error for combinations argparse cannot express.
+        params = list(inspect.signature(handler).parameters)
+        check(params == ["args", "parser"],
+              f"`{name}` handler takes (args, parser)"
+              + ("" if params == ["args", "parser"] else f" -- takes {params}"))
+
+    # `registry` nests its own subcommands, which dispatch through
+    # _run_registry rather than through set_defaults. Check they parse.
+    reg = commands["registry"]
+    reg_subs = [a for a in reg._actions
+                if isinstance(a, argparse._SubParsersAction)]
+    check(len(reg_subs) == 1, "registry has its own subparser group")
+    check(set(reg_subs[0].choices) == {"add", "add-lora", "ls", "export", "rm"},
+          f"registry subcommands: {sorted(reg_subs[0].choices)}")
+    check(reg.get_default("registry_parser") is reg,
+          "registry carries its own parser through for bare-command help")
+
+    # A no-argument invocation must still print help and exit 1 rather than
+    # raising AttributeError on the missing `func`.
+    result = subprocess.run(
+        [sys.executable, "-c", "from reminis.cli import main; main()"],
+        capture_output=True, text=True,
+    )
+    check(result.returncode == 1, f"bare `reminis` exits 1, got {result.returncode}")
+    check("usage:" in (result.stdout + result.stderr), "bare `reminis` prints usage")
+
+
 def test_tensor_sql_matches_the_schema():
     """Every generated statement must agree with the table it writes to.
 
@@ -861,6 +919,7 @@ ALL_TESTS = [
     test_quantize_chunking,
     test_gguf_fast_parser,
     test_convert_fallback,
+    test_every_subcommand_reaches_a_handler,
     test_tensor_sql_matches_the_schema,
     test_threaded_hash,
 ]

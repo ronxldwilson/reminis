@@ -9,6 +9,36 @@ rather than compared against a number from earlier in the day.
 `bench.py` produces these figures; `tests/test_prerelease.py` is the gate every
 release below had to pass.
 
+## 0.32.3 -- each command next to the flags it reads
+
+`main` was 495 lines: roughly 350 building 24 subparsers, then 140 of
+`elif args.command == "..."` dispatching to them. Every command's argument
+handling sat three hundred lines from the flags it consumed.
+
+Each command is now a `cmd_*(args, parser)` function attached to its subparser
+with `set_defaults(func=...)`, and `main` is fourteen lines that parse and
+call. `parser` is passed because a handler's remaining job is usually to
+reject a combination argparse cannot express, and `parser.error` is what
+prints usage and exits 2 the way every other argparse failure does.
+
+| | before | after |
+| --- | --- | --- |
+| `main` | 495 lines | **14** |
+| longest function in `cli.py` | 495 | 371 (`build_parser`, declarative) |
+
+Nothing about the interface moved. Every subcommand's `--help`, both parsers'
+usage, all six argument-validation errors, the bare-command and unknown-command
+paths and their exit codes were captured before the change and compared after:
+byte-identical across 32 cases. `convert`, `info`, `quantize`, `export`,
+`view`, `diff`, `apply`, `run`, `prepare` and the five `registry` subcommands
+were also run end to end against a real model.
+
+A subcommand with no branch used to parse successfully and then do nothing.
+`main` now dispatches on the `func` attribute, so that case prints help and
+exits 1, and the pre-release gate asserts every subcommand reaches a callable
+handler with the right signature -- checked against a deliberately unwired
+command.
+
 ## 0.32.2 -- the viewer's numbers, and one place that opens a database
 
 **Bug fix: the viewer reported wrong statistics for every BF16 model.** It

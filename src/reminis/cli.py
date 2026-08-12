@@ -7,7 +7,183 @@ from pathlib import Path
 from reminis import __version__
 
 
-def main():
+# Every command is a function taking (args, parser), attached to its
+# subparser with `set_defaults(func=...)` so `main` dispatches by calling it.
+# The alternative -- and what this was until 0.32.3 -- is a chain of
+# `elif args.command == "..."` at the bottom of a 495-line function, three
+# hundred lines from the flags each branch reads.
+#
+# `parser` is passed because a handler's remaining job is often to reject an
+# argument combination argparse cannot express, and `parser.error` is what
+# prints usage and exits 2 the way every other argparse failure does.
+
+
+def cmd_convert(args, parser):
+    fmt = args.format if args.format != "auto" else _detect_input_format(args.input)
+    if fmt == "safetensors":
+        from reminis.safetensors_io import safetensors_to_sqlite
+        safetensors_to_sqlite(args.input, args.output, verbose=not args.quiet)
+    else:
+        from reminis.converter import gguf_to_sqlite
+        gguf_to_sqlite(args.input, args.output, verbose=not args.quiet)
+
+
+def cmd_export(args, parser):
+    fmt = args.format if args.format != "auto" else _source_format(args.input)
+    if fmt == "safetensors":
+        from reminis.safetensors_io import sqlite_to_safetensors
+        sqlite_to_safetensors(args.input, args.output, verbose=not args.quiet)
+    else:
+        from reminis.converter import sqlite_to_gguf
+        sqlite_to_gguf(args.input, args.output, verbose=not args.quiet)
+
+
+def cmd_lora(args, parser):
+    from reminis.lora import lora_to_delta_pack
+    lora_to_delta_pack(
+        args.adapter, args.base, args.output, verbose=not args.quiet
+    )
+
+
+def cmd_info(args, parser):
+    _reject_registry(args.input, "info")
+    _show_info(args.input)
+
+
+def cmd_view(args, parser):
+    _reject_registry(args.input, "view")
+    import webbrowser
+    from reminis.viewer import generate_viewer
+    html_path = generate_viewer(args.input, args.output)
+    if not args.no_open:
+        webbrowser.open("file://" + str(Path(html_path).resolve()))
+
+
+def cmd_diff(args, parser):
+    from reminis.diff import diff_models
+    if args.lossy is not None and not args.output:
+        parser.error("--lossy only affects the written pack; pass -o/--output too")
+    diff_models(
+        args.base, args.target, args.output,
+        verbose=not args.quiet, lossy_tolerance=args.lossy,
+    )
+
+
+def cmd_run(args, parser):
+    _reject_registry(args.input, "run")
+    if args.pack is not None and args.pack != "native":
+        if args.pack == "compact":
+            pass
+        elif args.pack in ("4", "6", "8"):
+            args.pack = int(args.pack)
+        else:
+            parser.error(
+                "--pack takes no value (bit-exact), 'compact', or 4, 6 or 8"
+            )
+    if args.experts is not None and args.experts != "all":
+        if not args.experts.isdigit() or int(args.experts) < 1:
+            parser.error("--experts takes a positive number, or 'all'")
+        args.experts = int(args.experts)
+    from reminis.infer import run_cli
+    run_cli(args)
+
+
+def cmd_merge(args, parser):
+    from reminis.merge import merge_models
+    for path in args.inputs + ([args.base] if args.base else []):
+        _reject_registry(path, "merge")
+    weights = None
+    if args.weights:
+        try:
+            weights = [float(w) for w in args.weights.split(",")]
+        except ValueError:
+            parser.error("--weights must be comma-separated numbers, e.g. 0.7,0.3")
+    try:
+        merge_models(
+            args.inputs, args.output, method=args.method, weights=weights,
+            base=args.base, density=args.density, t=args.t, scale=args.scale,
+            verbose=not args.quiet,
+        )
+    except ValueError as exc:
+        print(f"Error: {exc}")
+        sys.exit(1)
+
+
+def cmd_registry(args, parser):
+    # `registry` alone is not a command, so it prints its own help rather than
+    # the top-level parser's. `registry_parser` is set by the same
+    # `set_defaults` call that attached this handler.
+    if args.registry_command is None:
+        args.registry_parser.print_help()
+        sys.exit(1)
+    _run_registry(args, args.registry_parser)
+
+
+def cmd_log(args, parser):
+    _show_log(args.input, step=args.step, spikes_only=args.spikes)
+
+
+def cmd_rollback(args, parser):
+    from reminis.track import TrainingLog, rollback_to_step
+    log = TrainingLog(args.log)
+    try:
+        rollback_to_step(log, args.step, args.output, verbose=True)
+    finally:
+        log.close()
+
+
+def cmd_quantize(args, parser):
+    from reminis.quantize import quantize_model
+    quantize_model(args.database, args.output, bits=args.bits)
+
+
+def cmd_sweep(args, parser):
+    from reminis.sweep import sweep
+
+    widths = []
+    for piece in args.bits.split(","):
+        piece = piece.strip()
+        if not piece:
+            continue
+        if not piece.isdigit() or int(piece) not in (2, 3, 4, 5, 6, 8):
+            parser.error(
+                f"--bits takes a comma-separated list drawn from "
+                f"2, 3, 4, 5, 6 and 8; got '{piece}'"
+            )
+        widths.append(int(piece))
+    if not widths:
+        parser.error("--bits needs at least one width")
+
+    sweep(
+        args.database, widths, prompt=args.prompt,
+        backend=None if args.backend == "auto" else args.backend,
+        kv_bits=args.kv_bits,
+    )
+
+
+def cmd_blame(args, parser):
+    _show_blame(args.log, args.param, args.top)
+
+
+def cmd_bisect(args, parser):
+    _run_bisect(args.log, args.good, args.bad, args.test)
+
+
+def cmd_apply(args, parser):
+    from reminis.diff import apply_delta
+    apply_delta(
+        args.base, args.delta, args.output,
+        verify=not args.no_verify, verbose=not args.quiet,
+    )
+
+
+def build_parser() -> argparse.ArgumentParser:
+    """The full command-line grammar.
+
+    Separate from `main` so the parser can be built and inspected without
+    running anything -- which is what the pre-release check does to assert
+    every subcommand still reaches a handler.
+    """
     parser = argparse.ArgumentParser(
         prog="reminis",
         description="Store LLM weights in a SQLite database. Convert GGUF and "
@@ -33,6 +209,7 @@ def main():
         help="Input format (default: detected from the path)",
     )
     p_convert.add_argument("-q", "--quiet", action="store_true", help="Suppress progress output")
+    p_convert.set_defaults(func=cmd_convert)
 
     # export: SQLite -> GGUF or safetensors
     p_export = sub.add_parser("export", help="Convert a SQLite database back to a model file")
@@ -43,6 +220,7 @@ def main():
         help="Output format (default: whichever format the model was imported from)",
     )
     p_export.add_argument("-q", "--quiet", action="store_true", help="Suppress progress output")
+    p_export.set_defaults(func=cmd_export)
 
     # lora: peft adapter -> delta pack
     p_lora = sub.add_parser(
@@ -52,16 +230,19 @@ def main():
     p_lora.add_argument("base", help="Path to the base model database the adapter was trained on")
     p_lora.add_argument("-o", "--output", required=True, help="Output delta pack path")
     p_lora.add_argument("-q", "--quiet", action="store_true", help="Suppress progress output")
+    p_lora.set_defaults(func=cmd_lora)
 
     # info: show database summary
     p_info = sub.add_parser("info", help="Show summary info about a reminis database")
     p_info.add_argument("input", help="Path to the SQLite database")
+    p_info.set_defaults(func=cmd_info)
 
     # view: generate and open interactive HTML viewer
     p_view = sub.add_parser("view", help="Open an interactive viewer for a reminis database")
     p_view.add_argument("input", help="Path to the SQLite database")
     p_view.add_argument("-o", "--output", help="Output HTML path (default: same name with .html)")
     p_view.add_argument("--no-open", action="store_true", help="Don't open in browser")
+    p_view.set_defaults(func=cmd_view)
 
     # diff: compare two model databases
     p_diff = sub.add_parser("diff", help="Compare two model databases tensor by tensor")
@@ -79,6 +260,7 @@ def main():
              "low-rank, as a LoRA fine-tune's is. Off by default.",
     )
     p_diff.add_argument("-q", "--quiet", action="store_true", help="Suppress progress output")
+    p_diff.set_defaults(func=cmd_diff)
 
     # run: generate text from weights in the database
     p_run = sub.add_parser(
@@ -143,6 +325,7 @@ def main():
              "memory than it would otherwise need, more slowly.",
     )
     p_run.add_argument("-q", "--quiet", action="store_true", help="Suppress progress output")
+    p_run.set_defaults(func=cmd_run)
 
     # merge: combine several models into one
     p_merge = sub.add_parser(
@@ -190,12 +373,16 @@ def main():
              "to the base (default 1.0)",
     )
     p_merge.add_argument("-q", "--quiet", action="store_true", help="Suppress progress output")
+    p_merge.set_defaults(func=cmd_merge)
 
     # registry: many models in one database
     p_reg = sub.add_parser(
         "registry",
         help="Keep many related models in one database, derived ones as deltas",
     )
+    # `registry_parser` carries p_reg through to the handler, which prints its
+    # help when `registry` is given with no subcommand.
+    p_reg.set_defaults(func=cmd_registry, registry_parser=p_reg)
     reg_sub = p_reg.add_subparsers(dest="registry_command")
 
     r_add = reg_sub.add_parser("add", help="Add a model to a registry")
@@ -246,6 +433,7 @@ def main():
     p_log.add_argument("input", help="Path to the training log database")
     p_log.add_argument("--step", type=int, help="Show per-parameter detail for one step")
     p_log.add_argument("--spikes", action="store_true", help="Show only loss spikes")
+    p_log.set_defaults(func=cmd_log)
 
     # rollback: restore a model to a snapshot
     p_rollback = sub.add_parser(
@@ -254,6 +442,7 @@ def main():
     p_rollback.add_argument("log", help="Path to the training log database")
     p_rollback.add_argument("step", type=int, help="Snapshot step to restore")
     p_rollback.add_argument("-o", "--output", required=True, help="Output database path")
+    p_rollback.set_defaults(func=cmd_rollback)
 
     # prepare: build the materialized expert index
     p_prepare = sub.add_parser(
@@ -273,6 +462,7 @@ def main():
     )
     p_prepare.add_argument("--drop", action="store_true",
                            help="Delete the index and reclaim its space")
+    p_prepare.set_defaults(func=_prepare)
 
     # quantize: write a quantized copy of a model
     p_quant = sub.add_parser(
@@ -287,6 +477,7 @@ def main():
              "53%%). Default 4. Both are real GGUF types, so the result "
              "exports back to GGUF and llama.cpp reads it.",
     )
+    p_quant.set_defaults(func=cmd_quantize)
 
     # sweep: run one model at several precisions and compare
     p_sweep = sub.add_parser(
@@ -309,6 +500,7 @@ def main():
         "--kv-bits", type=int, choices=(4, 8), metavar="BITS",
         help="Also compress the key/value cache to this many bits",
     )
+    p_sweep.set_defaults(func=cmd_sweep)
 
     # blame: when did a tensor last change?
     p_blame = sub.add_parser(
@@ -326,6 +518,7 @@ def main():
         "--top", type=int, default=20,
         help="How many steps to show (default: 20, 0 for all)",
     )
+    p_blame.set_defaults(func=cmd_blame)
 
     # bisect: binary-search for the step that broke something
     p_bisect = sub.add_parser(
@@ -343,6 +536,7 @@ def main():
         help="Shell command to test a restored model. {db} is replaced with the "
              "path to the restored database. Exit 0 = good, 125 = skip, other = bad.",
     )
+    p_bisect.set_defaults(func=cmd_bisect)
 
     # apply: apply a delta pack to a base model
     p_apply = sub.add_parser("apply", help="Apply a delta pack to a base model")
@@ -351,155 +545,25 @@ def main():
     p_apply.add_argument("-o", "--output", required=True, help="Output database path")
     p_apply.add_argument("--no-verify", action="store_true", help="Skip hash verification")
     p_apply.add_argument("-q", "--quiet", action="store_true", help="Suppress progress output")
+    p_apply.set_defaults(func=cmd_apply)
 
+    return parser
+
+
+def main():
+    parser = build_parser()
     args = parser.parse_args()
 
-    if args.command is None:
+    # No subcommand: argparse leaves `func` unset, since only a subparser sets
+    # it. Checking for the attribute rather than for `args.command is None`
+    # means a subcommand added without a handler fails here, loudly, instead
+    # of parsing successfully and silently doing nothing.
+    handler = getattr(args, "func", None)
+    if handler is None:
         parser.print_help()
         sys.exit(1)
 
-    if args.command == "convert":
-        fmt = args.format if args.format != "auto" else _detect_input_format(args.input)
-        if fmt == "safetensors":
-            from reminis.safetensors_io import safetensors_to_sqlite
-            safetensors_to_sqlite(args.input, args.output, verbose=not args.quiet)
-        else:
-            from reminis.converter import gguf_to_sqlite
-            gguf_to_sqlite(args.input, args.output, verbose=not args.quiet)
-
-    elif args.command == "export":
-        fmt = args.format if args.format != "auto" else _source_format(args.input)
-        if fmt == "safetensors":
-            from reminis.safetensors_io import sqlite_to_safetensors
-            sqlite_to_safetensors(args.input, args.output, verbose=not args.quiet)
-        else:
-            from reminis.converter import sqlite_to_gguf
-            sqlite_to_gguf(args.input, args.output, verbose=not args.quiet)
-
-    elif args.command == "lora":
-        from reminis.lora import lora_to_delta_pack
-        lora_to_delta_pack(
-            args.adapter, args.base, args.output, verbose=not args.quiet
-        )
-
-    elif args.command == "info":
-        _reject_registry(args.input, "info")
-        _show_info(args.input)
-
-    elif args.command == "view":
-        _reject_registry(args.input, "view")
-        import webbrowser
-        from reminis.viewer import generate_viewer
-        html_path = generate_viewer(args.input, args.output)
-        if not args.no_open:
-            webbrowser.open("file://" + str(Path(html_path).resolve()))
-
-    elif args.command == "diff":
-        from reminis.diff import diff_models
-        if args.lossy is not None and not args.output:
-            parser.error("--lossy only affects the written pack; pass -o/--output too")
-        diff_models(
-            args.base, args.target, args.output,
-            verbose=not args.quiet, lossy_tolerance=args.lossy,
-        )
-
-    elif args.command == "run":
-        _reject_registry(args.input, "run")
-        if args.pack is not None and args.pack != "native":
-            if args.pack == "compact":
-                pass
-            elif args.pack in ("4", "6", "8"):
-                args.pack = int(args.pack)
-            else:
-                parser.error(
-                    "--pack takes no value (bit-exact), 'compact', or 4, 6 or 8"
-                )
-        if args.experts is not None and args.experts != "all":
-            if not args.experts.isdigit() or int(args.experts) < 1:
-                parser.error("--experts takes a positive number, or 'all'")
-            args.experts = int(args.experts)
-        from reminis.infer import run_cli
-        run_cli(args)
-
-    elif args.command == "merge":
-        from reminis.merge import merge_models
-        for path in args.inputs + ([args.base] if args.base else []):
-            _reject_registry(path, "merge")
-        weights = None
-        if args.weights:
-            try:
-                weights = [float(w) for w in args.weights.split(",")]
-            except ValueError:
-                parser.error("--weights must be comma-separated numbers, e.g. 0.7,0.3")
-        try:
-            merge_models(
-                args.inputs, args.output, method=args.method, weights=weights,
-                base=args.base, density=args.density, t=args.t, scale=args.scale,
-                verbose=not args.quiet,
-            )
-        except ValueError as exc:
-            print(f"Error: {exc}")
-            sys.exit(1)
-
-    elif args.command == "registry":
-        if args.registry_command is None:
-            p_reg.print_help()
-            sys.exit(1)
-        _run_registry(args, p_reg)
-
-    elif args.command == "log":
-        _show_log(args.input, step=args.step, spikes_only=args.spikes)
-
-    elif args.command == "rollback":
-        from reminis.track import TrainingLog, rollback_to_step
-        log = TrainingLog(args.log)
-        try:
-            rollback_to_step(log, args.step, args.output, verbose=True)
-        finally:
-            log.close()
-
-    elif args.command == "prepare":
-        _prepare(args, parser)
-
-    elif args.command == "quantize":
-        from reminis.quantize import quantize_model
-        quantize_model(args.database, args.output, bits=args.bits)
-
-    elif args.command == "sweep":
-        from reminis.sweep import sweep
-
-        widths = []
-        for piece in args.bits.split(","):
-            piece = piece.strip()
-            if not piece:
-                continue
-            if not piece.isdigit() or int(piece) not in (2, 3, 4, 5, 6, 8):
-                parser.error(
-                    f"--bits takes a comma-separated list drawn from "
-                    f"2, 3, 4, 5, 6 and 8; got '{piece}'"
-                )
-            widths.append(int(piece))
-        if not widths:
-            parser.error("--bits needs at least one width")
-
-        sweep(
-            args.database, widths, prompt=args.prompt,
-            backend=None if args.backend == "auto" else args.backend,
-            kv_bits=args.kv_bits,
-        )
-
-    elif args.command == "blame":
-        _show_blame(args.log, args.param, args.top)
-
-    elif args.command == "bisect":
-        _run_bisect(args.log, args.good, args.bad, args.test)
-
-    elif args.command == "apply":
-        from reminis.diff import apply_delta
-        apply_delta(
-            args.base, args.delta, args.output,
-            verify=not args.no_verify, verbose=not args.quiet,
-        )
+    handler(args, parser)
 
 
 def _prepare(args, parser):
