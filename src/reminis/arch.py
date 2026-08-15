@@ -608,6 +608,15 @@ class Qwen35(Arch):
         xp = backend.xp
         return x / xp.sqrt(xp.sum(x * x, axis=-1, keepdims=True) + eps)
 
+    # Compiling this step was tried and removed. `mx.compile` over the whole
+    # recurrence -- the obvious move, since it is a dozen small elementwise
+    # operations issued one at a time, forty-eight layers deep on the 27B --
+    # measured 25.29 tok/s against 25.07 on the 4B and 4.36 against 4.6 on
+    # the 27B. Neither is a difference. What the step spends is evidently in
+    # the two matrix products, which were already single kernels, and not in
+    # the dispatch around them. It is recorded here so the next person does
+    # not spend the afternoon finding out the same thing.
+
     def _deltanet_scan(self, model, q, k, v, gate, beta, ssm_state):
         """Gated DeltaNet recurrence, one step per token, all heads at once.
 

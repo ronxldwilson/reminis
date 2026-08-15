@@ -282,6 +282,14 @@ def build_parser() -> argparse.ArgumentParser:
     p_run.add_argument("--seed", type=int, help="Seed, so a run repeats exactly")
     p_run.add_argument("--chat", action="store_true",
                        help="Wrap the prompt in the model's chat template")
+    p_run.add_argument(
+        "--think", action="store_true",
+        help="With --chat on a reasoning model, leave its thinking channel "
+             "open so it works through the problem before answering. Closed "
+             "by default: left open, a model reasons for as long as it likes "
+             "and a short run shows working and no answer, which reads like "
+             "a broken forward pass and is not one.",
+    )
     p_run.add_argument("--stream", action="store_true",
                        help="Re-read every weight from SQLite instead of caching "
                             "it, so peak memory is one layer rather than the "

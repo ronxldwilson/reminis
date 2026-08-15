@@ -224,6 +224,13 @@ class WeightStore:
         # packing was asked for, since it holds nothing else.
         self._packed_layouts = read_packed_layouts(self.conn)
         self.from_index = 0
+        # The width the index was built at, when it is of one mind about it.
+        # A run asking for a different one gets the index's, because
+        # rebuilding it per run is the cost it exists to remove -- but it
+        # gets told, since otherwise `--pack 4` would quietly produce
+        # three-bit weights and report nothing.
+        widths = {layout.bits for layout in self._packed_layouts.values()}
+        self.index_bits = widths.pop() if len(widths) == 1 else None
         if self._expert_layouts and reader_threads:
             self._reader = _IndexReader(db_path, workers=reader_threads,
                                         mmap_size=self._mmap_size(db_path))
@@ -349,15 +356,34 @@ class WeightStore:
             if row is None:
                 return
             shape, dtype, blob = row
-            if not is_quantized_dtype(dtype) or can_repack(dtype):
-                # A float tensor needs no unpacking, and an exactly-affine
-                # quantization is rearranged rather than decoded -- neither
-                # is worth a thread.
+            if not is_quantized_dtype(dtype):
+                # A float tensor is already numbers; there is nothing here
+                # a thread could do that the device will not do faster.
                 return
             dims = tuple(ast.literal_eval(shape))[::-1]
-            arr = dequantize_to_float32(blob, dtype).reshape(dims)
+
+            if can_repack(dtype):
+                # An exactly-affine quantization is rearranged rather than
+                # decoded, which is cheaper but not free -- it is still
+                # numpy moving bits, and it threads: measured 3.8x on eight
+                # threads for Q4_K. Skipping it here left a bit-exact load
+                # entirely single-threaded, which is most of what a Q4_K
+                # model spends before its first token.
+                if self.pack_bits != "native" or not self._packable(name):
+                    return
+                packed = ggml_repack(blob, dtype, dims)
+                if packed is None:
+                    return
+                entry = ("repacked", packed, dims, len(blob))
+                size = packed[0].nbytes + packed[1].nbytes + packed[2].nbytes
+            else:
+                arr = dequantize_to_float32(blob, dtype).reshape(dims)
+                entry = ("float32", (arr, dtype), dims, len(blob))
+                size = arr.nbytes
+
             with self._prefetch_lock:
-                self._prefetch_done[name] = (arr, dtype, dims, len(blob))
+                self._prefetch_done[name] = entry
+                self._prefetch_bytes += size
                 self._prefetch_bytes += arr.nbytes
         except Exception:
             # A prefetch that fails is not an error: `get` will do the work
@@ -368,8 +394,13 @@ class WeightStore:
     def take_prefetched(self, name):
         with self._prefetch_lock:
             entry = self._prefetch_done.pop(name, None)
-            if entry is not None:
-                self._prefetch_bytes -= entry[0].nbytes
+            if entry is None:
+                return None
+            kind, payload, _, _ = entry
+            if kind == "repacked":
+                self._prefetch_bytes -= sum(p.nbytes for p in payload[:3])
+            else:
+                self._prefetch_bytes -= payload[0].nbytes
         return entry
 
     def stop_prefetch(self):
@@ -409,21 +440,34 @@ class WeightStore:
         ready = (self.take_prefetched(name)
                  if getattr(self, "_prefetch_pool", None) else None)
         if ready is not None:
-            arr32, dtype, dims, n_bytes = ready
-            arr = self.backend.from_numpy(arr32)
-            self.backend.eval(arr)
-            del arr32
-            bits = nearest_bits(dtype) if self.pack_bits == "native" else None
-            if isinstance(self.pack_bits, int):
-                bits = self.pack_bits
-            if bits is not None and self.backend.can_pack() and self._packable(name):
-                arr = self.backend.pack(arr, bits,
-                                        _best_group(dims[-1], self.pack_group),
-                                        self.pack_compact)
-                self.packed += 1
+            kind, payload, dims, n_bytes = ready
             self.bytes_read += n_bytes
             self.reads += 1
-            self.dequantized += 1
+
+            if kind == "repacked":
+                words, scales, biases, bits = payload
+                arr = self.backend.adopt_packed(
+                    words, scales, biases, bits, AFFINE_GROUP, dims,
+                    self.pack_compact)
+                self.packed += 1
+                self.packed_native += 1
+            else:
+                arr32, dtype = payload
+                arr = self.backend.from_numpy(arr32)
+                self.backend.eval(arr)
+                del arr32
+                bits = (nearest_bits(dtype) if self.pack_bits == "native"
+                        else None)
+                if isinstance(self.pack_bits, int):
+                    bits = self.pack_bits
+                if (bits is not None and self.backend.can_pack()
+                        and self._packable(name)):
+                    arr = self.backend.pack(
+                        arr, bits, _best_group(dims[-1], self.pack_group),
+                        self.pack_compact)
+                    self.packed += 1
+                self.dequantized += 1
+
             if not self.stream:
                 self._cache[name] = arr
             return arr
@@ -2319,6 +2363,7 @@ def generate(
     seed: int | None = None,
     stream: bool = False,
     chat: bool = False,
+    think: bool = False,
     stop_at_eos: bool = True,
     verbose: bool = True,
     on_token=None,
@@ -2352,6 +2397,9 @@ def generate(
             peak memory is one layer rather than the whole model.
         chat: Wrap the prompt in the model's chat template, when it has a
             ChatML one.
+        think: On a reasoning model, leave its thinking channel open rather
+            than closing it immediately. The answer then arrives after the
+            working, which needs a token budget to match.
         stop_at_eos: Stop when the model emits its end-of-text token.
         verbose: Print the header, the prompt, and the closing timings. The
             generated text itself is printed either way, so that piping the
@@ -2380,7 +2428,7 @@ def generate(
     rng = np.random.default_rng(seed)
 
     try:
-        text = _apply_chat_template(prompt, tok) if chat else prompt
+        text = _apply_chat_template(prompt, tok, think) if chat else prompt
         tokens = tok.encode(text)
         if not tokens:
             raise ValueError("The prompt encoded to zero tokens")
@@ -2401,6 +2449,23 @@ def generate(
         if pack_bits is not None and not chosen.can_pack():
             print(f"Note: the {chosen.name} backend cannot multiply packed "
                   f"weights, so --pack was ignored.")
+
+        # A packed index holds one width. Honouring `--pack` against it would
+        # mean rebuilding every weight, which is the work the index exists to
+        # have already done -- so the index wins and says so. Silence here
+        # would mean asking for four bits and running three.
+        index_bits = model.store.index_bits
+        if index_bits is not None and pack_bits is not None:
+            asked = pack_bits if isinstance(pack_bits, int) else None
+            if asked != index_bits:
+                wanted = (f"--pack {asked}" if asked is not None
+                          else "bit-exact packing")
+                print(f"Note: this database has a packed index built at "
+                      f"{index_bits} bits, and it is being used. {wanted} "
+                      f"would mean rebuilding every weight, which is what "
+                      f"the index is there to avoid.\n"
+                      f"      To run at another width: reminis prepare "
+                      f"<db> --weights --bits N   (or --weights --drop)")
 
         cache = KVCache(model.cfg.n_layers, capacity=len(tokens) + max_tokens,
                         backend=chosen, quantize_bits=kv_bits)
@@ -2469,19 +2534,35 @@ def generate(
         model.close()
 
 
-def _apply_chat_template(prompt: str, tok) -> str:
+def _apply_chat_template(prompt: str, tok, think: bool = False) -> str:
     """Wrap a prompt as a chat turn, for models that use ChatML.
 
     The stored template is Jinja, and rendering Jinja to run one prompt is
     more machinery than it is worth. ChatML is recognisable and it is what
     the small instruct models here use; anything else is left alone rather
     than mangled into a format the model was not trained on.
+
+    A reasoning model needs one thing more. Its template does not stop at
+    the assistant marker -- it opens a thinking channel too, and the model
+    was trained expecting to find one already open:
+
+        <|im_start|>assistant\\n<think>\\n
+
+    Left off, the model opens the channel itself and reasons for as long as
+    it likes before answering, so a run with any sane token budget shows
+    working and no answer. That reads exactly like a broken forward pass
+    and is not one. Closing the channel immediately -- an empty pair of
+    tags -- is how these templates express "answer directly", and it is
+    the default here because a one-shot completion is the case `run`
+    serves. `--think` asks for the channel left open.
     """
-    if "<|im_start|>" not in (tok.chat_template or ""):
+    template = tok.chat_template or ""
+    if "<|im_start|>" not in template:
         return prompt
-    return (
-        f"<|im_start|>user\n{prompt}<|im_end|>\n<|im_start|>assistant\n"
-    )
+    turn = f"<|im_start|>user\n{prompt}<|im_end|>\n<|im_start|>assistant\n"
+    if "<think>" not in template:
+        return turn
+    return turn + ("<think>\n" if think else "<think>\n\n</think>\n\n")
 
 
 def run_cli(args, on_error=None):
@@ -2491,6 +2572,7 @@ def run_cli(args, on_error=None):
             args.input, args.prompt,
             max_tokens=args.max_tokens, temperature=args.temp, top_p=args.top_p,
             seed=args.seed, stream=args.stream, chat=args.chat,
+            think=getattr(args, 'think', False),
             verbose=not args.quiet, backend=args.backend,
             pack_bits=args.pack, kv_bits=args.kv_bits,
             expert_cache=0 if args.experts in (None, "all") else args.experts,

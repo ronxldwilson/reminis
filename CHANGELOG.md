@@ -9,6 +9,48 @@ rather than compared against a number from earlier in the day.
 `bench.py` produces these figures; `tests/test_prerelease.py` is the gate every
 release below had to pass.
 
+## 0.33.1 -- the index says which width it is, and `--chat` finishes the turn
+
+Three things 0.33.0 got wrong quietly, and one measurement that came back
+negative and is recorded rather than shipped.
+
+**A packed index now says when it is not the width you asked for.** It holds
+one width, and a run asking for another got the index's silently -- so
+`--pack 4` against an index built at 3 could produce three-bit weights and
+report nothing. The index still wins, because rebuilding every weight per run
+is the cost it exists to remove, but it says so and names the command that
+changes it.
+
+**`--chat` finishes the assistant turn on a reasoning model.** These templates
+do not stop at `<|im_start|>assistant\n`; they open a thinking channel too,
+and the model was trained expecting to find one open. Left off, the model
+opens its own and reasons for as long as it likes, so any ordinary token
+budget showed working and no answer -- which reads exactly like a broken
+forward pass. `--chat` now closes the channel immediately, which is how these
+templates express "answer directly", and `--think` leaves it open for when the
+working is the point.
+
+**The packed index has tests.** It shipped with none. They check the property
+that matters: logits through the index are *bit-identical* to logits without
+it, the index is demonstrably the thing that served them rather than assumed
+to be, a float run ignores it, and building then dropping leaves the model
+byte-for-byte where it started.
+
+**The bit-exact repack now threads.** `ggml_repack` moves bits rather than
+decoding, and the prefetch skipped it on that reasoning -- which left a
+bit-exact load of a Q4_K model entirely single-threaded. Qwen3.5-4B, cold, to
+first token: **66s -> 58s**. Eight threads repack 3.8x faster in isolation and
+this is 12%, because the pipeline is bounded by the device upload the main
+thread does either way. The isolated figure is the one to distrust.
+
+**Compiling the recurrence was tried and removed.** `mx.compile` over the
+whole delta-rule step is the obvious move -- a dozen small elementwise
+operations issued one at a time, forty-eight layers deep on the 27B -- and it
+measured 25.29 tok/s against 25.07 on the 4B, and 4.36 against 4.6 on the 27B.
+Neither is a difference. What the step spends is in the two matrix products,
+which were already single kernels. The finding is a comment in `arch.py` so
+the next person does not spend the afternoon on it.
+
 ## 0.33.0 -- a hybrid architecture, and loading it as a read
 
 **New architecture: `qwen35`,** which Qwen 3.5 and Qwen 3.8 are written in.
