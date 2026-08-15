@@ -1179,7 +1179,7 @@ wheels = [
 
 [[package]]
 name = "reminis"
-version = "0.32.4"
+version = "0.33.0"
 source = { editable = "." }
 dependencies = [
     { name = "gguf" },

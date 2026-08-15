@@ -439,3 +439,483 @@ class Gemma4(Arch):
             return logits
         xp = model.backend.xp
         return xp.tanh(logits / cap) * cap
+
+
+@register
+class Qwen35(Arch):
+    """Qwen 3.5 / 3.8: hybrid DeltaNet-attention with gated outputs.
+
+    Three layers out of four are Gated DeltaNet recurrent blocks; the
+    fourth is full attention with a learned sigmoid gate on the output.
+    Both types share a standard SwiGLU feed-forward after the mixing.
+
+    The DeltaNet block carries a per-head outer-product state matrix
+    rather than a KV cache, so memory per token is zero for those
+    layers. The state is [n_v_heads, head_dim, head_dim] updated by
+    ``S = exp(gate) * S + beta * outer(k, v)`` each token.
+
+    The full-attention block projects Q to twice the head dimension:
+    the first half is the query (normalised), the second half is a
+    sigmoid gate applied to the attention output.
+    """
+
+    name = "qwen35"
+    rope_style = "neox"
+
+    def configure(self, cfg, meta: dict, store) -> None:
+        a = cfg.arch
+
+        def num(key, default=None):
+            value = meta.get(f"{a}.{key}")
+            if value is None:
+                return default
+            return (float(value) if "." in str(value) or "e" in str(value).lower()
+                    else int(value))
+
+        # `block_count` counts one more block than the model runs. The last
+        # is the multi-token-prediction head -- it carries `nextn.*` tensors
+        # and no attention or recurrent mixing of its own, and it exists to
+        # let a speculative decoder guess the token after next. Running it as
+        # if it were layer 65 of the stack reads tensors that are not there.
+        # Generation uses the layers below it and stops.
+        cfg.nextn_layers = int(num("nextn_predict_layers", 0))
+        cfg.n_layers -= cfg.nextn_layers
+
+        cfg.ssm_conv_kernel = int(num("ssm.conv_kernel", 4))
+        cfg.ssm_state_size = int(num("ssm.state_size", 128))
+        cfg.ssm_group_count = int(num("ssm.group_count", 16))
+        cfg.ssm_dt_rank = int(num("ssm.time_step_rank", 48))
+        cfg.ssm_inner_size = int(num("ssm.inner_size", 6144))
+        cfg.full_attn_interval = int(num("full_attention_interval", 4))
+        # The recurrent block's head geometry is not the attention block's,
+        # and every number below is pinned by a tensor shape rather than
+        # guessed: ssm_norm is [state_size], so that is the head width for
+        # both keys and values; inner_size / that width gives the value
+        # heads, which is why it equals time_step_rank -- the decay and the
+        # input gate carry one value per value head. The keys have
+        # group_count heads of the same width, so 2048 = 16 * 128 is the
+        # key half of the fused projection, twice over for query and key.
+        cfg.ssm_head_dim = cfg.ssm_state_size
+        cfg.ssm_n_v_heads = cfg.ssm_inner_size // cfg.ssm_head_dim
+        cfg.ssm_n_k_heads = cfg.ssm_group_count
+        cfg.ssm_k_dim = cfg.ssm_n_k_heads * cfg.ssm_head_dim
+        cfg.ssm_v_dim = cfg.ssm_n_v_heads * cfg.ssm_head_dim
+
+        # The attention scale is left as the shared config worked it out,
+        # 1/sqrt(head_dim). Normalising queries and keys before the product
+        # does not replace it here: this architecture keeps both, where
+        # gemma folds the scale into its query norm and drops it. Setting it
+        # to 1 with a head width of 256 makes every score sixteen times too
+        # large, which saturates the softmax into attending to one token and
+        # reads as a model that has lost the thread rather than as an error.
+
+        # One layer in `full_attention_interval` attends; the rest recur.
+        cfg.is_ssm_layer = [
+            (i + 1) % cfg.full_attn_interval != 0
+            for i in range(cfg.n_layers)
+        ]
+
+        # The recurrence multiplies its state by exp(softplus(...) * ssm_a)
+        # every token, and softplus is positive, so ssm_a carries the sign.
+        # It has to be negative: at zero the state never forgets, and above
+        # zero it grows without bound. Neither raises anywhere on its own --
+        # the state saturates and the model produces fluent nonsense, which
+        # is the failure this whole file is written to avoid.
+        #
+        # The reference computes the log-decay as
+        #     g = -exp(A_log) * softplus(a + dt_bias)
+        # so the checkpoint's parameter is a *log*, positive, and the
+        # negation and exponential are applied around it. Converters fold
+        # both in and write -exp(A_log) directly, which is why multiplying
+        # by the stored value is right and the stored value is negative. A
+        # file that kept the raw A_log instead would need `-exp(ssm_a)`
+        # here, and this is what says so rather than leaving it to be
+        # inferred from bad output.
+        if store.has("blk.0.ssm_a"):
+            worst = float(store.get_numpy("blk.0.ssm_a").max())
+            if worst >= 0.0:
+                raise ValueError(
+                    f"This model's ssm_a is not negative (max {worst:+.4g}), "
+                    f"so the recurrent state would not decay and the model "
+                    f"would produce fluent nonsense rather than fail.\n"
+                    f"reminis reads the decay as "
+                    f"exp(softplus(alpha + dt_bias) * ssm_a), which expects "
+                    f"the converter to have folded in the reference's "
+                    f"leading minus and exponential. This file appears to "
+                    f"store the raw A_log, which needs -exp(ssm_a) instead."
+                )
+
+        # The key/value cache advances its length on the last layer, on the
+        # assumption that every layer appended to it. Here most layers do
+        # not, so that only holds while the last one attends -- which it
+        # does for this architecture as published. If a future variant
+        # ends on a recurrent layer, the cache would silently stop growing
+        # and every token after the first would attend to a stale span, so
+        # this refuses rather than generating quietly wrong text.
+        if cfg.is_ssm_layer[-1]:
+            raise ValueError(
+                f"This model's last layer is recurrent, which the key/value "
+                f"cache does not support: it tracks its length on layer "
+                f"{cfg.n_layers - 1}, and that layer never appends to it."
+            )
+
+    def _causal_conv1d(self, model, x, kernel, conv_state):
+        """A short depthwise convolution over time, carrying its own state.
+
+        `x` is (tokens, channels) and the kernel is one filter per channel.
+        GGUF writes it (kernel_size, channels) and reminis reverses shapes on
+        the way out of the database, so it arrives transposed and is put back
+        here rather than at every call site.
+
+        The state is the last `kernel_size - 1` inputs, which is what makes
+        the convolution causal across calls as well as within one: decoding
+        hands in a single token and the window it needs is the three that
+        came before, which were seen on earlier calls and are gone otherwise.
+        """
+        b = model.backend
+        xp = b.xp
+        channels = x.shape[-1]
+        if kernel.shape[0] == channels:
+            kernel = kernel.T
+        k_size = kernel.shape[0]
+
+        if conv_state is None:
+            conv_state = b.zeros((k_size - 1, channels))
+        padded = xp.concatenate([conv_state, x], axis=0)
+
+        # One term per kernel tap rather than one per token: tap j multiplies
+        # the whole sequence shifted by j, so a prompt of any length costs
+        # four vector operations instead of four per token. The two are the
+        # same sum, reassociated.
+        n = x.shape[0]
+        out = padded[0:n] * kernel[0]
+        for j in range(1, k_size):
+            out = out + padded[j:j + n] * kernel[j]
+
+        # The carried window has the same chaining problem the recurrent
+        # state does -- it is a slice of an array built from the previous
+        # call's window. Both are forced together by the caller, once per
+        # layer, rather than separately here and there.
+        return out, padded[-(k_size - 1):]
+
+    def _l2_norm(self, backend, x, eps=1e-6):
+        """Queries and keys are unit vectors before the recurrence.
+
+        The epsilon matches the reference implementation's `l2norm(..., eps
+        =1e-6)` rather than being chosen for float32 -- it is large enough
+        to matter on a short head, so a smaller one is a different function.
+        """
+        xp = backend.xp
+        return x / xp.sqrt(xp.sum(x * x, axis=-1, keepdims=True) + eps)
+
+    def _deltanet_scan(self, model, q, k, v, gate, beta, ssm_state):
+        """Gated DeltaNet recurrence, one step per token, all heads at once.
+
+        q, k: [n_tokens, n_k_heads, head_dim]
+        v:    [n_tokens, n_v_heads, head_dim]
+        gate: [n_tokens, n_v_heads] -- exp(gate) is the decay
+        beta: [n_tokens, n_v_heads] -- the input gate
+
+        The state is one matrix per value head, [key_dim, value_dim], and a
+        token both writes to it and reads from it. The update is a *delta*
+        rule, which is what the name of the architecture is about and is
+        not the same as gated linear attention:
+
+            S      = exp(gate) * S          decay what is already stored
+            stored = S^T k                  what S currently returns for k
+            S      = S + k (v - stored)^T   write only the difference
+            y      = S^T q
+
+        The third line is the whole point. Writing `S + beta * k v^T`
+        instead -- accumulating the value rather than the correction --
+        looks nearly the same and behaves nothing like it: a key that
+        recurs keeps adding its value to a direction that already holds it,
+        the state grows along that direction until it dominates every
+        readout, and the model emits the same token forever. It does not
+        diverge to infinity or produce a NaN, so nothing catches it; the
+        output is simply stuck. That was the first thing this
+        implementation did on the real weights.
+
+        The loop over positions is inherent -- each state depends on the one
+        before it -- but the loop over heads is not, and running 48 of them
+        as separate small matrix products per token per layer costs far more
+        in dispatch than in arithmetic. So heads are a batch axis here and
+        only time is stepped.
+
+        Keys and queries come in grouped, `n_v_heads / n_k_heads` value heads
+        to each, the same arrangement grouped-query attention uses.
+
+        The state is held in float32 even where the rest of the model is
+        half precision, which is what the reference does and is not a
+        precaution to be economised on. Every other tensor here is written
+        once and read once, so a rounding is a rounding; this one is fed
+        back into itself at every token, so a rounding compounds. With a
+        decay near one a head accumulates hundreds of contributions before
+        the oldest fades, and float16 has about three decimal digits to
+        hold the sum in. The error would not look like an error -- it looks
+        like a model that gradually loses the thread of a long answer.
+        """
+        b = model.backend
+        xp = b.xp
+        n_tokens, n_v_heads, head_dim = v.shape
+        n_k_heads = q.shape[1]
+        if n_v_heads > n_k_heads:
+            # Value head h uses key head h % n_k_heads -- the key heads are
+            # cycled through, not held while the value heads advance. The
+            # difference is exactly repeat versus tile, both produce an
+            # array of the right shape, and only one pairs each value with
+            # the key its weights were trained against.
+            times = n_v_heads // n_k_heads
+            q = xp.concatenate([q] * times, axis=1)
+            k = xp.concatenate([k] * times, axis=1)
+
+        wide = b.to_compute32
+        q, k, v = wide(q), wide(k), wide(v)
+        if ssm_state is None:
+            ssm_state = xp.zeros((n_v_heads, head_dim, head_dim),
+                                 dtype=type(b).float32_dtype())
+
+        decay = xp.exp(wide(gate))
+        beta = wide(beta)
+        # The readout is scaled by 1/sqrt(head_dim); the state is not. This
+        # is the one part of the recurrence that the architecture's own
+        # description does not mention and only the kernel shows -- without
+        # it every value leaving a recurrent layer is eleven times too
+        # large here, which is not enough to overflow and is far too much
+        # to be right.
+        scale = 1.0 / math.sqrt(head_dim)
+        outputs = []
+        for t in range(n_tokens):
+            kt = k[t][:, :, None]                       # (heads, key, 1)
+            ssm_state = decay[t][:, None, None] * ssm_state
+
+            # What the state already returns for this key, and the part of
+            # the new value it does not yet account for. Reading is the
+            # state contracted over its key axis, which is a matrix product
+            # against the transpose rather than an einsum.
+            stored = (xp.swapaxes(ssm_state, -1, -2) @ kt)[..., 0]
+            delta = (v[t] - stored) * beta[t][:, None]
+
+            ssm_state = ssm_state + kt * delta[:, None, :]
+            outputs.append(
+                (xp.swapaxes(ssm_state, -1, -2) @ q[t][:, :, None])
+                .reshape(1, n_v_heads * head_dim) * scale
+            )
+
+        # Back to the compute dtype on the way out: what follows is a
+        # quantized matrix multiply, which wants the backend's own width.
+        out = xp.concatenate(outputs, axis=0).astype(b.compute_dtype)
+
+        return out, ssm_state
+
+    def _ssm_block(self, model, x, layer, ssm_states, offset):
+        b = model.backend
+        xp = b.xp
+        cfg = model.cfg
+        p = f"blk.{layer}."
+
+        h = b.rms_norm(x, model.store.get(p + "attn_norm.weight").reshape(-1),
+                       cfg.rms_eps)
+
+        qkv = model._linear(h, p + "attn_qkv.weight")
+        z = model._linear(h, p + "attn_gate.weight")
+
+        conv_kernel = model.store.get(p + "ssm_conv1d.weight")
+        conv_state = ssm_states.get_conv(layer)
+        qkv_conv, new_conv = self._causal_conv1d(model, qkv, conv_kernel,
+                                                  conv_state)
+        ssm_states.set_conv(layer, new_conv)
+        qkv_conv = b.silu(qkv_conv)
+
+        # Three contiguous blocks, not the per-group interleaving the
+        # reference checkpoint uses: the conversion to GGUF already
+        # rearranges `fix_query_key_value_ordering`'s grouped layout into
+        # one run of queries, one of keys and one of values. Reading it the
+        # reference's way instead was measurably worse, which is the only
+        # evidence available -- the widths are consistent with both.
+        n_tokens = x.shape[0]
+        d = cfg.ssm_head_dim
+        k_dim = cfg.ssm_k_dim
+
+        q_part = self._l2_norm(b, qkv_conv[:, :k_dim].reshape(
+            n_tokens, cfg.ssm_n_k_heads, d))
+        k_part = self._l2_norm(b, qkv_conv[:, k_dim:2 * k_dim].reshape(
+            n_tokens, cfg.ssm_n_k_heads, d))
+        v_part = qkv_conv[:, 2 * k_dim:].reshape(
+            n_tokens, cfg.ssm_n_v_heads, d)
+
+        # The decay and the input gate carry one value per value head, so
+        # both projections land at exactly n_v_heads and nothing is
+        # broadcast: ssm_alpha and ssm_beta are [d_model, 48] and there are
+        # 48 value heads.
+        # In float32, as the reference computes it: this feeds an
+        # exponential whose result multiplies the state at every token, so
+        # it is the one scalar per head where half precision is visible.
+        alpha = b.to_compute32(model._linear(h, p + "ssm_alpha.weight"))
+        alpha = alpha + b.to_compute32(
+            model.store.get(p + "ssm_dt.bias").reshape(1, -1))
+        gate = _softplus(xp, alpha) * b.to_compute32(
+            model.store.get(p + "ssm_a").reshape(1, -1))
+        beta_val = b.sigmoid(model._linear(h, p + "ssm_beta.weight"))
+
+        scan_state = ssm_states.get_ssm(layer)
+        scan_out, new_state = self._deltanet_scan(
+            model, q_part, k_part, v_part, gate, beta_val, scan_state)
+        ssm_states.set_ssm(layer, new_state)
+
+        # Collapse both carried states, once for the layer.
+        #
+        # Each is built from its own value at the previous token, so on a
+        # lazy backend nothing collapses the chain: the logits are the only
+        # thing evaluated per token, and by then the states have been
+        # stored away and are no longer part of what the logits reference.
+        # Left alone the graph grows without bound -- measured on this
+        # model, memory climbed past the device's working set and every
+        # token cost more than the one before, which reads as a model that
+        # slows down the longer it talks rather than as a leak.
+        #
+        # Scheduled rather than waited on. Nothing in this layer or the
+        # next needs the state's value -- it is read at the *following*
+        # token -- so blocking here would stall the processor against the
+        # device once per recurrent layer, forty-eight times a token on the
+        # larger model, purely to learn something no one is asking. The
+        # graph is released either way; the forward pass's own eval of the
+        # logits is the one place a barrier is actually wanted.
+        b.eval_async(scan_out, new_state, new_conv)
+
+        ssm_norm = model.store.get(p + "ssm_norm.weight").reshape(-1)
+        # Gated RMS norm: normalise per head, then scale by the gate. The
+        # gate goes through silu rather than the sigmoid a gate usually
+        # takes -- checked against the reference, whose norm is configured
+        # with activation "silu". A sigmoid here still produces text, and
+        # slightly wrong text is the hardest kind of wrong to notice.
+        scan_out = _group_rms_norm(b, scan_out, ssm_norm,
+                                   cfg.ssm_n_v_heads, cfg.ssm_head_dim,
+                                   cfg.rms_eps)
+        scan_out = scan_out * b.silu(z)
+
+        attn_out = model._linear(scan_out, p + "ssm_out.weight")
+        return x + attn_out
+
+    def _attn_block(self, model, x, layer, cache, offset):
+        b = model.backend
+        xp = b.xp
+        cfg = model.cfg
+        p = f"blk.{layer}."
+        n_tokens = x.shape[0]
+
+        h = b.rms_norm(x, model.store.get(p + "attn_norm.weight").reshape(-1),
+                       cfg.rms_eps)
+
+        # The query projection is twice the head width, and the second half
+        # of each *head* is a gate on that head's output -- not the second
+        # half of the whole vector. The reference views the projection as
+        # (heads, 2 * head_dim) before splitting, so flattened it reads
+        # q0 g0 q1 g1 ... rather than q0 q1 ... g0 g1 ...
+        #
+        # Splitting the flat vector down the middle instead takes the first
+        # half of the heads, queries and gates interleaved, and calls it the
+        # query. Every head then attends with another head's gate applied to
+        # something that is not a query. It produces confident nonsense and
+        # nothing about the shapes objects, since both halves are the same
+        # size either way.
+        q_full = model._linear(h, p + "attn_q.weight").reshape(
+            n_tokens, cfg.n_heads, 2 * cfg.head_dim)
+        q = q_full[..., :cfg.head_dim]
+        q_gate = q_full[..., cfg.head_dim:].reshape(n_tokens, -1)
+
+        k = model._linear(h, p + "attn_k.weight")
+        v = model._linear(h, p + "attn_v.weight")
+
+        k = k.reshape(n_tokens, cfg.n_kv_heads, cfg.head_dim)
+        v = v.reshape(n_tokens, cfg.n_kv_heads, cfg.head_dim)
+
+        q = b.rms_norm(q, model.store.get(p + "attn_q_norm.weight").reshape(-1),
+                       cfg.rms_eps)
+        k = b.rms_norm(k, model.store.get(p + "attn_k_norm.weight").reshape(-1),
+                       cfg.rms_eps)
+
+        q = q.transpose(1, 0, 2)[None]
+        k = k.transpose(1, 0, 2)[None]
+        v = v.transpose(1, 0, 2)[None]
+
+        q = b.rope(q, cfg.rope_dim, False, cfg.rope_base, offset, cfg.rope_freqs)
+        k = b.rope(k, cfg.rope_dim, False, cfg.rope_base, offset, cfg.rope_freqs)
+
+        k_all, v_all = cache.append(layer, k, v)
+
+        mask = None
+        if n_tokens > 1:
+            mask = model._causal_mask(n_tokens, offset, k_all.shape[-2], 0)
+
+        out = b.attention(q, k_all, v_all, cfg.attn_scale, mask, None)
+        out = out[0].transpose(1, 0, 2).reshape(n_tokens, cfg.n_heads * cfg.head_dim)
+        out = out * b.sigmoid(q_gate)
+
+        return x + model._linear(out, p + "attn_output.weight")
+
+    def block(self, model, x, layer: int, cache, offset: int):
+        cfg = model.cfg
+        p = f"blk.{layer}."
+
+        ssm_states = getattr(model, "_ssm_states", None)
+        if ssm_states is None:
+            ssm_states = SSMState(cfg.n_layers, model.backend)
+            model._ssm_states = ssm_states
+
+        if cfg.is_ssm_layer[layer]:
+            x = self._ssm_block(model, x, layer, ssm_states, offset)
+        else:
+            x = self._attn_block(model, x, layer, cache, offset)
+
+        b = model.backend
+        ffn_norm_name = (p + "ffn_norm.weight" if model.store.has(p + "ffn_norm.weight")
+                         else p + "post_attention_norm.weight")
+        h = b.rms_norm(x, model.store.get(ffn_norm_name).reshape(-1), cfg.rms_eps)
+        gate = model._linear(h, p + "ffn_gate.weight")
+        up = model._linear(h, p + "ffn_up.weight")
+        return x + model._linear(b.silu(gate) * up, p + "ffn_down.weight")
+
+
+class SSMState:
+    """Hidden state for DeltaNet layers — conv buffers and scan states."""
+
+    def __init__(self, n_layers, backend):
+        self._conv = [None] * n_layers
+        self._ssm = [None] * n_layers
+        self.backend = backend
+
+    def get_conv(self, layer):
+        return self._conv[layer]
+
+    def set_conv(self, layer, state):
+        self._conv[layer] = state
+
+    def get_ssm(self, layer):
+        return self._ssm[layer]
+
+    def set_ssm(self, layer, state):
+        self._ssm[layer] = state
+
+
+def _softplus(xp, x):
+    """log(1 + exp(x)), by a route that does not overflow.
+
+    Written directly, the exponential is unbounded and half precision runs
+    out at about x = 11: exp(12) is already infinity in float16, so
+    log(1 + exp(x)) returns infinity for every larger input. That does not
+    raise. It makes the decay exp(inf * negative) exactly zero, so the
+    affected heads quietly forget everything and the model keeps talking.
+
+    The identity below moves the large part outside the exponential --
+    softplus(x) = max(x, 0) + log1p(exp(-|x|)) -- so the argument is never
+    positive and the result is exact across the whole range.
+    """
+    return xp.maximum(x, 0) + xp.log1p(xp.exp(-xp.abs(x)))
+
+
+def _group_rms_norm(backend, x, weight, n_heads, head_dim, eps):
+    shape = x.shape
+    x = x.reshape(*shape[:-1], n_heads, head_dim)
+    x = backend.rms_norm(x, weight, eps)
+    return x.reshape(shape)

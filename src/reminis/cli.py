@@ -74,11 +74,12 @@ def cmd_run(args, parser):
     if args.pack is not None and args.pack != "native":
         if args.pack == "compact":
             pass
-        elif args.pack in ("4", "6", "8"):
+        elif args.pack in ("2", "3", "4", "5", "6", "8"):
             args.pack = int(args.pack)
         else:
             parser.error(
-                "--pack takes no value (bit-exact), 'compact', or 4, 6 or 8"
+                "--pack takes no value (bit-exact), 'compact', or a width: "
+                "2, 3, 4, 5, 6 or 8"
             )
     if args.experts is not None and args.experts != "all":
         if not args.experts.isdigit() or int(args.experts) < 1:
@@ -302,9 +303,12 @@ def build_parser() -> argparse.ArgumentParser:
              "model stored as floats. "
              "'compact': the same with half-precision scales, 17%% smaller "
              "for a measured 8e-04 relative error. "
-             "4, 6 or 8: re-quantize to that width, which works on any model "
-             "-- 8 is imperceptible and the fastest option for an F16 file, "
-             "4 visibly reorders the top-5 tokens.",
+             "A width (2, 3, 4, 5, 6, 8): re-quantize to it, which works on "
+             "any model -- 8 is imperceptible and the fastest option for an "
+             "F16 file, 4 visibly reorders the top-5 tokens. A width is also "
+             "the way to cap memory when the bit-exact path would round a "
+             "narrow quantization *up*: a 3-bit i-quant has no exact affine "
+             "form, so it is otherwise rebuilt at 4 bits and grows.",
     )
     p_run.add_argument(
         "--kv-bits", type=int, choices=(4, 8), metavar="BITS",
@@ -460,6 +464,15 @@ def build_parser() -> argparse.ArgumentParser:
         "--group", type=int, default=128, choices=(32, 64, 128),
         help="Weights per scale in the index (default 128)",
     )
+    p_prepare.add_argument(
+        "--weights", action="store_true",
+        help="Index the dense weight matrices instead of the experts, so "
+             "that loading the model is a read rather than a decode. A "
+             "quantized model is otherwise unpacked and re-packed in full "
+             "on every run -- 466 seconds for a 27B at 3 bits, to rebuild "
+             "what the last run already built. Costs a second copy of the "
+             "weights on disk, which --drop reclaims.",
+    )
     p_prepare.add_argument("--drop", action="store_true",
                            help="Delete the index and reclaim its space")
     p_prepare.set_defaults(func=_prepare)
@@ -567,20 +580,42 @@ def main():
 
 
 def _prepare(args, parser):
-    """Build or drop the materialized expert index."""
-    from reminis import expert_index
+    """Build or drop a materialized index -- of experts, or of weights."""
+    from reminis import expert_index, packed_index
 
     if not Path(args.database).exists():
         parser.error(f"Database not found: {args.database}")
 
+    index = packed_index if args.weights else expert_index
+    label = "packed weight index" if args.weights else "expert index"
+
     if args.drop:
         before = Path(args.database).stat().st_size
-        if not expert_index.drop(args.database):
-            print("There was no expert index to drop.")
+        if not index.drop(args.database):
+            print(f"There was no {label} to drop.")
             return
         after = Path(args.database).stat().st_size
-        print(f"Dropped the expert index and reclaimed "
+        print(f"Dropped the {label} and reclaimed "
               f"{(before - after) / 1e9:.2f} GB.")
+        return
+
+    if args.weights:
+        def weight_progress(done, total, name, written, elapsed):
+            rate = written / elapsed / 1e9 if elapsed else 0
+            print(f"\r  [{done:>3}/{total}] {name:<32} "
+                  f"{written / 1e9:5.2f} GB, {rate:.2f} GB/s",
+                  end="", flush=True)
+
+        print(f"Packing the weights of {args.database} at {args.bits} bits")
+        summary = packed_index.build(args.database, bits=args.bits,
+                                     group_size=args.group,
+                                     progress=weight_progress)
+        print()
+        print(f"Wrote {summary['tensors']:,} tensors, "
+              f"{summary['bytes'] / 1e9:.2f} GB at {summary['bits']} bits, "
+              f"in {summary['seconds']:.0f}s.")
+        print(f"`reminis run --pack {args.bits}` will now read them straight "
+              f"out of it. `reminis prepare --weights --drop` undoes this.")
         return
 
     def progress(done, total, name, experts, written, elapsed):

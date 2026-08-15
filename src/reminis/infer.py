@@ -64,6 +64,7 @@ from reminis.dtypes import (
 )
 from reminis import arch as arch_registry
 from reminis.expert_index import read_layouts as read_expert_layouts
+from reminis.packed_index import read_layouts as read_packed_layouts
 from reminis.ggml_affine import AFFINE_GROUP, can_repack, nearest_bits
 from reminis.ggml_affine import repack as ggml_repack
 
@@ -163,6 +164,12 @@ class WeightStore:
         # Mixture-of-experts weights are stacked 3-D tensors and are most of
         # such a model's bytes, so they matter more here than anything else.
         "ffn_gate_exps.weight", "ffn_up_exps.weight", "ffn_down_exps.weight",
+        # A recurrent block names its projections differently, and on a model
+        # that is three-quarters recurrent those names are most of the
+        # weights: leaving them off this list left 11 GB of a 13.8 GB model
+        # expanded to float16, which is the whole difference between fitting
+        # on a 16 GB machine and not.
+        "attn_qkv.weight", "attn_gate.weight", "ssm_out.weight",
     )
 
     # The embedding table is indexed rather than multiplied, but on a model
@@ -190,6 +197,7 @@ class WeightStore:
         self._expert_cache = OrderedDict()
         self._expert_shapes = {}
         self._blobs = {}
+        self._prefetch_pool = None
         self._reader = None
         self._expert_layouts = {}
         self._expert_hits = 0
@@ -211,6 +219,11 @@ class WeightStore:
         # one. It is derived from the tensors above and can be dropped, so
         # its absence is ordinary rather than an error.
         self._expert_layouts = read_expert_layouts(self.conn)
+        # The same for the dense matrices, which is what makes loading a
+        # quantized model a read rather than a decode. Consulted only when
+        # packing was asked for, since it holds nothing else.
+        self._packed_layouts = read_packed_layouts(self.conn)
+        self.from_index = 0
         if self._expert_layouts and reader_threads:
             self._reader = _IndexReader(db_path, workers=reader_threads,
                                         mmap_size=self._mmap_size(db_path))
@@ -247,6 +260,129 @@ class WeightStore:
     def has(self, name: str) -> bool:
         return name in self._shapes
 
+    # How many bytes of unpacked-but-not-yet-packed tensors to keep in
+    # flight. Unpacking produces float32, four times what the packed result
+    # will be and sixteen times what a 2-bit source occupied, so this is
+    # the one place where reading ahead can cost more memory than the model
+    # itself.
+    #
+    # The depth is chosen against the model rather than fixed, because the
+    # two demands are in direct competition: on a model that leaves room to
+    # spare, a couple of gigabytes of lookahead costs nothing and keeps the
+    # threads fed; on one that nearly fills the machine, the same lookahead
+    # is taken from the weights and the system compresses one to make room
+    # for the other. A tenth of the file, within these bounds, keeps enough
+    # in flight to matter without being the reason it does not fit.
+    PREFETCH_MIN = 256_000_000
+    PREFETCH_MAX = 2_000_000_000
+    PREFETCH_HEADROOM = 1_500_000_000
+
+    def start_prefetch(self, names, workers: int = 6):
+        """Unpack these tensors on other threads, ahead of being asked for.
+
+        Loading a quantized model is almost entirely `gguf`'s dequantize,
+        which is numpy over the block layout and holds no interpreter lock
+        while it runs -- measured at 3.2x on eight threads. The packing that
+        follows is a GPU call and stays on the calling thread, so the two
+        overlap: the processor unpacks the next tensors while the device
+        packs this one.
+
+        Ordering is a request rather than a promise. Whatever has not
+        arrived when `get` asks for it is simply unpacked there and then, so
+        this can never change what is loaded, only when.
+        """
+        if self.stream or not names:
+            return
+        from concurrent.futures import ThreadPoolExecutor
+
+        try:
+            size = os.path.getsize(self.path)
+        except OSError:
+            size = self.PREFETCH_MAX
+        self.prefetch_bytes_limit = min(
+            self.PREFETCH_MAX, max(self.PREFETCH_MIN, size // 10))
+        # Anything the packed index already holds needs no unpacking, so
+        # reading ahead for it would be work done twice and thrown away.
+        self._prefetch_order = [n for n in names if n in self._shapes
+                                and n not in self._packed_layouts]
+        if not self._prefetch_order:
+            return
+        self._prefetch_done = {}
+        self._prefetch_lock = threading.Lock()
+        self._prefetch_room = threading.Semaphore(0)
+        self._prefetch_bytes = 0
+        self._prefetch_pool = ThreadPoolExecutor(
+            max_workers=workers, thread_name_prefix="reminis-unpack")
+        self._prefetch_local = threading.local()
+        self._prefetch_stop = threading.Event()
+        for name in self._prefetch_order:
+            self._prefetch_pool.submit(self._unpack_one, name)
+
+    def _prefetch_conn(self):
+        conn = getattr(self._prefetch_local, "conn", None)
+        if conn is None:
+            conn = sqlite3.connect(self.path, check_same_thread=False)
+            conn.execute("PRAGMA query_only = 1")
+            self._prefetch_local.conn = conn
+        return conn
+
+    def _unpack_one(self, name):
+        """One tensor's blocks to float32, on a worker thread.
+
+        Waits while the buffer is full rather than racing ahead: the point
+        is to stay a few tensors in front of the forward pass, not to
+        materialise the whole model at four bytes a weight.
+        """
+        if self._prefetch_stop.is_set():
+            return
+        try:
+            while True:
+                with self._prefetch_lock:
+                    if self._prefetch_bytes < self.prefetch_bytes_limit:
+                        break
+                if self._prefetch_stop.wait(0.02):
+                    return
+
+            row = self._prefetch_conn().execute(
+                "SELECT shape, dtype, data FROM tensors WHERE name = ?", (name,)
+            ).fetchone()
+            if row is None:
+                return
+            shape, dtype, blob = row
+            if not is_quantized_dtype(dtype) or can_repack(dtype):
+                # A float tensor needs no unpacking, and an exactly-affine
+                # quantization is rearranged rather than decoded -- neither
+                # is worth a thread.
+                return
+            dims = tuple(ast.literal_eval(shape))[::-1]
+            arr = dequantize_to_float32(blob, dtype).reshape(dims)
+            with self._prefetch_lock:
+                self._prefetch_done[name] = (arr, dtype, dims, len(blob))
+                self._prefetch_bytes += arr.nbytes
+        except Exception:
+            # A prefetch that fails is not an error: `get` will do the work
+            # itself, and whatever is genuinely wrong will surface there
+            # with the right message rather than on a background thread.
+            return
+
+    def take_prefetched(self, name):
+        with self._prefetch_lock:
+            entry = self._prefetch_done.pop(name, None)
+            if entry is not None:
+                self._prefetch_bytes -= entry[0].nbytes
+        return entry
+
+    def stop_prefetch(self):
+        pool = getattr(self, "_prefetch_pool", None)
+        if pool is None:
+            return
+        self._prefetch_stop.set()
+        pool.shutdown(wait=False, cancel_futures=True)
+        with self._prefetch_lock:
+            self._prefetch_done.clear()
+            self._prefetch_bytes = 0
+        self._prefetch_pool = None
+
     def get(self, name: str):
         """A tensor in the backend's compute dtype, row-major.
 
@@ -258,6 +394,39 @@ class WeightStore:
         cached = self._cache.get(name)
         if cached is not None:
             return cached
+
+        # Already in the kernel's layout, sitting in the database: read the
+        # bytes and hand them over. No block format is decoded, no float32
+        # is materialised, and nothing is quantized a second time -- all of
+        # that happened once, when the index was built.
+        indexed = self._from_packed_index(name)
+        if indexed is not None:
+            return indexed
+
+        # Already unpacked by a background thread: skip straight to the
+        # narrowing and packing, which belong on this thread because they
+        # are device calls.
+        ready = (self.take_prefetched(name)
+                 if getattr(self, "_prefetch_pool", None) else None)
+        if ready is not None:
+            arr32, dtype, dims, n_bytes = ready
+            arr = self.backend.from_numpy(arr32)
+            self.backend.eval(arr)
+            del arr32
+            bits = nearest_bits(dtype) if self.pack_bits == "native" else None
+            if isinstance(self.pack_bits, int):
+                bits = self.pack_bits
+            if bits is not None and self.backend.can_pack() and self._packable(name):
+                arr = self.backend.pack(arr, bits,
+                                        _best_group(dims[-1], self.pack_group),
+                                        self.pack_compact)
+                self.packed += 1
+            self.bytes_read += n_bytes
+            self.reads += 1
+            self.dequantized += 1
+            if not self.stream:
+                self._cache[name] = arr
+            return arr
 
         row = self.conn.execute(
             "SELECT shape, dtype, data FROM tensors WHERE name = ?", (name,)
@@ -308,6 +477,37 @@ class WeightStore:
 
         self.bytes_read += len(blob)
         self.reads += 1
+        if not self.stream:
+            self._cache[name] = arr
+        return arr
+
+    def _from_packed_index(self, name: str):
+        """One tensor out of the packed index, or None if it is not there.
+
+        Only consulted when this run asked for packed weights: the index
+        holds them at one width, and a run that wants floats wants the
+        original tensors instead. The width the index was built at wins
+        over the one asked for, since rebuilding it per run is the cost it
+        exists to remove -- `reminis prepare --weights` is where that
+        choice is made, and `--drop` is how it is unmade.
+        """
+        if self.pack_bits is None or not self._packed_layouts:
+            return None
+        layout = self._packed_layouts.get(name)
+        if layout is None or not self.backend.can_pack():
+            return None
+
+        with self.conn.blobopen("packed_index", "block", layout.row_id,
+                                readonly=True) as handle:
+            raw = handle.read()
+        words, scales, biases = layout.split(raw)
+        arr = self.backend.adopt_packed(words, scales, biases, layout.bits,
+                                        layout.group_size, layout.shape,
+                                        compact=True)
+        self.bytes_read += len(raw)
+        self.reads += 1
+        self.packed += 1
+        self.from_index += 1
         if not self.stream:
             self._cache[name] = arr
         return arr
@@ -505,6 +705,7 @@ class WeightStore:
         return hasattr(self.conn, "blobopen")
 
     def close(self):
+        self.stop_prefetch()
         if self._reader is not None:
             self._reader.close()
             self._reader = None
@@ -763,6 +964,30 @@ _GPT4O_PATTERN = (
     r"|\s+"
 )
 
+# qwen 3.5's splitter, which is not qwen2's and not llama 3's. Two
+# differences, and the first one matters on every number in every prompt:
+#
+#   digits    `\p{N}` matches one digit at a time, where llama 3 takes runs
+#             of up to three. "2026" is four pieces here and two there, and
+#             a model asked to do arithmetic on the wrong pieces answers
+#             fluently and wrongly.
+#   marks     `\p{M}` joins combining marks to the letter they modify, so a
+#             decomposed accent stays with its base rather than splitting
+#             off into the punctuation class.
+#
+# Like gpt-4o's, this needs Unicode general categories that Python's `re`
+# does not have, so it is only available with the `regex` module and says
+# so rather than silently splitting a different way.
+_QWEN35_PATTERN = (
+    r"(?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])"
+    r"|[^\r\n\p{L}\p{N}]?[\p{L}\p{M}]+"
+    r"|\p{N}"
+    r"| ?[^\s\p{L}\p{M}\p{N}]+[\r\n]*"
+    r"|\s*[\r\n]+"
+    r"|\s+(?!\S)"
+    r"|\s+"
+)
+
 _PRETOKENIZERS["qwen2"] = _PRETOKENIZERS["llama-bpe"]
 _PRETOKENIZERS["smollm"] = _PRETOKENIZERS["default"]
 _PRETOKENIZERS["gpt-2"] = _PRETOKENIZERS["default"]
@@ -1003,30 +1228,42 @@ class BPETokenizer:
         self.ids = {t: i for i, t in enumerate(self.tokens)}
         self.ranks = {tuple(m.split(" ")): i for i, m in enumerate(merges)}
 
-        # GGUF token type 3 is CONTROL: <|im_start|> and friends, which must
-        # be matched whole rather than split into bytes. Numeric GGUF arrays
-        # come back as one-element lists per entry, since that is how the
-        # reader hands them over.
+        # Token types 3 and 4 are CONTROL and USER_DEFINED -- <|im_start|>
+        # and friends, and markers like <think> that a chat template writes
+        # as literal text. Both must be matched whole rather than run
+        # through the splitter, which would cut <think> at the boundary
+        # between its punctuation and its letters and leave BPE unable to
+        # rebuild it: the pieces are all real tokens, so nothing complains,
+        # and the model is handed a sequence it was never trained on.
+        #
+        # Only CONTROL was collected here, while the SentencePiece
+        # tokenizer above already took both. That difference was the bug
+        # rather than a distinction being drawn.
+        #
+        # Numeric GGUF arrays come back as one-element lists per entry,
+        # since that is how the reader hands them over.
         types = [
             t[0] if isinstance(t, (list, tuple)) else t
             for t in _parse_array(meta, "tokenizer.ggml.token_type")
         ]
         self.specials = sorted(
-            (self.tokens[i] for i, t in enumerate(types) if int(t) == 3),
+            (self.tokens[i] for i, t in enumerate(types) if int(t) in (3, 4)),
             key=len, reverse=True,
         )
 
         pre = meta.get("tokenizer.ggml.pre", "default")
-        if pre == "gpt-4o":
+        if pre in ("gpt-4o", "qwen35"):
+            unicode_pattern = _GPT4O_PATTERN if pre == "gpt-4o" else _QWEN35_PATTERN
             try:
                 import regex
             except ImportError:
                 raise UnsupportedModel(
-                    "This model uses the gpt-4o pre-tokenizer, which needs "
-                    "Unicode case classes that Python's `re` does not have.\n"
-                    "  pip install regex"
+                    f"This model uses the {pre} pre-tokenizer, which needs "
+                    f"Unicode general categories that Python's `re` does not "
+                    f"have.\n"
+                    f"  pip install regex"
                 )
-            self.pattern = regex.compile(_GPT4O_PATTERN)
+            self.pattern = regex.compile(unicode_pattern)
         else:
             self.pattern = re.compile(
                 _PRETOKENIZERS.get(pre, _PRETOKENIZERS["default"])
@@ -1280,6 +1517,106 @@ class Model:
         self._rope_cache: tuple | None = None
         self._mask_cache: dict = {}
         self._fused_cache: dict[tuple[int, str], tuple] = {}
+        if pack_bits is not None and not stream and self.backend.can_pack():
+            self._wire_memory()
+            self.store.start_prefetch(self._load_order())
+            self._pack_widest_first()
+
+    def _wire_memory(self):
+        """Ask that the weights, once loaded, be allowed to stay put.
+
+        On unified memory a packed weight is ordinary system memory, and
+        the system compresses ordinary memory when it runs short. It does
+        so silently, and the device then stalls faulting each weight back
+        in on the way to using it -- which is the whole of the forward
+        pass, every token.
+
+        `preload_experts` has wired its index for this reason since it was
+        written, with a measurement attached: a mixture model on this size
+        of machine wandered between 4.6 and 33 tok/s left to the system's
+        judgement and held a flat 41 tok/s once wired. A dense model was
+        never given the same treatment, and it has the same problem for
+        the same reason -- worse, if anything, because every weight is
+        touched for every token rather than the few a router picks.
+
+        The request is a ceiling rather than an allocation, so asking
+        before the weights exist is the right time to ask: it is what
+        stops them being compressed as they arrive. The runtime clamps it
+        to what the device will actually hold.
+        """
+        budget = self.backend.memory_budget()
+        if not budget:
+            return
+        try:
+            size = os.path.getsize(self.store.path)
+        except OSError:
+            return
+        # Packing lands near the file's own size, so that is the estimate.
+        #
+        # What must not be wired is everything else the load needs while it
+        # is happening: the prefetched blocks, the float32 a quantization
+        # is unpacked through, the copy the device narrows from it. Wiring
+        # the weights *and* asking for room to build them leaves the system
+        # nowhere to put anything, and it responds by compressing whatever
+        # is not wired -- which is precisely those working buffers. Asking
+        # for a quarter more than the file, measured on a 9.9 GB model on a
+        # 16 GB machine, pinned 12.3 GB and left the loader thrashing at
+        # half a processor with nothing to show for it.
+        #
+        # So the request is the estimate itself, held back from the whole
+        # of what the device offers. A model that fits easily is unaffected
+        # -- it is below the cap either way.
+        keep_free = max(int(budget * 0.15), WeightStore.PREFETCH_HEADROOM)
+        self.backend.reserve(min(size, max(budget - keep_free, 0)))
+
+    def _load_order(self):
+        """The tensors a forward pass will want, roughly in the order it
+        wants them.
+
+        Only a hint for the prefetcher: it decides how far ahead to read,
+        and being wrong about the order costs a little overlap and nothing
+        else. Embeddings first because `_pack_widest_first` takes them
+        before anything, then each block's weights in the order a layer
+        walks them.
+        """
+        names = [n for n in ("token_embd.weight", "output.weight")
+                 if self.store.has(n)]
+        for layer in range(self.cfg.n_layers):
+            p = f"blk.{layer}."
+            names.extend(
+                p + suffix for suffix in (
+                    "attn_qkv.weight", "attn_gate.weight",
+                    "attn_q.weight", "attn_k.weight", "attn_v.weight",
+                    "attn_output.weight", "ssm_out.weight",
+                    "ffn_gate.weight", "ffn_up.weight", "ffn_down.weight",
+                )
+                if self.store.has(p + suffix)
+            )
+        return names
+
+    def _pack_widest_first(self):
+        """Pack the two vocabulary-sized matrices before anything else.
+
+        Packing a quantization with no affine form has to unpack it to
+        float32 first, and for a matrix the width of the vocabulary that
+        intermediate dwarfs the result: measured on this model's embedding,
+        1.27 billion weights cost 8.5 GB at their peak and 0.52 GB once
+        packed, a factor of sixteen.
+
+        A forward pass reaches the embedding first and the output projection
+        last, so left alone the second of those spikes lands when every
+        layer is already resident -- 11 GB plus 8.5 GB on a 17 GB machine,
+        which does not fail, it swaps, and a model that would have run
+        merely becomes unusable. Paying both spikes up front, while nothing
+        else is loaded, keeps the high-water mark where the packed model
+        is rather than where its largest intermediate is.
+
+        Nothing here changes what ends up in memory, only the order it
+        arrives in, so a model with room to spare is unaffected.
+        """
+        for name in ("token_embd.weight", "output.weight"):
+            if self.store.has(name):
+                self.store.get(name)
 
     def close(self):
         self.store.close()

@@ -347,6 +347,25 @@ reminis prepare model.db --drop   # throw it away, reclaim the space
 
 `prepare` writes a second physical copy of the expert weights — already unpacked, already in the kernel's layout, one row per expert, clustered so a layer's experts are contiguous. It is an index in the ordinary sense: redundant, derived, ordered for one access path, and droppable without losing anything. On gpt-oss-20b it is 2,304 rows and takes 30 seconds.
 
+### The same idea for a dense model
+
+A mixture re-derives the kernel's layout per token. A dense model does it once per *run* — and then throws it away, so the next run does it again. On Qwen3.8-27B at 3 bits that was 466 seconds of unpacking and re-quantizing 27.3 billion weights to rebuild 11 GB the previous run had already built.
+
+```bash
+reminis prepare model.db --weights --bits 3   # build it
+reminis run model.db --pack 3                 # now a seek and a memcpy
+reminis prepare model.db --weights --drop     # reclaim the space
+```
+
+| Qwen3.8-27B, 16 GB machine | without | with |
+|---|---|---|
+| Time to first token | 466 s | **5.3 s** |
+| Decode | 1.0 tok/s | **4.6 tok/s** |
+
+The decode figure was not the point of the index and is the more interesting half. Loading without one materialises the float32 that a quantization is unpacked through — five gigabytes for a vocabulary-sized matrix — and on a machine this size that is enough to make the system compress the weights and fault them back in during the forward pass. Never building it leaves the model resident, and a model that stays put runs at a flat rate.
+
+It costs a second copy of the weights on disk: 11.07 GB beside the original 9.85 GB. The original tensors are untouched, so the database is still the model and still converts back to GGUF.
+
 Then `--experts all` holds the whole index and pins it:
 
 ```bash
@@ -938,6 +957,7 @@ Implemented, and enforced rather than assumed:
 - **Sliding-window attention** — layers that see only the most recent N keys, alternating with full-attention layers on whatever pattern the metadata records.
 - **Float weights** — F32, F16, BF16.
 - **Gemma 4**, which is not a variation on the block above but a different one: head count, head width, rotary base and rotary width all vary per layer; one layer in six attends globally and has no value projection at all, because value *is* key; and a 128-expert mixture runs *beside* the dense feed-forward rather than instead of it, on a separately normalised copy of the same input. Checked layer by layer against transformers' own `modeling_gemma4.py` driven by these weights — all thirty layers agree to a correlation of 0.99997 or better.
+- **Qwen 3.5 / 3.8 (`qwen35`)**, which is a hybrid: three layers in four are Gated DeltaNet — a recurrent block carrying a matrix-valued state instead of a key/value cache — and the fourth is attention with a learned gate on its output. The recurrence is a *delta* rule, `S = exp(g)·S + k(v − Sᵀk)ᵀβ`, and writing it as the more obvious `S += k vᵀβ` gives a model that emits one token forever with no error and no NaN, because a repeated key keeps adding a value the state already holds. Two further details are invisible in the architecture's description and only appear in the kernel: value heads pair to key heads by tiling rather than repeating, and the readout carries a `1/√head_dim` the state does not. Checked against llama.cpp's own eval trace — all twenty-four intermediate tensors of layer 0 agree to within float noise.
 - **Three tokenizer families**, all rebuilt from the database. Byte-level BPE (`gpt2`) matches `transformers` exactly across three vocabularies. SentencePiece (`llama`) matches llama.cpp exactly on 14 strings including special tokens, byte fallback and whitespace edges — it has no merge list at all, merging instead by a score attached to each token, so the vocabulary itself encodes the merge order. And the hybrid Gemma ships: BPE by merge rank over a SentencePiece alphabet, where a space is `▁` and an unmapped byte is the literal text `<0xE2>`. Its scores are all one placeholder, so merging by them would be merging by nothing — which is how it is told apart from real SentencePiece.
 
 Anything else raises. A state-space model is refused by name; a quantized tensor is refused before it can be decoded as though its blocks were floats. A forward pass that guesses produces fluent nonsense, which is worse than an error.

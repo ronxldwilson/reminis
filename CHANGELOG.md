@@ -9,6 +9,87 @@ rather than compared against a number from earlier in the day.
 `bench.py` produces these figures; `tests/test_prerelease.py` is the gate every
 release below had to pass.
 
+## 0.33.0 -- a hybrid architecture, and loading it as a read
+
+**New architecture: `qwen35`,** which Qwen 3.5 and Qwen 3.8 are written in.
+Three layers in every four are Gated DeltaNet -- a recurrent block carrying a
+matrix-valued state rather than a key/value cache -- and the fourth is
+attention with a learned gate on its output. A 27B model is 48 recurrent
+layers and 16 attending ones.
+
+The recurrence is a *delta* rule, and that is the part worth stating plainly
+because writing it as the more obvious thing produces a model that talks:
+
+    S = exp(gate) * S                decay what is stored
+    S = S + k (v - S^T k)^T beta     write only the difference
+    y = S^T q / sqrt(head_dim)
+
+Accumulating `k v^T` instead of the correction looks nearly identical and
+behaves nothing like it -- a key that recurs keeps adding a value the state
+already holds, the state grows along that direction until it dominates every
+readout, and the model emits one token forever. No error, no NaN. Two further
+details have the same character: value heads pair to key heads by tiling
+(`h % n_k_heads`) rather than by repeating, and the readout carries a
+`1/sqrt(head_dim)` the state does not. Each was found by checking every
+intermediate tensor of layer 0 against llama.cpp's own trace; all twenty-four
+now agree to within float noise.
+
+Two smaller things this model needed, both of which were silently wrong
+before rather than absent:
+
+* its pre-tokenizer, which splits digits one at a time where the fallback
+  took whole runs -- `2026` is four tokens here and one under GPT-2's rules,
+  so every number in every prompt was being handed over as ids the model was
+  never trained on;
+* `USER_DEFINED` tokens matched whole. The SentencePiece tokenizer already
+  took token types 3 and 4; the byte-level one took only 3, so `<think>` was
+  shattered into pieces that BPE could not rebuild. The three reference
+  tokenizers this suite checks against are unaffected by the fix.
+
+**New: a packed index over dense weights.** `expert_index` exists because a
+mixture of experts re-derives the kernel's layout per token. A dense model has
+the same problem at load: it unpacks and re-packs every weight before the
+first token and keeps none of it, so the next run does it again. On
+Qwen3.8-27B at 3 bits that was 466 seconds to rebuild 11 GB the previous run
+had already built.
+
+    reminis prepare model.db --weights --bits 3
+    reminis run model.db --pack 3
+    reminis prepare model.db --weights --drop
+
+Loading becomes a primary-key seek and a memcpy into the layout the quantized
+matmul already wants. Time to first token, Qwen3.8-27B: **466s -> 5.3s**. It
+costs a second copy of the weights on disk -- 11.07 GB beside the original
+9.85 GB -- which is the trade an index always offers, and `--drop` reclaims
+it. The original tensors are untouched, so the database is still the model
+and still converts back.
+
+Decoding got faster too, which was not the point and is worth explaining: the
+index never materialises the float32 a quantization is unpacked through, so
+peak memory falls far enough that the system stops compressing the weights
+and faulting them back in mid-forward-pass. Qwen3.8-27B went from 1.0 to
+**4.6 tok/s** on a 16 GB machine.
+
+**Two general speed fixes,** both applying to any packed model on Apple
+silicon:
+
+* the carried state of a recurrent layer is scheduled rather than waited on.
+  It has to be collapsed every token or the graph grows without bound, but
+  nothing needs its value until the *next* token, so blocking stalled the
+  processor against the device once per layer -- forty-eight times a token on
+  the 27B.
+* dense weights are wired, so the system cannot compress them. `reserve` has
+  done this for the expert index since it was written, with a measurement
+  attached; a dense model was never given the same treatment and has the same
+  problem for the same reason.
+
+Qwen3.5-4B, decode: **13.6 -> 25.1 tok/s**, against llama.cpp b10270's 17.7
+on the same file and machine.
+
+`--pack` now takes 2, 3 and 5 as well as 4, 6 and 8. A three-bit i-quant has
+no exact affine form, so the bit-exact path rebuilds it at four bits and it
+*grows*; naming the width is how a model that only just fits is made to fit.
+
 ## 0.32.4 -- an export that cannot write a field stops
 
 **Bug fix: `export` silently dropped metadata it could not encode.** The loop

@@ -150,6 +150,21 @@ class Backend:
     def eval(self, *arrays):
         """Force evaluation, for backends that are lazy. A no-op otherwise."""
 
+    def eval_async(self, *arrays):
+        """Schedule evaluation without waiting for it to finish.
+
+        For the case where something must be computed so that the graph
+        behind it can be released, but nothing needs the value yet. A
+        recurrent state is the example: it has to be collapsed every token
+        or the graph grows without bound, and waiting for it stalls the
+        processor against the device once per layer for no reason -- the
+        next layer's work does not depend on the answer.
+
+        Falls back to the blocking form, which is correct everywhere and
+        merely slower.
+        """
+        self.eval(*arrays)
+
     def reserve(self, n_bytes: int) -> int:
         """Ask that this much of our memory stay put. Returns the old limit.
 
@@ -506,6 +521,9 @@ class MLXBackend(Backend):
 
     def eval(self, *arrays):
         self.mx.eval(*arrays)
+
+    def eval_async(self, *arrays):
+        self.mx.async_eval(*arrays)
 
     def reserve(self, n_bytes: int) -> int:
         """Wire this much memory, so the system cannot page or compress it.
