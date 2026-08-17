@@ -497,6 +497,32 @@ def test_inference():
           "output is not mojibake (block layout OK)")
 
 
+def test_transcription():
+    """A speech model must still hear, and say so out of the database alone.
+
+    The failure this guards against is not a crash: a wrong spectrogram, a
+    dropped mean in LayerNorm, or an unsuppressed token all give a fluent
+    English sentence that is not what the audio said. So the check is for
+    words that are actually in the clip.
+    """
+    section("Transcription")
+    whisper_db = MODELS / "whisper-tiny.db"
+    speech = MODELS / "kokoro-82m" / "samples" / "HEARME.wav"
+    if not whisper_db.exists() or not speech.exists():
+        skip("whisper-tiny.db or the sample audio is not present")
+        return
+
+    from reminis.whisper import transcribe_file
+
+    result = transcribe_file(str(whisper_db), str(speech), verbose=False)
+    text = (result["text"] or "").lower()
+    check(bool(text.strip()), "whisper transcribes audio")
+    check(all(word in text for word in ("open", "model", "parameters")),
+          "the transcription is of this clip, not a fluent substitute")
+    check(result["text"] is not None,
+          "the tokenizer came out of the database")
+
+
 # ── 11. Threaded weights hash consistency ────────────────────────────────
 
 def test_encode_candidates_parallel():
@@ -972,6 +998,7 @@ ALL_TESTS = [
     test_registry,
     test_lowrank,
     test_inference,
+    test_transcription,
     test_encode_candidates_parallel,
     test_diff_tensor_set_changes,
     test_quantize_chunking,

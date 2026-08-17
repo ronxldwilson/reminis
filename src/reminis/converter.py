@@ -40,6 +40,7 @@ from reminis.db import (  # noqa: F401
     INSERT_OR_REPLACE_TENSOR,
     TENSOR_COLUMN_DDL,
     open_for_bulk_write,
+    read_blobs_ahead,
 )
 
 
@@ -625,10 +626,14 @@ def sqlite_to_gguf(db_path: str, gguf_path: str | None = None, verbose: bool = T
     fout = writer.fout[0]
     writer.write_padding(fout, fout.tell())
 
-    for i, (name, shape, dtype_name, n_bytes) in enumerate(plan):
-        (blob,) = conn.execute(
-            "SELECT data FROM tensors WHERE name = ?", (name,)
-        ).fetchone()
+    # Reads run ahead on their own connections while this thread writes.
+    # SQLite serializes writers and does not serialize readers, and the loop
+    # this replaces alternated a blocking read with a write, so neither the
+    # disk nor the writer was ever busy. Order is preserved because
+    # write_ti_data_to_file has already committed to these offsets.
+    blobs = read_blobs_ahead(str(db_path), [name for name, _, _, _ in plan])
+    for i, ((name, shape, dtype_name, n_bytes), (_, blob)) in enumerate(
+            zip(plan, blobs)):
         fout.write(blob)
         writer.write_padding(fout, n_bytes)
         del blob  # one tensor resident at a time, not the whole model

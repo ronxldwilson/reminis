@@ -16,7 +16,7 @@ Once weights are in a database, you get — for free — much of what 40 years o
 
 Not all of it, and reminis tries to be specific about which. Rollback, in particular, does not mean what it means in a database — see [what rollback actually gives you](#what-rollback-actually-gives-you--a-negative-result).
 
-The database is also still a *model*, not an archive of one: `reminis run` generates text straight from the rows, and its logits match `transformers` to 4e-05.
+The database is also still a *model*, not an archive of one: `reminis run` generates text straight from the rows, and its logits match `transformers` to 4e-05. `reminis transcribe` does the same for speech — Whisper transcribes audio out of the database, token-for-token identical to `transformers`, with the spectrogram and the tokenizer coming out of the same file.
 
 ## What this is, and what it is not
 
@@ -50,6 +50,7 @@ Where the small-machine story is real is *upstream* of inference: a 70B model ca
 | Check a model still works after surgery | `reminis run` | It generates text, or it does not. |
 | Move between GGUF and safetensors | `reminis convert`, `reminis export` | Lossless in both directions, verified by SHA256. |
 | Run a quantized model you were given | `reminis run` | Every K-quant and i-quant, unpacked at load; `--pack` to keep it small. |
+| Check a speech model still hears | `reminis transcribe` | Whisper transcribes audio straight from the rows, token-for-token identical to `transformers`. |
 
 ## How it compares
 
@@ -101,6 +102,10 @@ reminis merge sql.db chat.db -o both.db --method ties --base base.db
 
 # Generate text straight from the weights in the database
 reminis run soup.db "The capital of France is"
+
+# Transcribe audio with a Whisper model in the database
+reminis convert ./whisper-tiny/ -o whisper.db
+reminis transcribe whisper.db speech.wav
 
 # See what a tracked training run did, and rewind to a snapshot
 reminis log run.log.db
@@ -276,6 +281,131 @@ The first two only *rearrange* existing quantization, so they have nothing to do
 `--pack compact` holds the per-group scale and bias in float16 instead of float32. At a group size of 32 that is the difference between 6 and 5 bits per weight on a 4-bit tensor — 17% of the model — for a measured **8.3e-04** relative error, far below the quantization already in the file. It is the one thing that stops the repack being bit-exact, so it is opt-in.
 
 `Q6_K`, `Q2_K`, `Q3_K` and the i-quants have no affine form — 16-weight sub-blocks and codebooks respectively. Rather than leave them as float16, which would cost *more* memory than the file did, they are re-quantized to the nearest width. On Mistral-7B that one change was worth 6.55 GB → 5.49 GB and 3.0 → 8.3 tok/s.
+
+### A speech model, out of the same database
+
+Everything above is a text model. `reminis transcribe` runs **Whisper**, which is not one: it is an encoder-decoder over audio, and it shares almost nothing with the block `reminis run` implements.
+
+```bash
+reminis convert ./whisper-tiny/ -o whisper.db
+reminis transcribe whisper.db speech.wav
+```
+
+```
+4 encoder + 4 decoder layers | mlx 0.32.0 (Device(gpu, 0))
+20.8s of audio, resampled from 24000 Hz
+
+Cochoro is an open weight TTS model with 82 million parameters. Despite its
+lightweight architecture, it delivers comparable quality to larger models
+while being significantly faster and more cost-efficient.
+
+57 tokens in 0.33s
+```
+
+The waveform, the spectrogram, both transformer stacks and the tokenizer all come out of the one file. No torch, no `transformers`, no ffmpeg, no config on disk.
+
+Checked against `transformers` running the original checkpoint in float32, on identical features:
+
+| Check | Result |
+|---|---|
+| Mel filterbank vs `transformers`'s own | 9.2e-10 |
+| Log-Mel features, silence and speech | 0.0, 3.0e-05 |
+| Encoder hidden states | correlation **1.00000000**, 1.0e-04 relative |
+| Decoder logits | correlation **1.00000000**, 2.0e-06 relative |
+| Top-5 next tokens | identical, in order |
+| Greedy transcription, 57 tokens | **token for token identical** |
+| MLX against numpy | same tokens |
+
+**Six things here had no counterpart in the rest of reminis**, and each is a place where getting it wrong yields a fluent English sentence that is not what was said — the failure that no hash can catch and that made `reminis run` worth building in the first place:
+
+- **A spectrogram instead of tokens.** 80 Mel channels over exactly 30 seconds, Slaney-scaled and Slaney-normalised. Both of those have a second convention in circulation, and the other one gives filters that look right and weight the spectrum wrongly.
+- **Two 1-D convolutions**, the second strided, which is what turns 3000 spectrogram frames into the 1500 positions the rest of the model is built around. Written as one matrix product per kernel tap — three taps, so three products and no im2col.
+- **LayerNorm, not RMSNorm**, with a bias and a mean subtraction. Dropping the centring leaves a model that still produces words.
+- **GELU with no gate**, so a feed-forward of two matrices rather than three. Exact `erf`, not the tanh approximation, which is off by ~1e-3 — enough to show against the reference. MLX has `erf`; numpy does not, so it uses Abramowitz & Stegun 7.1.26, within 1.5e-7.
+- **Cross-attention**, a second attention per decoder block, over the audio. Its keys and values depend on the encoding alone, so they are computed once for the whole transcription rather than per token.
+- **Suppressed tokens.** Whisper's config lists tokens that must never be produced and a second set barred only from the first position. Skipping them gives fluent output that quietly disagrees with every other implementation — it was the only thing still wrong once the logits already matched to 2e-06.
+
+Two findings are worth recording because both produced plausible output rather than an error:
+
+**Float16 breaks LayerNorm, quietly.** The statistics are a sum over the whole channel: 384 squared activations of magnitude ~17 reach six figures, and float16 saturates at 65504 and returns infinity. The encoder still correlated at **0.956** with the reference — wrong, and nowhere near obviously broken. The statistics are now taken in float32 on both backends whatever the weights are stored as.
+
+**The backends take a boolean mask, not an additive one.** `attention` expects true where a query may see a key; handing it additive `-inf` inverts it, every row masks itself out, and the softmax returns NaN. Loud, and only because a NaN propagates — an inverted mask that stayed finite would have transcribed something.
+
+It generalizes across sizes and both families with no code change, because the layer counts, widths and token ids are read rather than assumed:
+
+| Model | Tensors | Layers | Prefix | Transcription |
+|---|---|---|---|---|
+| whisper-tiny | 167 | 4 + 4 | `50258 50259 50359 50363` | matches `transformers` token for token |
+| whisper-base | 245 | 6 + 6 | `50258 50259 50359 50363` | matches `transformers` token for token |
+| whisper-tiny.en | 167 | 4 + 4 | `50257 50362` | matches `transformers` token for token |
+
+That last row is the one worth having. **The English-only checkpoints number every special token one lower**, because they carry no language or task tokens: `.en` starts its decoder at 50257 and marks no-timestamps with 50362 where the multilingual models use 50258 and 50363. A constant for either family primes the other one's decoder with the wrong prefix, and a wrong prefix does not fail — it transcribes fluently and wrongly. So the prefix is resolved by *name* against the vocabulary now sitting in the database (`<|notimestamps|>` rather than 50363), which is stable where a number is not, and the decoder's start comes from the config that records it.
+
+### How fast, against the tools people actually use
+
+Same 20.8-second clip, whisper-tiny, greedy, English, no timestamps. Every engine is handed the same float32 samples, so nobody is charged for decoding audio, and each computes its own spectrogram. **Interleaved** — one round of each, alternating, nine rounds, medians — because the machine is not idle and alternating makes shared load cancel. The bracketed range is the full spread.
+
+| Engine | Warm | ×realtime | Cold | Range |
+|---|---|---|---|---|
+| **reminis (mlx)** | **0.108 s** | **192×** | 0.142 s | [0.104–0.113] |
+| mlx-whisper | 0.118 s | 176× | — | [0.117–0.122] |
+| openai-whisper (torch) | 0.322 s | 64× | 0.686 s | [0.319–0.355] |
+| faster-whisper int8 | 0.435 s | 48× | 0.907 s | [0.428–0.543] |
+| transformers | 0.519 s | 40× | 0.559 s | [0.514–0.526] |
+| reminis (numpy) | 0.534 s | 39× | 0.577 s | [0.528–0.549] |
+
+**On warm transcription reminis is the fastest of these, by 9%** — and the ranges do not overlap, which is the only reason that is worth saying at this margin. mlx-whisper has no separate cold figure because it caches the model globally, so both columns would sample the same call.
+
+**Cold, it loses**: 0.142 s against mlx-whisper's ~0.118 s. That is the storage layer, not the forward pass — reminis reads a 154 MB float32 database and narrows it, where mlx-whisper memory-maps 75 MB of float16. Storing the model at the width you intend to run it is the fix, and it is the same open roadmap item as *storing the F32 form beside the F16 one*.
+
+It started at **0.656 s (32×)**, slower than everything except its own numpy backend. Six changes account for the 6.1×, and only two of them are arithmetic:
+
+| Change | Effect |
+|---|---|
+| The tokenizer was rebuilt on every call | 266 ms → cached. Decoding itself is 0.04 ms. |
+| `prompt_tokens` re-parsed the whole vocabulary, three times | 236 ms → cached |
+| Vocabulary stored as a Python `repr`, read with `ast.literal_eval` | now JSON: 82 ms → 4.6 ms per parse |
+| Three LayerNorms per layer, eleven operations each | `mx.fast.layer_norm`: per token 1.64 ms → 1.10 ms |
+| The whole 51,865-wide logit row copied to the host per token | argmax on the device: one integer instead, 0.23 ms/token |
+| Prefill projected all four positions through the vocabulary | last position only |
+
+The first three are not optimizations so much as accounting errors: **65% of a transcription was spent parsing a vocabulary, not running a model.** They were invisible until the time was attributed per phase, and the phase that looked expensive — "prefill" — turned out to be innocent; the cost was in `prompt_tokens`, called on the line above it.
+
+**And one idea that measured worse and was reverted.** Fusing Q, K and V into a single matrix product is worth a third in reminis's text path. Here it made a transcription **137 ms → 220 ms**, because Whisper-tiny's projections are 384×384 and a decoded token is one row: the products are dispatch-bound rather than arithmetic-bound, so the three slices and the reshape of each strided view cost more than the two dispatches saved. The comment in `_project_kv` records it, so the next person does not spend the afternoon on it.
+
+And the point of storing it in a database at all shows up when you operate on it. Quantizing the model and asking it to listen again:
+
+| | Size | Transcription |
+|---|---|---|
+| whisper-tiny F32 | 151 MB | "...is an open weight TTS model..." |
+| `reminis quantize --bits 8` | **41.8 MB** (27.7%) | "...is an openweight TTS model..." |
+
+One token moved, from 8-bit rounding. That is `reminis run`'s argument carried over to speech: after surgery, a hash tells you the bytes changed and cannot tell you the result is still a working model. Asking it to listen can.
+
+### Kokoro: stored losslessly, and not run
+
+`hexgrad/Kokoro-82M` is a text-to-speech model, and it went in cleanly — 548 tensors, 81,763,410 parameters, and an export that comes back **byte-identical, 548/548 tensors SHA256-matched**. Its `.pth` was flattened to safetensors first, since that is the format reminis reads.
+
+Once it is rows, the structure is a query rather than a source-code archaeology exercise:
+
+```sql
+SELECT substr(name, 1, instr(name, '.') - 1) AS module,
+       COUNT(*) AS tensors, SUM(n_elements) AS params
+FROM tensors GROUP BY module ORDER BY params DESC;
+```
+
+```
+module            tensors       params
+decoder               375   53,276,190     65%
+predictor             122   16,194,612     20%
+bert                   25    6,292,480      8%
+text_encoder           24    5,606,400      7%
+bert_encoder            2      393,728
+```
+
+**`reminis transcribe` does not run it, and there is no `reminis speak`.** Being specific about why is more useful than an open roadmap item. Kokoro is StyleTTS 2 with an iSTFTNet vocoder, and two thirds of it is that vocoder: 89 of its tensors are **weight-normalised** convolutions stored as a `weight_v`/`weight_g` pair, whose real weight is `g · v / ‖v‖` and has to be reconstructed at load; it carries AdaIN scale-and-shift pairs, an F0 and an energy predictor, and an inverse short-time Fourier transform to get from features to a waveform. None of that is a transformer, so none of the machinery Whisper reused applies. It also needs `espeak-ng` to turn text into phonemes, which is an external C library rather than anything that could live in a database.
+
+So the honest statement is the one the storage layer can actually back: reminis is a complete and verified home for Kokoro's weights — convert, query, diff, delta-pack, merge, export — and running it would be a second inference engine rather than another entry in `arch.py`. What it would take, and the one small piece worth doing first to find out whether it is worth the rest, is written up in [#19](https://github.com/ronxldwilson/reminis/issues/19).
 
 ### Mixture-of-experts models
 
@@ -1121,6 +1251,14 @@ result = generate("soup.db", "The capital of France is", max_tokens=32, temperat
 print(result["completion"])
 ```
 
+```python
+from reminis import transcribe_file
+
+result = transcribe_file("whisper.db", "speech.wav")
+print(result["text"])
+print(result["tokens"], result["seconds"], result["elapsed"])
+```
+
 ## Supported Formats
 
 ### GGUF
@@ -1167,6 +1305,7 @@ The references they check against — transformers for logits, peft for LoRA ada
 | `test_infer` | Tokenizers against `transformers` and llama.cpp, logits against torch, KV cache, MoE, quantization |
 | `test_backend` | numpy/MLX/CuPy agreement on primitives, attention, sinks, windows |
 | `test_ggml_affine` | Bit-exactness of every repackable quantization |
+| `test_whisper` | Mel features, LayerNorm, conv1d, encoder, decoder and transcription against `transformers` |
 | `test_features` | Feature combinations and the command line |
 
 The checks are written to fail for the right reason. Where a property could pass vacuously — two backends agreeing because both ignore a feature, a cache "matching" itself — the test compares against an independent reference instead: `transformers` for logits, `llama-tokenize` for token ids, `gguf` for dequantization, `peft` for LoRA merges. Several were verified by deliberately breaking the code and confirming they caught it.
@@ -1210,8 +1349,17 @@ The checks are written to fail for the right reason. Where a property could pass
 - [x] Per-tensor history across steps (`reminis blame`)
 - [x] Binary-search for regressions (`reminis bisect`)
 - [x] Unsloth integration (`setup_unsloth` convenience + documentation)
-- [ ] Faster repacking at load: 83 s for a 7B, all of it numpy
+- [x] Faster repacking at load: 83 s → 31 s for a 7B, by fixing a silently-discarded prefetch and vectorising the bit packing
+- [x] Parallel blob reads, since SQLite serializes writers and not readers: export 1621 → 3347 MB/s, hashing 1120 → 1700 MB/s
+- [x] A speech model, not only text: Whisper end to end (`reminis transcribe`), token-for-token identical to `transformers`
+- [x] The tokenizer travels with a safetensors conversion, so such a database can name its own tokens
+- [x] Kokoro stored and verified lossless (548/548 tensors), with a specific account of why running it is a second engine
 - [ ] Running attention-free architectures (Mamba / state space, RWKV)
+- [x] Whisper faster than the tools people use for it: 0.656 s → 0.108 s, ahead of mlx-whisper by 9% on warm transcription
+- [ ] Whisper beyond one 30-second window: long audio needs chunking with overlap ([#16](https://github.com/ronxldwilson/reminis/issues/16))
+- [ ] Cold transcription, where reminis still loses: it reads 154 MB of float32 where mlx-whisper maps 75 MB of float16 ([#17](https://github.com/ronxldwilson/reminis/issues/17))
+- [ ] `--pack` for the speech path, where a quantized Whisper is currently 3.5x smaller and 2x slower ([#18](https://github.com/ronxldwilson/reminis/issues/18))
+- [ ] Kokoro: stored losslessly, and a second engine away from running ([#19](https://github.com/ronxldwilson/reminis/issues/19))
 
 ## License
 

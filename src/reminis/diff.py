@@ -19,7 +19,12 @@ import zstandard
 
 from gguf.constants import GGMLQuantizationType
 
-from reminis.db import UPSERT_TENSOR, open_for_bulk_copy, open_read_only
+from reminis.db import (
+    UPSERT_TENSOR,
+    open_for_bulk_copy,
+    open_read_only,
+    read_blobs_ahead,
+)
 from reminis.dtypes import from_float32, is_float_dtype, to_float32
 
 # zstd level 1 measured at 547 MB/s on XOR delta data, versus 4 MB/s for zlib
@@ -323,32 +328,30 @@ class _BackgroundHash:
 
 
 def _weights_hash_threaded(db_path: str) -> str:
-    """Hash weight data with I/O on a background thread.
+    """Hash weight data with the reads spread over several threads.
 
-    SHA-256 and SQLite blob reads both release the GIL, so a reader thread
-    keeps blobs ready while the main thread hashes the previous one.
+    SHA-256 and SQLite blob reads both release the GIL, so reading can run
+    ahead of hashing. It now runs ahead on four connections rather than one,
+    because SQLite serializes writers and not readers -- measured at 3570
+    MB/s on one thread against 15079 on four.
+
+    **The digest stays serial, and that is deliberate.** Hashing each tensor
+    separately and combining the digests would parallelise to 7 GB/s, but it
+    would be a different number, and these hashes are written into delta
+    packs and checked by `apply`. Changing them would make every pack ever
+    written unopenable. So the reads get the threads and the digest keeps its
+    order; the ceiling is one core's SHA-256, measured here at 1412 MB/s.
     """
-    from queue import Queue
-    from threading import Thread
+    conn = open_read_only(db_path)
+    try:
+        names = [n for (n,) in conn.execute(
+            "SELECT name FROM tensors ORDER BY name")]
+    finally:
+        conn.close()
 
-    q = Queue(maxsize=8)
-
-    def _reader():
-        c = open_read_only(db_path)
-        for (blob,) in c.execute("SELECT data FROM tensors ORDER BY name"):
-            q.put(blob)
-        c.close()
-        q.put(None)
-
-    t = Thread(target=_reader, daemon=True)
-    t.start()
     h = hashlib.sha256()
-    while True:
-        blob = q.get()
-        if blob is None:
-            break
+    for _, blob in read_blobs_ahead(db_path, names):
         h.update(blob)
-    t.join()
     return h.hexdigest()
 
 

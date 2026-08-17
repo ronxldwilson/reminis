@@ -21,6 +21,7 @@ import sqlite3
 import time
 from pathlib import Path
 
+from reminis.db import read_blobs_ahead
 from reminis.dtypes import (
     DTYPE_SYSTEM_GGUF,
     DTYPE_SYSTEM_SAFETENSORS,
@@ -107,6 +108,70 @@ def _read_config(model_dir: Path) -> dict:
         return {}
 
 
+def _read_tokenizer(model_dir: Path) -> list[tuple[str, str, str]]:
+    """A sibling tokenizer.json as the ``tokenizer.ggml.*`` rows reminis reads.
+
+    A GGUF carries its tokenizer inside the file, so a converted text model
+    can be run straight out of the database. safetensors carries none, and
+    without this the database holds a model that computes correct logits and
+    cannot say which words they stand for -- which is the same completeness
+    gap that dropping array metadata on export turned out to be in 0.32.0.
+
+    Only byte-level BPE is ingested. That is what the ``gpt2`` reader
+    implements, and claiming a vocabulary reminis cannot drive would be worse
+    than leaving it out: a wrong tokenizer decodes to fluent nonsense.
+    """
+    path = model_dir / "tokenizer.json"
+    if not path.exists():
+        return []
+    try:
+        spec = json.loads(path.read_text())
+    except (json.JSONDecodeError, OSError):
+        return []
+
+    model = spec.get("model") or {}
+    if str(model.get("type", "")).upper() != "BPE":
+        return []
+    vocab = model.get("vocab") or {}
+    merges = model.get("merges") or []
+    if not vocab or not merges:
+        return []
+
+    # `added_tokens` are the specials -- <|startoftranscript|>, the language
+    # and task markers, <|endoftext|>, and Whisper's timestamps. They have to
+    # be matched whole rather than split, which is what token type 3 means to
+    # the reader. Their ids run *past* the end of `vocab`, so the table is
+    # sized to cover both rather than to the vocabulary alone.
+    added = {int(entry["id"]): entry["content"]
+             for entry in (spec.get("added_tokens") or [])
+             if "id" in entry and "content" in entry}
+
+    size = max(max(vocab.values()), max(added, default=-1)) + 1
+    tokens = [""] * size
+    for token, index in vocab.items():
+        tokens[index] = token
+    for index, content in added.items():
+        tokens[index] = content
+    types = [3 if i in added else 1 for i in range(size)]
+
+    # Older tokenizer.json files write each merge as "a b"; newer ones write
+    # a two-element list. The reader wants the string form.
+    flat = []
+    for merge in merges:
+        flat.append(merge if isinstance(merge, str) else " ".join(merge))
+
+    # Stored as JSON rather than as a Python repr. The reader accepts both,
+    # but `ast.literal_eval` on half a megabyte of vocabulary costs 82 ms
+    # against `json.loads`'s 4.6 ms, and a transcription pays that three
+    # times before it can name a single token.
+    return [
+        ("tokenizer.ggml.model", "gpt2", "string"),
+        ("tokenizer.ggml.tokens", json.dumps(tokens), "json"),
+        ("tokenizer.ggml.merges", json.dumps(flat), "json"),
+        ("tokenizer.ggml.token_type", json.dumps(types), "json"),
+    ]
+
+
 def _default_db_path(src: Path) -> Path:
     """Where to put the database when the caller did not say.
 
@@ -181,6 +246,8 @@ def safetensors_to_sqlite(
 
     for key, value in index_meta.items():
         meta_rows.append((f"index.{key}", json.dumps(value), "json"))
+
+    meta_rows.extend(_read_tokenizer(model_dir))
 
     total_tensors = 0
     total_bytes = 0
@@ -348,11 +415,14 @@ def sqlite_to_safetensors(
     with open(output_path, "wb") as f:
         f.write(len(header_bytes).to_bytes(8, "little"))
         f.write(header_bytes)
-        for i, (name, n_bytes) in enumerate(plan):
-            (blob,) = conn.execute(
-                "SELECT data FROM tensors WHERE name = ?", (name,)
-            ).fetchone()
+        # Read ahead on other threads while this one writes; the header has
+        # already fixed the order these have to land in. See
+        # `db.read_blobs_ahead` for why the read half parallelises and the
+        # write half does not.
+        blobs = read_blobs_ahead(str(db_path), [name for name, _ in plan])
+        for i, ((name, n_bytes), (_, blob)) in enumerate(zip(plan, blobs)):
             f.write(blob)
+            del blob
             if verbose:
                 print(f"  [{i+1}/{len(plan)}] {name:60s} {n_bytes / 1024:10.1f} KB")
 

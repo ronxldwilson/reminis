@@ -107,6 +107,102 @@ def open_read_only(db_path: str) -> sqlite3.Connection:
     return sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
 
 
+# How many bytes of read-ahead to hold. The things being read are whole
+# tensors and one of them can be half a gigabyte, so this is a byte budget
+# rather than a count -- a fixed queue depth would hold four embedding
+# matrices on one model and four norms on another.
+READ_AHEAD_BYTES = 512_000_000
+
+# Writes to one file serialize; reads do not. Measured on a 4.4 GB model,
+# reading every tensor by name: 3570 MB/s on one thread, 15079 on four,
+# 16056 on eight. Four is where the curve flattens, and it leaves cores for
+# whatever the caller is doing with the bytes.
+READ_THREADS = 4
+
+
+def read_blobs_ahead(db_path: str, names, threads: int = READ_THREADS,
+                     budget: int = READ_AHEAD_BYTES):
+    """Yield ``(name, blob)`` for `names`, **in order**, read on other threads.
+
+    Every caller that walks a model does the same thing: read a tensor, do
+    something with it, read the next one. The read blocks the work and the
+    work blocks the read, so neither the disk nor the processor is ever busy.
+
+    SQLite serializes writers and does not serialize readers, so the read
+    half parallelises even though the write half cannot. Each worker gets its
+    own connection -- a connection is not safe to share across threads, and
+    `mmap_size` lets several of them touch the same pages without copying.
+
+    Order is preserved because callers depend on it: an export has already
+    written the offsets its tensors must land at, so reading them out of
+    order would produce a file whose header lies about its contents.
+
+    The read-ahead is bounded by bytes rather than by tensors, and always
+    allows one, so a model whose largest tensor exceeds the budget still
+    makes progress instead of deadlocking.
+    """
+    from collections import deque
+    from concurrent.futures import ThreadPoolExecutor
+    import threading as _threading
+
+    names = list(names)
+    if not names:
+        return
+
+    local = _threading.local()
+
+    def connection():
+        conn = getattr(local, "conn", None)
+        if conn is None:
+            conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True,
+                                   check_same_thread=False)
+            conn.execute("PRAGMA query_only=1")
+            # Mapping the file rather than copying each blob through
+            # SQLite's own buffer: 15079 MB/s against 11486 on four threads.
+            conn.execute("PRAGMA mmap_size=8589934592")
+            local.conn = conn
+        return conn
+
+    def fetch(name):
+        row = connection().execute(
+            "SELECT data FROM tensors WHERE name = ?", (name,)).fetchone()
+        if row is None:
+            raise KeyError(f"no tensor named '{name}' in {db_path}")
+        return row[0]
+
+    # n_bytes is a column, so the budget can be charged before a blob is read
+    # rather than guessed at afterwards. One query, no weights.
+    sizer = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+    try:
+        sizes = dict(sizer.execute("SELECT name, n_bytes FROM tensors"))
+    finally:
+        sizer.close()
+
+    pool = ThreadPoolExecutor(max_workers=max(1, threads),
+                              thread_name_prefix="reminis-read")
+    try:
+        pending = deque()
+        in_flight = 0
+        index = 0
+
+        while index < len(names) or pending:
+            # Read ahead while there is room, always allowing one so a tensor
+            # larger than the whole budget still moves.
+            while index < len(names) and (not pending or in_flight < budget):
+                name = names[index]
+                pending.append((name, pool.submit(fetch, name)))
+                in_flight += sizes.get(name, 0)
+                index += 1
+
+            name, future = pending.popleft()
+            blob = future.result()
+            in_flight -= sizes.get(name, 0)
+            yield name, blob
+            del blob
+    finally:
+        pool.shutdown(wait=True)
+
+
 # ── what a tensor is ────────────────────────────────────────────────────────
 #
 # The columns below were declared in two schemas and written by eight separate

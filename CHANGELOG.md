@@ -9,6 +9,195 @@ rather than compared against a number from earlier in the day.
 `bench.py` produces these figures; `tests/test_prerelease.py` is the gate every
 release below had to pass.
 
+## 0.34.0 -- a speech model, and a 7B that repacks in 31 s
+
+### Whisper runs out of the database
+
+`reminis transcribe` is a second forward pass. Whisper is an encoder-decoder
+over audio and shares almost nothing with the block `reminis run` implements,
+so it is its own module rather than an entry in `arch.py` -- that registry
+holds *deviations* from a shared block, and here there is no shared block
+left.
+
+```bash
+reminis convert ./whisper-tiny/ -o whisper.db
+reminis transcribe whisper.db speech.wav
+```
+
+The waveform, the spectrogram, both transformer stacks and the tokenizer all
+come out of the one file: no torch, no `transformers`, no ffmpeg, no config on
+disk. Against `transformers` in float32 on identical features -- encoder
+hidden states at correlation 1.00000000 (1.0e-04 relative), decoder logits at
+1.00000000 (2.0e-06), the top-5 identical in order, and the greedy
+transcription **token for token identical**. whisper-base and whisper-tiny.en
+work with no code change, because the layer counts, widths and token ids are
+read rather than assumed.
+
+That last one nearly did not. **The English-only checkpoints number every
+special token one lower** -- `.en` starts its decoder at 50257 and marks
+no-timestamps with 50362, where the multilingual models use 50258 and 50363 --
+because they carry no language or task tokens. A constant for either family
+primes the other one's decoder with the wrong prefix, and that transcribes
+fluently and wrongly rather than failing. The prefix is now resolved by name
+against the vocabulary in the database, which is stable where a number is not.
+
+Six things had no counterpart in the rest of reminis, and each one fails by
+producing a fluent English sentence that is not what was said: an 80-channel
+Mel spectrogram (Slaney scale *and* Slaney normalisation -- both have a second
+convention in circulation); two 1-D convolutions, the second strided;
+LayerNorm rather than RMSNorm; a gate-free GELU feed-forward with exact `erf`;
+cross-attention over the audio, whose keys and values are computed once for
+the whole transcription; and Whisper's two lists of suppressed tokens, which
+were the only thing still wrong once the logits already matched to 2e-06.
+
+Two failures are recorded because both looked like working models:
+
+**Float16 breaks LayerNorm quietly.** Its statistics are a sum over the whole
+channel -- 384 squared activations of magnitude ~17 reach six figures, and
+float16 saturates at 65504 and returns infinity. The encoder still correlated
+at **0.956** with the reference. The statistics are now taken in float32
+whatever the weights are stored as.
+
+**The backends take a boolean mask, not an additive one.** `attention` wants
+true where a query may see a key; additive `-inf` inverts it, every row masks
+itself out, and the softmax returns NaN. That one was loud only because NaN
+propagates.
+
+### And it is the fastest of the tools tried
+
+Same clip, whisper-tiny, greedy, everyone handed the same samples and
+computing their own spectrogram. Interleaved, nine rounds, medians:
+
+| Engine | Warm | xRT | Range |
+|---|---|---|---|
+| **reminis (mlx)** | **0.108 s** | **192x** | [0.104-0.113] |
+| mlx-whisper | 0.118 s | 176x | [0.117-0.122] |
+| openai-whisper | 0.322 s | 64x | [0.319-0.355] |
+| faster-whisper int8 | 0.435 s | 48x | [0.428-0.543] |
+| transformers | 0.519 s | 40x | [0.514-0.526] |
+
+Ahead by 9%, with ranges that do not overlap -- which is the only reason a
+margin that size is worth stating. **Cold it loses**, 0.142 s against
+~0.118 s, and that is the storage layer rather than the forward pass:
+reminis reads a 154 MB float32 database and narrows it where mlx-whisper
+memory-maps 75 MB of float16.
+
+It started at 0.656 s, slower than everything. The 6.1x came from six
+changes, and the first three are accounting errors rather than
+optimizations -- **65% of a transcription was spent parsing a vocabulary**:
+
+- the tokenizer was rebuilt on every call: 266 ms, against 0.04 ms to decode
+- `prompt_tokens` re-parsed the whole vocabulary, three times: 236 ms
+- the vocabulary was stored as a Python `repr` and read with
+  `ast.literal_eval`; as JSON it is 82 ms -> 4.6 ms, and `_parse_array`
+  now tries JSON first so older databases keep working
+- three LayerNorms per layer at eleven operations each became
+  `mx.fast.layer_norm`: 1.64 ms a token -> 1.10 ms
+- greedy decoding does its argmax on the device, so one integer crosses the
+  boundary per token rather than a 51,865-wide row
+- prefill projects only the last position through the vocabulary
+
+The phase that looked expensive was innocent. "Prefill" measured 245 ms and
+turned out to cost 3 ms; the time belonged to `prompt_tokens`, called on the
+line above it and swept into the same window.
+
+**Fusing Q, K and V measured worse and was reverted.** It is worth a third
+in the text path. Here it took a transcription from 137 ms to 220 ms: these
+projections are 384x384 and a decoded token is one row, so they are
+dispatch-bound, and three slices plus a reshape of each strided view cost
+more than the two dispatches saved.
+
+### A safetensors conversion now carries its tokenizer
+
+A GGUF holds its tokenizer inside the file; safetensors holds none, so such a
+database could compute correct logits and not say which words they stood for.
+A sibling `tokenizer.json` is now ingested into `tokenizer.ggml.*` and read by
+the existing byte-level BPE implementation. Only BPE is taken: claiming a
+vocabulary reminis cannot drive would be worse than leaving it out, because a
+wrong tokenizer decodes to fluent nonsense.
+
+This is the same completeness gap that dropped array metadata on export until
+0.32.0, found in the other direction.
+
+### Kokoro is stored, verified, and not run
+
+`hexgrad/Kokoro-82M` converts and exports **byte-identical, 548/548 tensors
+SHA256-matched**, and its structure is a `GROUP BY` rather than an
+archaeology exercise. It is not runnable here, and the reason is specific
+rather than a pending roadmap item: two thirds of it is an iSTFTNet vocoder,
+89 of its tensors are weight-normalised `weight_v`/`weight_g` pairs, and it
+needs `espeak-ng` for phonemes. None of that is a transformer, so none of the
+machinery Whisper reused applies.
+
+### Reads go wide, because SQLite lets them
+
+Export alternated a blocking read with a write, so neither the disk nor the
+writer was ever busy. SQLite serializes writers and does **not** serialize
+readers, so the read half parallelises even where the write half cannot.
+
+Measured on a 4.4 GB model, reading every tensor by name:
+
+| Readers | Throughput |
+|---|---|
+| 1 thread | 3570 MB/s |
+| 4 threads | 15079 MB/s |
+| 8 threads | 16056 MB/s |
+
+`db.read_blobs_ahead` is the shared form: one connection per thread, a byte
+budget rather than a queue depth -- one tensor can be half a gigabyte -- and
+**order preserved**, because an export has already written the offsets its
+tensors must land at.
+
+| | before | after |
+|---|---|---|
+| GGUF export | 1621 MB/s | **3347 MB/s** |
+| Weights hash | 1120 MB/s | **1700 MB/s** |
+| safetensors export | same loop | same fix |
+
+Output is byte-identical and the digest is unchanged.
+
+**Hashing each tensor separately would reach 7 GB/s, and is not done.** It
+would be a different number, and these digests are written into delta packs
+and checked by `apply`, so changing them would make every pack ever written
+unopenable. The reads get the threads; the digest keeps its order.
+
+**Conversion was measured and left alone.** At 895 MB/s it looked like the
+slow half, but a bare SQLite blob insert of the same bytes runs at 892 MB/s
+-- it is already at the storage engine's ceiling, and the memoryview it
+binds is doing its job, since binding `bytes` instead measures the same. The
+gap to a raw file copy (3930 MB/s) is SQLite's page and B-tree overhead, not
+reminis's.
+
+### Repacking a 7B at load: 83 s -> 31 s
+
+Three changes, measured separately on Mistral-7B Q4_K_M with a warm page
+cache.
+
+**The prefetch was silently discarding every affine repack.** `_unpack_one`
+referenced `arr.nbytes` on the repacked path, where `arr` does not exist; the
+blanket `except Exception` ate the `NameError`, so every Q4_K, Q5_0 and Q8_0
+tensor fell through to the synchronous path and six worker threads did
+nothing at all. On a Q4_K_M model that is almost the whole load.
+
+**The bit packing was expanding every value to individual bits.**
+`_pack_words` went through `unpackbits`/`packbits`, which was 89% of a single
+tensor's repack. For widths that divide 32 -- 4 and 8, the common cases -- it
+is now a vectorised shift-and-OR: **4.6x faster**. The bit-stream path stays
+for the 5-bit types, which straddle word boundaries.
+
+**The main thread was racing the workers it was waiting for.** With nothing
+to coordinate them, `get` did the work itself whenever a worker had not
+finished, and it kept winning: 21 prefetch hits against 726 misses. It now
+waits on a condition variable for a tensor already in flight -- **226 hits
+against 65**.
+
+| Mistral-7B Q4_K_M, `--pack compact` | before | after |
+|---|---|---|
+| Time to first token | 85 s | **31 s** |
+| Processor utilisation | ~100% | ~245% |
+
+Granite-3.1-1b-a400m came down from 13.9 s to 4.3 s on the same changes.
+
 ## 0.33.1 -- the index says which width it is, and `--chat` finishes the turn
 
 Three things 0.33.0 got wrong quietly, and one measurement that came back

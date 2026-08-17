@@ -42,6 +42,7 @@ guesses produces fluent-looking nonsense, which is worse than an error.
 
 import ast
 import heapq
+import json
 import math
 import os
 import sqlite3
@@ -807,6 +808,17 @@ class Config:
     def __init__(self, meta: dict, store: WeightStore):
         self.arch = meta.get("general.architecture", "")
         if self.arch not in SUPPORTED_ARCHS:
+            from reminis.whisper import is_whisper
+
+            # A speech model is not an unrunnable model, it is a differently
+            # runnable one, so say which command runs it rather than sending
+            # the reader to the viewer.
+            if is_whisper(meta):
+                raise UnsupportedModel(
+                    "This is a Whisper model, which is an encoder-decoder over "
+                    "audio rather than a text model.\n"
+                    "Transcribe it instead:  reminis transcribe <db> <audio.wav>"
+                )
             raise UnsupportedModel(
                 f"reminis run implements {', '.join(sorted(SUPPORTED_ARCHS))}; "
                 f"this model's architecture is '{self.arch or 'unknown'}'.\n"
@@ -1504,6 +1516,16 @@ def _parse_array(meta: dict, key: str) -> list:
     raw = meta.get(key)
     if not raw:
         return []
+    # JSON first: a GGUF conversion writes these as a Python repr, but a
+    # safetensors one writes real JSON, and `json.loads` is 16-32x faster on
+    # a vocabulary-sized list -- 4.6 ms against 82 ms for 51,865 tokens.
+    # A repr uses single quotes, so it fails here immediately and falls
+    # through rather than being parsed wrongly.
+    if raw[:1] in ("[", "{"):
+        try:
+            return json.loads(raw)
+        except ValueError:
+            pass
     try:
         return ast.literal_eval(raw)
     except (ValueError, SyntaxError) as exc:

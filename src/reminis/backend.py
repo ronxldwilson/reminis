@@ -253,6 +253,30 @@ class Backend:
     def rms_norm(self, x, weight, eps: float):
         raise NotImplementedError
 
+    def layer_norm(self, x, weight, bias, eps: float):
+        """LayerNorm, centred as well as scaled, with a bias.
+
+        The statistics are taken in float32 whatever the weights are stored
+        as, because they are a sum over the whole channel: a few hundred
+        squared activations of moderate size reach six figures, and float16
+        saturates at 65504 and returns infinity. That failure does not look
+        like one -- a Whisper encoder whose norms overflowed still correlated
+        at 0.956 with the reference.
+
+        Backends with a fused kernel override this; the generic form is here
+        so every backend has one.
+        """
+        xp = self.xp
+        dtype = x.dtype
+        x32 = x.astype(xp.float32)
+        mu = x32.mean(axis=-1, keepdims=True)
+        centred = x32 - mu
+        var = (centred * centred).mean(axis=-1, keepdims=True)
+        out = centred / xp.sqrt(var + eps) * weight.astype(xp.float32)
+        if bias is not None:
+            out = out + bias.astype(xp.float32)
+        return out.astype(dtype)
+
     def softmax(self, x, axis=-1):
         raise NotImplementedError
 
@@ -706,6 +730,19 @@ class MLXBackend(Backend):
         return self.mx.fast.scaled_dot_product_attention(
             q, k, v, scale=scale, mask=mask, sinks=sinks
         )
+
+    def layer_norm(self, x, weight, bias, eps: float):
+        """One fused kernel instead of eleven operations.
+
+        Spelled out, LayerNorm is a cast, two means, a subtract, two
+        multiplies, an add, a square root, a divide and a cast back. At three
+        norms per decoder layer that was two thirds of every operation
+        dispatched for a token, and on a model small enough to be
+        dispatch-bound rather than arithmetic-bound, that is most of the
+        time. The kernel also does its reduction in float32 internally, which
+        is the property the generic form has to arrange by hand.
+        """
+        return self.mx.fast.layer_norm(x, weight, bias, eps)
 
     def softmax(self, x, axis=-1):
         # precise=True accumulates in float32 even when the input is half,

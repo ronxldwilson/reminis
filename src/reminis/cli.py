@@ -89,6 +89,57 @@ def cmd_run(args, parser):
     run_cli(args)
 
 
+def cmd_transcribe(args, parser):
+    import os
+
+    _reject_registry(args.input, "transcribe")
+    if not os.path.exists(args.audio):
+        parser.error(f"no such audio file: {args.audio}")
+
+    from reminis.backend import select as select_backend
+    from reminis.whisper import UnsupportedModel, transcribe_file
+
+    backend = None
+    if args.backend != "auto":
+        backend = select_backend("inference", args.backend)
+
+    try:
+        result = transcribe_file(
+            args.input, args.audio, max_tokens=args.max_tokens,
+            language=args.language, task=args.task, temperature=args.temp,
+            seed=args.seed, backend=backend, verbose=not args.quiet,
+        )
+    except UnsupportedModel as exc:
+        print(f"Error: {exc}")
+        sys.exit(1)
+
+    if not args.quiet:
+        encoder, decoder = result["layers"]
+        print(f"{encoder} encoder + {decoder} decoder layers | "
+              f"{result['backend']}")
+        rate = result["source_rate"]
+        note = "" if rate == 16000 else f", resampled from {rate} Hz"
+        print(f"{result['seconds']:.1f}s of audio{note}")
+        if result["truncated"]:
+            # Whisper's positional table is exactly 30 seconds long, so this
+            # is a property of the model rather than a choice made here.
+            print("Note: only the first 30s was transcribed -- Whisper's "
+                  "encoder is exactly that long.")
+        print()
+
+    if result["text"] is None:
+        print("This database carries no tokenizer, so only ids are available.")
+        print(result["tokens"])
+    else:
+        print(result["text"].strip())
+
+    if not args.quiet:
+        print()
+        print(f"{len(result['tokens'])} tokens in {result['elapsed']:.2f}s")
+    if args.tokens:
+        print(result["tokens"])
+
+
 def cmd_merge(args, parser):
     from reminis.merge import merge_models
     for path in args.inputs + ([args.base] if args.base else []):
@@ -340,6 +391,40 @@ def build_parser() -> argparse.ArgumentParser:
     p_run.set_defaults(func=cmd_run)
 
     # merge: combine several models into one
+    p_hear = sub.add_parser(
+        "transcribe",
+        help="Transcribe audio with a speech model, out of the database",
+        description="Whisper's encoder-decoder forward pass over tensors "
+                    "selected from SQLite. The waveform, the spectrogram, the "
+                    "two transformer stacks and the tokenizer all come out of "
+                    "the one file -- no torch, no transformers, no ffmpeg.",
+    )
+    p_hear.add_argument("input", help="Path to the model database")
+    p_hear.add_argument("audio", help="A PCM wav file. Any sample rate; "
+                                      "resampled to 16 kHz and downmixed.")
+    p_hear.add_argument("-n", "--max-tokens", type=int, default=224,
+                        help="Most tokens to produce (default 224)")
+    p_hear.add_argument("--language", default="en",
+                        help="Language code to transcribe as (default en). "
+                             "Ignored by the English-only checkpoints.")
+    p_hear.add_argument("--task", choices=("transcribe", "translate"),
+                        default="transcribe",
+                        help="Transcribe in the spoken language, or translate "
+                             "to English (default transcribe)")
+    p_hear.add_argument("--temp", type=float, default=0.0,
+                        help="Sampling temperature; 0 is greedy (default 0)")
+    p_hear.add_argument("--seed", type=int, help="Seed, so a run repeats exactly")
+    p_hear.add_argument(
+        "--backend", choices=("auto", "numpy", "mlx", "cupy"), default="auto",
+        help="Which array library to compute with. numpy is the reference "
+             "implementation; mlx holds float16 and is faster.",
+    )
+    p_hear.add_argument("--tokens", action="store_true",
+                        help="Print the token ids alongside the text")
+    p_hear.add_argument("-q", "--quiet", action="store_true",
+                        help="Print only the transcription")
+    p_hear.set_defaults(func=cmd_transcribe)
+
     p_merge = sub.add_parser(
         "merge",
         help="Merge several model databases into one",
