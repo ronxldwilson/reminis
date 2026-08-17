@@ -74,7 +74,6 @@ class Model:
         self.cfg = Config(meta, self.store)
         self.tokenizer = build_tokenizer(meta)
         self._layer_cache: dict[int, tuple] = {}
-        self._rope_cache: tuple | None = None
         self._mask_cache: dict = {}
         self._fused_cache: dict[tuple[int, str], tuple] = {}
         if pack_bits is not None and not stream and self.backend.can_pack():
@@ -270,70 +269,6 @@ class Model:
         b.reserve(int(needed / self.PRELOAD_SHARE))
         return {"experts": total, "bytes": needed,
                 "seconds": time.time() - started}
-
-    # -- rotary embeddings ------------------------------------------------
-
-    def _rope_tables(self, n_positions: int, offset: int):
-        """cos/sin for positions [offset, offset + n_positions).
-
-        Every layer in a forward pass asks for the same positions, so the
-        trigonometry was being redone once per layer -- thirty times per
-        token on a 135M model. One entry is enough to hold it.
-        """
-        if self._rope_cache is not None:
-            key_n, key_offset, cos, sin = self._rope_cache
-            if key_n == n_positions and key_offset == offset:
-                return cos, sin
-
-        cfg = self.cfg
-        half = cfg.rope_dim // 2
-        # The tables are built in numpy at full precision regardless of the
-        # backend. They are tiny, they are cached, and the angles are the one
-        # place where half precision would visibly cost accuracy: an error in
-        # a position's angle shifts every token that attends to it.
-        inv_freq = 1.0 / (
-            cfg.rope_base ** (np.arange(half, dtype=np.float32) * 2.0 / cfg.rope_dim)
-        )
-        if cfg.rope_factors is not None:
-            inv_freq = inv_freq / cfg.rope_factors[:half]
-        pos = np.arange(offset, offset + n_positions, dtype=np.float32)
-        angles = pos[:, None] * inv_freq[None, :]
-        cos = self.backend.from_numpy(np.cos(angles))
-        sin = self.backend.from_numpy(np.sin(angles))
-        self._rope_cache = (n_positions, offset, cos, sin)
-        return cos, sin
-
-    def _apply_rope(self, x, cos, sin):
-        """Rotate the first `rope_dim` channels of each head.
-
-        Two layouts exist and they are not interchangeable. llama.cpp's
-        "norm" rotates adjacent channels as pairs; "neox" rotates channel i
-        against channel i + rope_dim/2. Which one a model wants depends on
-        how its weights were laid out at conversion time, so it comes from
-        the architecture rather than from a guess.
-        """
-        d = self.cfg.rope_dim
-        rot, rest = x[..., :d], x[..., d:]
-        cos = cos[:, None, :]
-        sin = sin[:, None, :]
-
-        xp = self.backend.xp
-        if self.cfg.rope_style == "norm":
-            even, odd = rot[..., 0::2], rot[..., 1::2]
-            # Interleaving the two halves back together by stacking and
-            # reshaping rather than by assigning into a buffer, since not
-            # every backend's arrays can be written into piecewise.
-            rotated = xp.stack([even * cos - odd * sin, even * sin + odd * cos],
-                               axis=-1)
-            out = rotated.reshape(rot.shape)
-        else:
-            half = d // 2
-            first, second = rot[..., :half], rot[..., half:]
-            out = xp.concatenate(
-                [first * cos - second * sin, first * sin + second * cos], axis=-1
-            )
-
-        return out if rest.shape[-1] == 0 else xp.concatenate([out, rest], axis=-1)
 
     # -- one layer --------------------------------------------------------
 
