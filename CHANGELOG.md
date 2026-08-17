@@ -9,6 +9,46 @@ rather than compared against a number from earlier in the day.
 `bench.py` produces these figures; `tests/test_prerelease.py` is the gate every
 release below had to pass.
 
+## Unreleased
+
+### `infer.py` was 2,606 lines, and "inference" had stopped being a subject
+
+One file held the weight store, the config reader, four tokenizers, the
+forward pass, the KV cache, the sampler and the CLI entry point. That was
+fine when it was the forward pass and a little scaffolding; it stopped being
+fine somewhere around the third tokenizer.
+
+It is now seven modules, and the move was mechanical -- every one of the
+twenty top-level classes and functions is byte-identical under `ast.dump`
+before and after, which is the check that was run rather than a claim about
+having been careful.
+
+| | lines | what it holds |
+|---|---|---|
+| `weights.py` | 720 | a row becomes something that multiplies: dtypes, repacking, prefetch, the memory map |
+| `model.py` | 720 | the forward pass |
+| `tokenizer.py` | 592 | the three tokenizer families and the pre-tokenizer patterns |
+| `infer.py` | 353 | the loop that drives them, and the sampler |
+| `config.py` | 203 | rows become the numbers a forward pass needs |
+| `kvcache.py` | 136 | keys and values, kept across steps |
+| `meta.py` | 45 | reading list-shaped values back out of `model_meta` |
+| `errors.py` | 9 | the one exception all of them raise |
+
+`UnsupportedModel` earned a module of its own because everything raises it,
+and a shared home is cheaper than five modules importing each other to reach
+it.
+
+**No caller changed.** `infer.py` re-exports every name it used to hold,
+including the underscored ones the suites reach for by name, so
+`from reminis.infer import Model` still works and the published API is
+unmoved. Inside the package the importers were repointed at the real modules;
+the tests were deliberately left on the old address, so they exercise the
+compatibility surface on every run.
+
+Verified with `test_infer`, `test_features`, `test_whisper`, `test_qwen35`,
+`test_backend`, `test_expert_index`, `test_packed_index`, `test_sweep`, and
+the release gate at 187 passed / 0 failed.
+
 ## 0.34.0 -- a speech model, and a 7B that repacks in 31 s
 
 ### Whisper runs out of the database

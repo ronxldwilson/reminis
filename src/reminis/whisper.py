@@ -215,7 +215,7 @@ class Whisper:
 
     def __init__(self, db_path, backend=None):
         from reminis.backend import select as select_backend
-        from reminis.infer import WeightStore
+        from reminis.weights import WeightStore
 
         self.backend = backend or select_backend("inference")
         self.store = WeightStore(db_path, backend=self.backend)
@@ -239,7 +239,7 @@ class Whisper:
     def _vocab(self):
         """The token list, parsed once. Empty when the database has none."""
         if self._vocab_cache is None:
-            from reminis.infer import _parse_array
+            from reminis.meta import _parse_array
 
             self._vocab_cache = _parse_array(self.meta, "tokenizer.ggml.tokens")
         return self._vocab_cache
@@ -548,7 +548,7 @@ class Whisper:
         cached, and none of it was arithmetic.
         """
         if self._tokenizer is None:
-            from reminis.infer import build_tokenizer
+            from reminis.tokenizer import build_tokenizer
 
             if not self.meta.get("tokenizer.ggml.tokens"):
                 raise UnsupportedModel(
@@ -609,7 +609,7 @@ def decode_tokens(db_path, ids):
     a 51,865-token BPE tokenizer costs 262 ms and decoding with it costs
     0.04 ms. Prefer ``Whisper.detokenize`` when a model is already open.
     """
-    from reminis.infer import build_tokenizer
+    from reminis.tokenizer import build_tokenizer
 
     try:
         stamp = os.stat(db_path).st_mtime_ns

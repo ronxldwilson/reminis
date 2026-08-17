@@ -32,7 +32,9 @@ import numpy as np
 
 from reminis.db import open_read_only
 from reminis.backend import select as select_backend
-from reminis.infer import KVCache, Model, UnsupportedModel
+from reminis.errors import UnsupportedModel
+from reminis.kvcache import KVCache
+from reminis.model import Model
 
 # Enough tokens that the agreement percentages mean something, short enough
 # that a rung is seconds rather than minutes.
