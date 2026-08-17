@@ -1212,7 +1212,7 @@ The work is a handful of reductions per parameter, done in the framework rather 
 
 The appealing idea is surgical: find the bad step, subtract its update from the final weights, keep everything learned since. **That does not work, and reminis says so rather than shipping it.**
 
-`tests/experiment_rollback.py` measures it directly. The same model is trained twice on identical data with identical seeds, differing only in whether one step sees a corrupted batch — so run B is the ground truth we would want to recover. Then three ways of "undoing" run A's bad step are compared against it:
+`experiments/rollback.py` measures it directly. The same model is trained twice on identical data with identical seeds, differing only in whether one step sees a corrupted batch — so run B is the ground truth we would want to recover. Then three ways of "undoing" run A's bad step are compared against it:
 
 | Approach | Distance from ground truth |
 |---|---|
