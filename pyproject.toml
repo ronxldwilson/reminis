@@ -67,6 +67,11 @@ packages = ["src/reminis"]
 
 # Ship only source and docs. Generated viewers and downloaded test models live
 # alongside the repo during development and must never reach the sdist.
+#
+# The .html exclusion is anchored to directories that hold generated output.
+# An unanchored "*.html" also matched src/reminis/viewer_template.html, which
+# is source: without it `reminis view` raises FileNotFoundError on any install
+# built from the sdist, and nothing in the repo would have caught that.
 [tool.hatch.build.targets.sdist]
 include = ["src/reminis", "tests", "README.md", "LICENSE", "pyproject.toml"]
-exclude = ["models", "*.html", "*.gguf", "*.db", "*.safetensors"]
+exclude = ["models", "/*.html", "tests/**/*.html", "*.gguf", "*.db", "*.safetensors"]

@@ -21,6 +21,10 @@ wheels/
 
 # Generated viewers
 *.html
+# ...but the viewer's template is source, not output. Without this the file
+# is invisible to git and to hatchling, which builds from the same list, so
+# `reminis view` would fail on every installed copy while working locally.
+!src/reminis/viewer_template.html
 
 # Test model working directory
 models/
