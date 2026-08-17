@@ -18,7 +18,6 @@ Skips rather than fails when the model or the reference is absent.
 """
 
 import sqlite3
-import sys
 from pathlib import Path
 
 import numpy as np
@@ -431,34 +430,3 @@ def test_refusals():
         check("a 24-bit wav is refused, with a way out", "ffmpeg" in str(exc))
     finally:
         odd.unlink(missing_ok=True)
-
-
-def main():
-    print("=" * 70)
-    print("WHISPER TESTS")
-    print("=" * 70)
-
-    test_filterbank_and_features()
-    test_thirty_second_window()
-    test_wav_reading()
-    test_layer_norm_and_conv()
-    test_against_transformers()
-    test_both_whisper_families()
-    test_backends_agree()
-    test_tokenizer_is_in_the_database()
-    test_end_to_end_transcription()
-    test_refusals()
-
-    print("\n" + "=" * 70)
-    if FAILURES:
-        print(f"{len(FAILURES)} WHISPER TESTS FAILED")
-        for f in FAILURES:
-            print(f"  - {f}")
-        print("=" * 70)
-        sys.exit(1)
-    print("ALL WHISPER TESTS PASSED")
-    print("=" * 70)
-
-
-if __name__ == "__main__":
-    main()

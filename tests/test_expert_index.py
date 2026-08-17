@@ -13,7 +13,6 @@ README where they can carry their conditions with them.
 
 import shutil
 import sqlite3
-import sys
 import tempfile
 from pathlib import Path
 
@@ -331,32 +330,3 @@ def test_mmap_decision():
               WeightStore._mmap_size(str(big)) == 0)
         check("a missing file does not raise",
               WeightStore._mmap_size(str(Path(tmp) / "nope.db")) == 0)
-
-
-def main():
-    print("=" * 70)
-    print("EXPERT INDEX TESTS")
-    print("=" * 70)
-
-    test_group_sizes()
-    test_reserve_is_optional()
-    test_mmap_decision()
-    test_build_and_read()
-    test_drop_is_reversible()
-    test_refusals()
-    test_inference_agrees()
-    test_preload()
-
-    print("\n" + "=" * 70)
-    if FAILURES:
-        print(f"{len(FAILURES)} EXPERT INDEX TESTS FAILED")
-        for f in FAILURES:
-            print(f"  - {f}")
-        print("=" * 70)
-        sys.exit(1)
-    print("ALL EXPERT INDEX TESTS PASSED")
-    print("=" * 70)
-
-
-if __name__ == "__main__":
-    main()

@@ -252,27 +252,3 @@ def test_gguf_db_exports_to_safetensors():
         checked += 1
     conn.close()
     print(f"  {checked} tensors exported byte-identically, shapes un-reversed")
-
-
-def main():
-    shutil.rmtree(TMP, ignore_errors=True)
-    TMP.mkdir(parents=True, exist_ok=True)
-
-    print("=" * 78)
-    print("safetensors support")
-    print("=" * 78)
-
-    test_bf16_matches_torch()
-    test_roundtrip(shard=False)
-    test_roundtrip(shard=True)
-    test_gguf_export_guard()
-    test_gguf_db_exports_to_safetensors()
-
-    shutil.rmtree(TMP, ignore_errors=True)
-    print("\n" + "=" * 78)
-    print("ALL SAFETENSORS TESTS PASSED")
-    print("=" * 78)
-
-
-if __name__ == "__main__":
-    main()

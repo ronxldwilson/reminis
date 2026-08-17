@@ -17,7 +17,6 @@ import re
 import shutil
 import sqlite3
 import subprocess
-import sys
 from pathlib import Path
 
 import numpy as np
@@ -515,37 +514,3 @@ def test_experts_on_demand():
 
     check("on-demand experts give the same text as resident ones",
           texts[0] == texts[64], f"{texts[0]!r} vs {texts[64]!r}")
-
-
-def main():
-    print("=" * 70)
-    print("FEATURE AND CLI TESTS")
-    print("=" * 70)
-
-    test_group_selection()
-    test_yarn()
-    test_gptoss_activation()
-    test_mxfp4_on_device()
-    test_experts_on_demand()
-    test_nearest_bits()
-    test_embedding_packing()
-    test_sliding_window()
-    test_combinations()
-    test_database_untouched()
-    test_cli_run()
-    test_cli_other_commands()
-    test_cli_rejects_registry()
-
-    print("\n" + "=" * 70)
-    if FAILURES:
-        print(f"{len(FAILURES)} FEATURE TESTS FAILED")
-        for f in FAILURES:
-            print(f"  - {f}")
-        print("=" * 70)
-        sys.exit(1)
-    print("ALL FEATURE TESTS PASSED")
-    print("=" * 70)
-
-
-if __name__ == "__main__":
-    main()

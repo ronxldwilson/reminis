@@ -153,19 +153,3 @@ def test_backward_compatibility():
     payload = zlib.compress(delta)
     check(_decode_tensor("xor_zlib", payload, base, "F16", "t") == target,
           "a pre-0.3.0 zlib pack decodes with the bit-plane path in place")
-
-
-def main():
-    test_planes_roundtrip()
-    test_plane_contents()
-    test_encode_decode()
-    test_refusals()
-    test_selection()
-    test_backward_compatibility()
-    print("\n" + "=" * 70)
-    print(f"ALL BIT-PLANE TESTS PASSED ({checks} checks)")
-    print("=" * 70)
-
-
-if __name__ == "__main__":
-    main()

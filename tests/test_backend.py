@@ -10,7 +10,6 @@ cupy needs NVIDIA hardware, mlx needs Apple silicon, and neither is a
 prerequisite for reminis working.
 """
 
-import sys
 from pathlib import Path
 
 import numpy as np
@@ -239,30 +238,3 @@ def test_generation_agrees():
         check(f"{name}: generates the same text as numpy",
               result["completion"] == baseline,
               f"got {result['completion']!r}")
-
-
-def main():
-    print("=" * 70)
-    print("BACKEND TESTS")
-    print("=" * 70)
-
-    test_selection()
-    test_primitives()
-    test_roundtrip()
-    test_attention_features()
-    test_forward_pass_agrees()
-    test_generation_agrees()
-
-    print("\n" + "=" * 70)
-    if FAILURES:
-        print(f"{len(FAILURES)} BACKEND TESTS FAILED")
-        for f in FAILURES:
-            print(f"  - {f}")
-        print("=" * 70)
-        sys.exit(1)
-    print("ALL BACKEND TESTS PASSED")
-    print("=" * 70)
-
-
-if __name__ == "__main__":
-    main()

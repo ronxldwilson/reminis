@@ -5,7 +5,6 @@ Trains a tiny model for several steps with periodic snapshots, then verifies:
 - bisect finds the step where a condition changes
 """
 
-import shutil
 import sqlite3
 import subprocess
 import sys
@@ -202,27 +201,3 @@ def test_bisect_bad_step(log_path):
     assert result.returncode != 0
     assert "No snapshot at step 999" in result.stdout
     print(f"  correctly refused nonexistent snapshot")
-
-
-def main():
-    shutil.rmtree(TMP, ignore_errors=True)
-    TMP.mkdir(parents=True, exist_ok=True)
-
-    print("=" * 78)
-    print("blame and bisect")
-    print("=" * 78)
-
-    log_path = train_and_log()
-    test_blame(log_path)
-    test_blame_cli(log_path)
-    test_bisect(log_path)
-    test_bisect_bad_step(log_path)
-
-    shutil.rmtree(TMP, ignore_errors=True)
-    print("\n" + "=" * 78)
-    print("ALL BLAME/BISECT TESTS PASSED")
-    print("=" * 78)
-
-
-if __name__ == "__main__":
-    main()

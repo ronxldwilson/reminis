@@ -7,9 +7,7 @@ share an architecture, which is where the SQL alignment, the dtype round-trip
 through F16, and the GGUF export actually get exercised.
 """
 
-import shutil
 import sqlite3
-import sys
 from pathlib import Path
 
 import numpy as np
@@ -468,40 +466,3 @@ def test_real_models():
                  method="slerp", t=0.5, verbose=False)
     check("slerp gives a different model than the linear average",
           not np.allclose(read_tensor(slerp_out, name), read_tensor(out, name), atol=1e-4))
-
-
-def main():
-    if TMP_DIR.exists():
-        shutil.rmtree(TMP_DIR)
-    TMP_DIR.mkdir(parents=True, exist_ok=True)
-
-    print("=" * 70)
-    print("MERGE TESTS")
-    print("=" * 70)
-
-    try:
-        test_methods()
-        test_ties_trim()
-        test_rejections()
-        test_structure_mismatch()
-        test_mixed_dtypes()
-        test_provenance()
-        test_chunking_matches_whole_tensor()
-        test_trim_cutoff()
-        test_real_models()
-    finally:
-        shutil.rmtree(TMP_DIR, ignore_errors=True)
-
-    print("\n" + "=" * 70)
-    if FAILURES:
-        print(f"{len(FAILURES)} MERGE TESTS FAILED")
-        for f in FAILURES:
-            print(f"  - {f}")
-        print("=" * 70)
-        sys.exit(1)
-    print("ALL MERGE TESTS PASSED")
-    print("=" * 70)
-
-
-if __name__ == "__main__":
-    main()

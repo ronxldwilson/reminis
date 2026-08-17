@@ -174,21 +174,3 @@ def test_prompt_is_substantial():
     section("The default prompt is long enough to mean something")
     check(len(DEFAULT_PROMPT.split()) > 30,
           "the default prompt is more than a handful of words")
-
-
-def main():
-    test_softmax()
-    test_compare_identical()
-    test_compare_detects_damage()
-    test_compare_uses_every_position()
-    test_predicted_bytes()
-    test_fit_share()
-    test_prompt_is_substantial()
-    test_end_to_end()
-    print("\n" + "=" * 70)
-    print(f"ALL SWEEP TESTS PASSED ({checks} checks)")
-    print("=" * 70)
-
-
-if __name__ == "__main__":
-    main()

@@ -14,7 +14,6 @@ sentences" proves nothing. These checks are chosen to fail loudly instead:
 """
 
 import sqlite3
-import sys
 from pathlib import Path
 
 import numpy as np
@@ -682,42 +681,3 @@ def test_merged_model_runs():
     finally:
         import shutil
         shutil.rmtree(tmp, ignore_errors=True)
-
-
-def main():
-    if not SMOL.exists():
-        print(f"Missing {SMOL}. Run: reminis convert models/SmolLM-135M.f16.gguf")
-        sys.exit(1)
-
-    print("=" * 70)
-    print("INFERENCE TESTS")
-    print("=" * 70)
-
-    test_tokenizer_roundtrip()
-    test_tokenizer_vs_reference()
-    test_logits_vs_reference()
-    test_kv_cache()
-    test_streaming_matches_cached()
-    test_sampling()
-    test_architectures()
-    test_refusals()
-    test_quantized_models()
-    test_packed_weights()
-    test_sentencepiece_tokenizer()
-    test_mixture_of_experts()
-    test_kv_cache_quantization()
-    test_merged_model_runs()
-
-    print("\n" + "=" * 70)
-    if FAILURES:
-        print(f"{len(FAILURES)} INFERENCE TESTS FAILED")
-        for f in FAILURES:
-            print(f"  - {f}")
-        print("=" * 70)
-        sys.exit(1)
-    print("ALL INFERENCE TESTS PASSED")
-    print("=" * 70)
-
-
-if __name__ == "__main__":
-    main()

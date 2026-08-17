@@ -21,8 +21,6 @@ is the point. Every check here is about internal consistency, and each one
 fails loudly for a different reason.
 """
 
-import sys
-from pathlib import Path
 
 import numpy as np
 
@@ -343,33 +341,3 @@ def test_divergent_decay_refused(tmp):
         "positive ssm_a is refused by name", "ssm_a is not negative",
         lambda: Model(str(db), backend=select_backend("inference", "numpy")),
     )
-
-
-def main():
-    tmp = Path(__file__).parent / "tmp_qwen35"
-    tmp.mkdir(exist_ok=True)
-
-    print("=" * 70)
-    print("QWEN35 HYBRID ARCHITECTURE TESTS")
-    print("=" * 70)
-
-    try:
-        test_recurrent_state_carries(tmp)
-        test_backends_agree(tmp)
-        test_prediction_head_skipped(tmp)
-        test_delta_rule_matches_reference()
-        test_pretokenizer()
-        test_divergent_decay_refused(tmp)
-    finally:
-        import shutil
-        shutil.rmtree(tmp, ignore_errors=True)
-
-    print("\n" + "=" * 70)
-    if FAILURES:
-        print(f"{len(FAILURES)} FAILED: " + ", ".join(FAILURES))
-        sys.exit(1)
-    print("All qwen35 checks passed")
-
-
-if __name__ == "__main__":
-    main()

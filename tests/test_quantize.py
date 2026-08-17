@@ -227,21 +227,3 @@ def test_real_model():
         check(all(ord(c) < 0x3000 for c in text),
               "the text is not the mojibake a broken block layout produces")
         print(f"      generated: {text!r}")
-
-
-def main():
-    test_block_sizes()
-    test_against_reference()
-    test_sign_of_the_extreme()
-    test_zero_blocks()
-    test_eligibility()
-    test_widths()
-    test_refusals()
-    test_real_model()
-    print("\n" + "=" * 70)
-    print(f"ALL QUANTIZE TESTS PASSED ({checks} checks)")
-    print("=" * 70)
-
-
-if __name__ == "__main__":
-    main()

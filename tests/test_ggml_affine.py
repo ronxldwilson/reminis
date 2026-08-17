@@ -15,7 +15,6 @@ the format.
 
 import ast
 import sqlite3
-import sys
 from pathlib import Path
 
 import numpy as np
@@ -134,27 +133,3 @@ def test_refusals():
     check("a float type declines", not can_repack("F16"))
     check("repack returns None rather than raising",
           repack(b"\x00" * 64, "Q6_K", (2, 32)) is None)
-
-
-def main():
-    print("=" * 70)
-    print("GGML AFFINE REPACK TESTS")
-    print("=" * 70)
-
-    test_bit_packing()
-    test_repack_is_exact()
-    test_refusals()
-
-    print("\n" + "=" * 70)
-    if FAILURES:
-        print(f"{len(FAILURES)} REPACK TESTS FAILED")
-        for f in FAILURES:
-            print(f"  - {f}")
-        print("=" * 70)
-        sys.exit(1)
-    print("ALL REPACK TESTS PASSED")
-    print("=" * 70)
-
-
-if __name__ == "__main__":
-    main()
