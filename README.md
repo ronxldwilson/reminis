@@ -1,5 +1,10 @@
 # reminis
 
+[![PyPI](https://img.shields.io/pypi/v/reminis.svg)](https://pypi.org/project/reminis/)
+[![Downloads](https://static.pepy.tech/badge/reminis)](https://pepy.tech/project/reminis)
+[![Downloads per month](https://img.shields.io/pypi/dm/reminis.svg)](https://pypistats.org/packages/reminis)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+
 **Your model's weights are just data. Store them in a database.**
 
 `reminis` converts any GGUF or safetensors model into a SQLite database where every tensor becomes a queryable, versionable, diffable row — one you can also merge with a join and run text through. Convert back when you're done. Lossless. Fast.
@@ -7,6 +12,8 @@
 ```bash
 pip install reminis
 ```
+
+On PyPI at [pypi.org/project/reminis](https://pypi.org/project/reminis/), with download counts at [pepy.tech/project/reminis](https://pepy.tech/project/reminis).
 
 ## Why
 
