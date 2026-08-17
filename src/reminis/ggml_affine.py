@@ -204,9 +204,17 @@ def _pack_words(q: np.ndarray, bits: int) -> np.ndarray:
     # Expert weights arrive as one 3-D tensor per projection, so the
     # leading axes are flattened and restored rather than assumed away.
     original = q.shape
+    if 32 % bits == 0:
+        q = np.ascontiguousarray(q, dtype=np.uint8).reshape(-1, original[-1])
+        vals_per_word = 32 // bits
+        n_words = q.shape[-1] // vals_per_word
+        grouped = q.reshape(q.shape[0], n_words, vals_per_word).astype(np.uint32)
+        shifts = (np.arange(vals_per_word, dtype=np.uint32) * bits
+                  ).reshape(1, 1, -1)
+        words = np.bitwise_or.reduce(grouped << shifts, axis=-1)
+        return words.reshape(*original[:-1], -1)
+
     flat = np.ascontiguousarray(q, dtype=np.uint8).reshape(-1, original[-1], 1)
-    # Little-endian bit order means bit 0 of each value comes first, so
-    # taking the low `bits` bits of each byte gives the stream directly.
     stream = np.unpackbits(flat, axis=-1, bitorder="little")[:, :, :bits]
     packed = np.packbits(stream.reshape(stream.shape[0], -1), axis=-1,
                          bitorder="little")

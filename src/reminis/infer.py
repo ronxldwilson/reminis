@@ -316,7 +316,8 @@ class WeightStore:
             return
         self._prefetch_done = {}
         self._prefetch_lock = threading.Lock()
-        self._prefetch_room = threading.Semaphore(0)
+        self._prefetch_ready = threading.Condition(self._prefetch_lock)
+        self._prefetch_in_progress = set()
         self._prefetch_bytes = 0
         self._prefetch_pool = ThreadPoolExecutor(
             max_workers=workers, thread_name_prefix="reminis-unpack")
@@ -343,6 +344,9 @@ class WeightStore:
         if self._prefetch_stop.is_set():
             return
         try:
+            with self._prefetch_lock:
+                self._prefetch_in_progress.add(name)
+
             while True:
                 with self._prefetch_lock:
                     if self._prefetch_bytes < self.prefetch_bytes_limit:
@@ -357,18 +361,10 @@ class WeightStore:
                 return
             shape, dtype, blob = row
             if not is_quantized_dtype(dtype):
-                # A float tensor is already numbers; there is nothing here
-                # a thread could do that the device will not do faster.
                 return
             dims = tuple(ast.literal_eval(shape))[::-1]
 
             if can_repack(dtype):
-                # An exactly-affine quantization is rearranged rather than
-                # decoded, which is cheaper but not free -- it is still
-                # numpy moving bits, and it threads: measured 3.8x on eight
-                # threads for Q4_K. Skipping it here left a bit-exact load
-                # entirely single-threaded, which is most of what a Q4_K
-                # model spends before its first token.
                 if self.pack_bits != "native" or not self._packable(name):
                     return
                 packed = ggml_repack(blob, dtype, dims)
@@ -381,18 +377,23 @@ class WeightStore:
                 entry = ("float32", (arr, dtype), dims, len(blob))
                 size = arr.nbytes
 
-            with self._prefetch_lock:
+            with self._prefetch_ready:
                 self._prefetch_done[name] = entry
                 self._prefetch_bytes += size
-                self._prefetch_bytes += arr.nbytes
+                self._prefetch_ready.notify_all()
         except Exception:
-            # A prefetch that fails is not an error: `get` will do the work
-            # itself, and whatever is genuinely wrong will surface there
-            # with the right message rather than on a background thread.
-            return
+            pass
+        finally:
+            with self._prefetch_ready:
+                self._prefetch_in_progress.discard(name)
+                self._prefetch_ready.notify_all()
 
     def take_prefetched(self, name):
-        with self._prefetch_lock:
+        with self._prefetch_ready:
+            if name in self._prefetch_in_progress and name not in self._prefetch_done:
+                self._prefetch_ready.wait_for(
+                    lambda: name not in self._prefetch_in_progress
+                    or name in self._prefetch_done)
             entry = self._prefetch_done.pop(name, None)
             if entry is None:
                 return None
