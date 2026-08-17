@@ -15,13 +15,36 @@ from pathlib import Path
 
 import pytest
 
-sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
+_ROOT = Path(__file__).parent.parent
+sys.path.insert(0, str(_ROOT / "src"))
+# The repo root as well, so `from tests import ...` below resolves. Running
+# as `python -m pytest` put the working directory on the path and hid the
+# need for this; `uv run pytest` does not, and the blame/bisect fixtures
+# failed to import under it.
+sys.path.insert(0, str(_ROOT))
 
 
 @pytest.fixture(params=[False, True], ids=["single-file", "sharded"])
 def shard(request):
     """Both safetensors layouts: one file, and an index over several."""
     return request.param
+
+
+@pytest.fixture(scope="module")
+def tmp(request):
+    """A scratch directory, named after the module that asked for it.
+
+    Module-scoped rather than per-test because the scripts these tests
+    came from build one model into a shared directory and then run every
+    check against it, which is what their `main()` does.
+    """
+    path = Path(__file__).parent / f"tmp_{request.module.__name__.split('.')[-1]}"
+    shutil.rmtree(path, ignore_errors=True)
+    path.mkdir(parents=True, exist_ok=True)
+    try:
+        yield path
+    finally:
+        shutil.rmtree(path, ignore_errors=True)
 
 
 @pytest.fixture(scope="module")
