@@ -4,7 +4,7 @@ Runs in under two minutes against SmolLM-135M.f16 (258 MB). Covers every
 subsystem that has been burned by a release: conversion, diff, apply,
 quantize, merge, registry, viewer, and the bit-plane encoding.
 
-    uv run python tests/test_prerelease.py
+    uv run pytest tests/test_prerelease.py
 
 The full test suite (`tests/test_roundtrip.py`, `test_infer.py`, etc.)
 round-trips every model in `models/` and trains real networks; that is a
@@ -22,6 +22,7 @@ import tempfile
 from pathlib import Path
 
 import numpy as np
+import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
@@ -29,38 +30,36 @@ MODELS = Path(__file__).resolve().parents[1] / "models"
 SMALL_DB = MODELS / "SmolLM-135M.f16.db"
 SMALL_GGUF = MODELS / "SmolLM-135M.f16.gguf"
 
-passed = 0
-failed = 0
-skipped = 0
-
 
 def section(title):
     print(f"\n{'=' * 70}\n{title}\n{'=' * 70}")
 
 
 def ok(label):
-    global passed
-    passed += 1
     print(f"  ok: {label}")
 
 
 def fail(label):
-    global failed
-    failed += 1
-    print(f"  FAIL: {label}")
+    """A failed check, raised rather than counted.
+
+    This used to increment a module-level counter and print, and only
+    main() ever read the counter. Under pytest -- which is how the suite
+    actually runs -- nothing read it at all, so every check in this file
+    passed whatever it found. A deliberately broken check reported
+    "1 passed". Raising is what makes the twenty-one gate tests a gate.
+    """
+    raise AssertionError(label)
 
 
 def skip(label):
-    global skipped
-    skipped += 1
-    print(f"  skip: {label}")
+    """Likewise: a missing model has to skip, not quietly pass."""
+    pytest.skip(label)
 
 
 def check(condition, label):
-    if condition:
-        ok(label)
-    else:
+    if not condition:
         fail(label)
+    ok(label)
 
 
 # ── 1. Bit-plane encoding (no model needed) ─────────────────────────────
@@ -452,9 +451,9 @@ def test_lowrank():
             "WHERE dtype IN ('F16','F32') AND shape LIKE '[%,%' LIMIT 1"
         ).fetchone()
         if row is None:
-            skip("no 2D float tensor for low-rank test")
+            # Close first: skip() raises now, so anything after it is dead.
             conn.close()
-            return
+            skip("no 2D float tensor for low-rank test")
 
         name, shape_json, dtype, blob = row
         np_dtype = np.float32 if dtype == "F32" else np.float16
@@ -983,58 +982,3 @@ def test_threaded_hash():
 
     h_threaded = _weights_hash_threaded(str(SMALL_DB))
     check(h_seq == h_threaded, "threaded hash matches sequential hash")
-
-
-# ── runner ────────────────────────────────────────────────────────────────
-
-ALL_TESTS = [
-    test_bitplane,
-    test_quantize_blocks,
-    test_viewer,
-    test_gguf_roundtrip,
-    test_diff_apply,
-    test_quantize_model,
-    test_merge,
-    test_registry,
-    test_lowrank,
-    test_inference,
-    test_transcription,
-    test_encode_candidates_parallel,
-    test_diff_tensor_set_changes,
-    test_quantize_chunking,
-    test_gguf_fast_parser,
-    test_convert_fallback,
-    test_export_refuses_to_drop_metadata,
-    test_every_subcommand_reaches_a_handler,
-    test_tensor_sql_matches_the_schema,
-    test_threaded_hash,
-]
-
-
-def main():
-    import time
-    t0 = time.perf_counter()
-
-    print("reminis pre-release test suite")
-    print(f"model: {SMALL_DB.name} ({'present' if SMALL_DB.exists() else 'MISSING'})")
-
-    for test in ALL_TESTS:
-        try:
-            test()
-        except Exception as exc:
-            fail(f"{test.__name__} raised: {exc}")
-
-    elapsed = time.perf_counter() - t0
-    print(f"\n{'=' * 70}")
-    print(f"  {passed} passed, {failed} failed, {skipped} skipped  ({elapsed:.1f}s)")
-    print(f"{'=' * 70}")
-
-    if failed:
-        print("\nPRE-RELEASE CHECK FAILED")
-        sys.exit(1)
-    else:
-        print("\nPRE-RELEASE CHECK PASSED")
-
-
-if __name__ == "__main__":
-    main()
