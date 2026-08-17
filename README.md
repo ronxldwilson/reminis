@@ -1334,7 +1334,7 @@ The checks are written to fail for the right reason. Where a property could pass
 - [x] Inference from database-stored weights (`reminis run`, verified against transformers)
 - [x] GPU backends chosen per workload (`--backend`: MLX on Apple silicon, CuPy on NVIDIA)
 - [x] Better delta encoding: bit-plane splitting, 58.4% to 50.4% — and a measured entropy floor of 46.5% showing how little is left ([#7](https://github.com/ronxldwilson/reminis/issues/7))
-- [ ] Storing the F32 form beside the F16 one, so loading skips the conversion
+- [ ] Storing the F32 form beside the F16 one, so loading skips the conversion ([#23](https://github.com/ronxldwilson/reminis/issues/23))
 - [x] Running quantized models: every K-quant and i-quant, unpacked at load
 - [x] Keeping weights packed in the backend's own format (`--pack 4/6/8`)
 - [x] Multiplying GGML's blocks with no second rounding, for the affine types (`--pack`)
@@ -1354,12 +1354,26 @@ The checks are written to fail for the right reason. Where a property could pass
 - [x] A speech model, not only text: Whisper end to end (`reminis transcribe`), token-for-token identical to `transformers`
 - [x] The tokenizer travels with a safetensors conversion, so such a database can name its own tokens
 - [x] Kokoro stored and verified lossless (548/548 tensors), with a specific account of why running it is a second engine
-- [ ] Running attention-free architectures (Mamba / state space, RWKV)
+- [ ] Running attention-free architectures (Mamba / state space, RWKV) ([#20](https://github.com/ronxldwilson/reminis/issues/20))
 - [x] Whisper faster than the tools people use for it: 0.656 s → 0.108 s, ahead of mlx-whisper by 9% on warm transcription
 - [ ] Whisper beyond one 30-second window: long audio needs chunking with overlap ([#16](https://github.com/ronxldwilson/reminis/issues/16))
 - [ ] Cold transcription, where reminis still loses: it reads 154 MB of float32 where mlx-whisper maps 75 MB of float16 ([#17](https://github.com/ronxldwilson/reminis/issues/17))
 - [ ] `--pack` for the speech path, where a quantized Whisper is currently 3.5x smaller and 2x slower ([#18](https://github.com/ronxldwilson/reminis/issues/18))
 - [ ] Kokoro: stored losslessly, and a second engine away from running ([#19](https://github.com/ronxldwilson/reminis/issues/19))
+
+### The road to a full engine
+
+Storage is finished work and so is the forward pass. What turns a forward pass into an engine mostly is not built yet, and [#31](https://github.com/ronxldwilson/reminis/issues/31) is the map — where reminis stands against `mlx-lm` and against vLLM, and why the database-shaped items come before the engine-shaped ones.
+
+- [ ] Python dispatch is 26% of a token; removing it puts reminis ahead of llama.cpp ([#22](https://github.com/ronxldwilson/reminis/issues/22))
+- [ ] A sampler beyond temperature and top-p: top-k, min-p, penalties, stop strings, grammars ([#21](https://github.com/ronxldwilson/reminis/issues/21))
+- [ ] Prefix caching, so a chat loop stops re-prefilling its own transcript ([#24](https://github.com/ronxldwilson/reminis/issues/24))
+- [ ] `reminis serve`, OpenAI-compatible, with a registry as a multi-model server ([#26](https://github.com/ronxldwilson/reminis/issues/26))
+- [ ] A batch dimension below `generate()` ([#25](https://github.com/ronxldwilson/reminis/issues/25))
+- [ ] Speculative decoding, with draft and target in the same database ([#28](https://github.com/ronxldwilson/reminis/issues/28))
+- [ ] Vision-language input, taking Whisper as the precedent ([#29](https://github.com/ronxldwilson/reminis/issues/29))
+- [ ] Continuous batching and a paged KV cache — recorded deliberately, and honest that none of it uses the thesis ([#27](https://github.com/ronxldwilson/reminis/issues/27))
+- [ ] Training inside reminis, not only tracking of training done elsewhere ([#30](https://github.com/ronxldwilson/reminis/issues/30))
 
 ## License
 
