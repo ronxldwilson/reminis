@@ -36,8 +36,7 @@ import ast
 import sqlite3
 import time
 
-import numpy as np
-
+from reminis import blockindex
 from reminis.db import mmap_bytes
 
 # The suffixes of the stacked 3-D expert tensors. Everything else in a
@@ -60,84 +59,30 @@ EXPERT_TENSORS = (
 DEFAULT_BITS = 4
 DEFAULT_GROUP = 128
 
-SCHEMA = """
-CREATE TABLE IF NOT EXISTS expert_index (
-    id    INTEGER PRIMARY KEY,
-    block BLOB NOT NULL
-);
-CREATE TABLE IF NOT EXISTS expert_index_layout (
-    tensor     TEXT PRIMARY KEY,
-    base_id    INTEGER NOT NULL,
-    n_experts  INTEGER NOT NULL,
-    rows       INTEGER NOT NULL,
-    cols       INTEGER NOT NULL,
-    bits       INTEGER NOT NULL,
-    group_size INTEGER NOT NULL,
-    q_bytes    INTEGER NOT NULL,
-    s_bytes    INTEGER NOT NULL
-);
-"""
+TABLE = "expert_index"
+SCHEMA = blockindex.schema(
+    TABLE,
+    "    base_id    INTEGER NOT NULL,\n    n_experts  INTEGER NOT NULL,",
+)
 
 
-class Layout:
+class Layout(blockindex.BlockLayout):
     """Where one tensor's experts live, and how to read one back.
 
-    The three arrays a quantized matmul needs -- codes, scales, biases --
-    are stored end to end in a single blob rather than in three columns, so
-    reading an expert is one seek rather than three.
+    A row is one expert of a stacked tensor, so the identity is the
+    `base_id` the stack starts at and how many experts follow it.
     """
 
-    __slots__ = ("tensor", "base_id", "n_experts", "rows", "cols", "bits",
-                 "group_size", "q_bytes", "s_bytes")
-
-    def __init__(self, tensor, base_id, n_experts, rows, cols, bits,
-                 group_size, q_bytes, s_bytes):
-        self.tensor = tensor
-        self.base_id = base_id
-        self.n_experts = n_experts
-        self.rows = rows
-        self.cols = cols
-        self.bits = bits
-        self.group_size = group_size
-        self.q_bytes = q_bytes
-        self.s_bytes = s_bytes
-
-    @property
-    def block_bytes(self) -> int:
-        return self.q_bytes + 2 * self.s_bytes
+    __slots__ = ("base_id", "n_experts")
+    COLUMNS = ("tensor", "base_id", "n_experts") + blockindex.GEOMETRY_COLUMNS
 
     def row_id(self, expert: int) -> int:
         return self.base_id + expert
 
-    def split(self, raw: memoryview):
-        """The codes, scales and biases of one stored block, as numpy views.
-
-        No bytes are copied here: each is a view onto the buffer sqlite
-        handed back, and the copy happens once when the backend takes them.
-        """
-        q_end = self.q_bytes
-        s_end = q_end + self.s_bytes
-        words = np.frombuffer(raw, dtype=np.uint32, count=self.q_bytes // 4)
-        scales = np.frombuffer(raw, dtype=np.float16,
-                               count=self.s_bytes // 2, offset=q_end)
-        biases = np.frombuffer(raw, dtype=np.float16,
-                               count=self.s_bytes // 2, offset=s_end)
-        groups = self.cols // self.group_size
-        return (words.reshape(self.rows, -1),
-                scales.reshape(self.rows, groups),
-                biases.reshape(self.rows, groups))
-
 
 def read_layouts(conn: sqlite3.Connection) -> dict:
     """Every indexed tensor, or an empty mapping if there is no index."""
-    try:
-        rows = conn.execute(
-            "SELECT tensor, base_id, n_experts, rows, cols, bits, "
-            "group_size, q_bytes, s_bytes FROM expert_index_layout"
-        ).fetchall()
-    except sqlite3.OperationalError:
-        return {}
-    return {row[0]: Layout(*row) for row in rows}
+    return blockindex.read_layouts(conn, TABLE, Layout)
 
 
 def expert_tensor_names(conn: sqlite3.Connection) -> list:
@@ -265,32 +210,8 @@ def build(db_path: str, backend=None, bits: int = DEFAULT_BITS,
 
 def drop(db_path: str) -> bool:
     """Remove the index. Returns whether there was one."""
-    conn = sqlite3.connect(db_path)
-    try:
-        existed = bool(conn.execute(
-            "SELECT count(*) FROM sqlite_master WHERE type='table' "
-            "AND name='expert_index'"
-        ).fetchone()[0])
-        conn.executescript(
-            "DROP TABLE IF EXISTS expert_index;"
-            "DROP TABLE IF EXISTS expert_index_layout;"
-        )
-        conn.commit()
-        # The file keeps the freed pages otherwise, and an index that was
-        # the same size as the model is not a rounding error.
-        conn.execute("VACUUM")
-        return existed
-    finally:
-        conn.close()
+    return blockindex.drop(db_path, TABLE)
 
 
-def _nbytes(backend, array) -> int:
-    return int(np.asarray(backend.to_host(array)).nbytes)
-
-
-def _to_bytes(backend, packed) -> bytes:
-    """One quantized weight as the bytes the index stores."""
-    parts = [backend.to_host(packed.q),
-             backend.to_host(packed.scales),
-             backend.to_host(packed.biases)]
-    return b"".join(np.ascontiguousarray(p).tobytes() for p in parts)
+_nbytes = blockindex.nbytes
+_to_bytes = blockindex.to_bytes

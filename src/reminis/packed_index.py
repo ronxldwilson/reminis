@@ -36,7 +36,7 @@ import ast
 import sqlite3
 import time
 
-import numpy as np
+from reminis import blockindex
 
 # The suffixes worth storing packed: the per-layer matrices, which are
 # nearly all of a model's bytes and are only ever the right-hand side of a
@@ -56,78 +56,27 @@ PACKABLE_EMBED = ("token_embd.weight", "output.weight")
 DEFAULT_BITS = 4
 DEFAULT_GROUP = 128
 
-SCHEMA = """
-CREATE TABLE IF NOT EXISTS packed_index (
-    id    INTEGER PRIMARY KEY,
-    block BLOB NOT NULL
-);
-CREATE TABLE IF NOT EXISTS packed_index_layout (
-    tensor     TEXT PRIMARY KEY,
-    row_id     INTEGER NOT NULL,
-    rows       INTEGER NOT NULL,
-    cols       INTEGER NOT NULL,
-    bits       INTEGER NOT NULL,
-    group_size INTEGER NOT NULL,
-    q_bytes    INTEGER NOT NULL,
-    s_bytes    INTEGER NOT NULL
-);
-"""
+TABLE = "packed_index"
+SCHEMA = blockindex.schema(TABLE, "    row_id     INTEGER NOT NULL,")
 
 
-class Layout:
-    """Where one tensor's packed form lives, and how to read it back."""
+class Layout(blockindex.BlockLayout):
+    """Where one tensor's packed form lives, and how to read it back.
 
-    __slots__ = ("tensor", "row_id", "rows", "cols", "bits", "group_size",
-                 "q_bytes", "s_bytes")
+    One row per tensor, so the identity is a single `row_id`.
+    """
 
-    def __init__(self, tensor, row_id, rows, cols, bits, group_size,
-                 q_bytes, s_bytes):
-        self.tensor = tensor
-        self.row_id = row_id
-        self.rows = rows
-        self.cols = cols
-        self.bits = bits
-        self.group_size = group_size
-        self.q_bytes = q_bytes
-        self.s_bytes = s_bytes
-
-    @property
-    def block_bytes(self) -> int:
-        return self.q_bytes + 2 * self.s_bytes
+    __slots__ = ("row_id",)
+    COLUMNS = ("tensor", "row_id") + blockindex.GEOMETRY_COLUMNS
 
     @property
     def shape(self) -> tuple:
         return (self.rows, self.cols)
 
-    def split(self, raw):
-        """Codes, scales and biases as numpy views onto the stored bytes.
-
-        Nothing is copied here; the copy happens once when the backend
-        adopts them.
-        """
-        q_end = self.q_bytes
-        s_end = q_end + self.s_bytes
-        words = np.frombuffer(raw, dtype=np.uint32, count=self.q_bytes // 4)
-        scales = np.frombuffer(raw, dtype=np.float16,
-                               count=self.s_bytes // 2, offset=q_end)
-        biases = np.frombuffer(raw, dtype=np.float16,
-                               count=self.s_bytes // 2, offset=s_end)
-        groups = self.cols // self.group_size
-        return (words.reshape(self.rows, -1),
-                scales.reshape(self.rows, groups),
-                biases.reshape(self.rows, groups))
-
 
 def read_layouts(conn: sqlite3.Connection) -> dict:
     """Every packed tensor, or an empty mapping if there is no index."""
-    try:
-        rows = conn.execute(
-            "SELECT tensor, row_id, rows, cols, bits, group_size, "
-            "q_bytes, s_bytes FROM packed_index_layout"
-        ).fetchall()
-    except sqlite3.OperationalError:
-        return {}
-    return {row[0]: Layout(*row) for row in rows}
+    return blockindex.read_layouts(conn, TABLE, Layout)
 
 
 def packable(name: str) -> bool:
@@ -236,29 +185,8 @@ def build(db_path: str, backend=None, bits: int = DEFAULT_BITS,
 
 def drop(db_path: str) -> bool:
     """Remove the index. Returns whether there was one."""
-    conn = sqlite3.connect(db_path)
-    try:
-        existed = bool(conn.execute(
-            "SELECT count(*) FROM sqlite_master WHERE type='table' "
-            "AND name='packed_index'"
-        ).fetchone()[0])
-        conn.executescript(
-            "DROP TABLE IF EXISTS packed_index;"
-            "DROP TABLE IF EXISTS packed_index_layout;"
-        )
-        conn.commit()
-        conn.execute("VACUUM")
-        return existed
-    finally:
-        conn.close()
+    return blockindex.drop(db_path, TABLE)
 
 
-def _nbytes(backend, array) -> int:
-    return int(np.asarray(backend.to_host(array)).nbytes)
-
-
-def _to_bytes(backend, packed) -> bytes:
-    parts = [backend.to_host(packed.q),
-             backend.to_host(packed.scales),
-             backend.to_host(packed.biases)]
-    return b"".join(np.ascontiguousarray(p).tobytes() for p in parts)
+_nbytes = blockindex.nbytes
+_to_bytes = blockindex.to_bytes
