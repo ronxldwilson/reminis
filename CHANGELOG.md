@@ -11,6 +11,78 @@ release below had to pass.
 
 ## Unreleased
 
+### A width per group, measured for the model rather than inherited
+
+`reminis sweep --mix` groups a model's tensors by role -- `embed`, `attn`,
+`ffn`, `ssm`, `output` -- holds every group at the widest rung that fits, takes
+one group at a time down to each narrower width, and keeps the narrowest width
+each group tolerated. `pack_bits` now accepts a `{role: bits}` map alongside a
+single width, which is what made this possible.
+
+Mixed precision is not new; the `_M` in `Q4_K_M` is exactly this, and llama.cpp
+has shipped it for years. What is new here is where the mix comes from. Theirs
+is a fixed recipe, the same constants for every model. This one is measured on
+the model in front of you, which is affordable only because a rung is derived
+from the same rows on the way to the GPU rather than being another copy on
+disk.
+
+On `SmolLM-135M-Instruct`, holding every other group at 8-bit:
+
+| group | bits | resident | top-1 |
+|---|---|---|---|
+| `embed` | 6 | 135 MB | 90.5% |
+| `attn` | 6 | 135 MB | 93.7% |
+| `ffn` | 6 | 122 MB | 95.2% |
+| `ffn` | 4 | 102 MB | 73.0% |
+
+The embedding and the attention projections will not take 6 bits on this model.
+The feed-forward matrices take it for nothing. That asymmetry is what a single
+number hides, and it is the whole reason to measure per group:
+
+| | resident | top-1 |
+|---|---|---|
+| uniform 8-bit | 142 MB | 95.2% |
+| derived mix -- `embed=8 attn=8 ffn=6` | 122 MB | 95.2% |
+| uniform 6-bit | 109 MB | 88.9% |
+
+14% less memory at identical agreement, and 6.3 points more top-1 than the
+uniform rung nearest its size.
+
+**A loss is reported as a loss.** On `granite-3.1-1b-a400m` no group tolerated
+a narrower width, the derived mix came out identical to uniform 8-bit, and the
+run says so rather than dressing it up. A search that only announces wins is
+not a measurement.
+
+**The mix is measured, not assembled.** A group's cost on its own does not have
+to be its cost alongside the others, so the derived mix is loaded and run as
+one model before anything is claimed about it. Where the search finds nothing
+and the mix equals the uniform rung, that final run is a consistency check: two
+separate loads of the same configuration have to agree, and if they ever do not
+then every other row is suspect.
+
+**The comparison is against the recipe, not only against uniform.** A model
+converted from a `_K_M` GGUF still carries llama.cpp's choices in its dtypes,
+so the run measures those too and prints them beside the derived mix -- on
+Granite, `Q4_K x144, Q6_K x25`, 876 MB at 93.2%. Beating uniform is the easy
+half.
+
+One thing that took a measurement to get right. The budget is a share of what
+the *base rung* achieves, not of the reference. Those are different questions --
+what quantizing this model costs at all, and what narrowing this group costs on
+top of that -- and only the second is what the search chooses on. Stated
+against the reference, a 99% budget is unreachable for every group at every
+width on a model whose 8-bit rung already gives up five points, and the search
+returns the base width for everything and calls it a derived mix. That is what
+the first run produced.
+
+Not yet measured: `Mistral-7B`, which needs about 9 GB resident. Its uniform
+rungs reproduce the published table exactly, and the per-group probes are
+outstanding.
+
+The packable-tensor list moved to the new `bitmix.py`. `weights.py` and
+`packed_index.py` each held a copy, the second with a comment saying the two
+must agree; they now agree by construction.
+
 ### `infer.py` was 2,606 lines, and "inference" had stopped being a subject
 
 One file held the weight store, the config reader, four tokenizers, the

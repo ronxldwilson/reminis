@@ -772,6 +772,42 @@ The `forward` column is one batched prefill and is the least trustworthy column 
 
 This is the kind of question the database makes cheap. Every rung is derived from the same rows on the way to the GPU, so comparing four precisions does not mean keeping four copies of the model on disk, and the exact source weights are still sitting there byte-intact when the sweep finishes.
 
+### A width per group, derived for the model in front of you
+
+One width for a whole model is a compromise: it is set by whichever tensors tolerate it least, and every other tensor pays for them. llama.cpp settled that years ago — the `_M` in `Q4_K_M` *is* mixed precision, some tensors at Q6_K and the rest at Q4_K. What it cannot do is tell you the right mix for *your* model, because its mix is a fixed recipe, the same constants for everything.
+
+Here the weights are rows and the packed form is derived on the way to the GPU, so a rung costs nothing but the time to run it. `--mix` spends that time: it holds every group of tensors at the widest rung that fits, takes one group at a time down to each narrower width, and keeps the narrowest width each group tolerated.
+
+```bash
+reminis sweep models/SmolLM-135M-Instruct.f16.db --bits 8,6,4,3,2 --mix
+```
+
+```
+   group   bits   resident    top-1    top-5         KL
+   embed      6     135 MB    90.5%x   93.0%     0.0129
+    attn      6     135 MB    93.7%x   94.6%     0.0126
+     ffn      6     122 MB    95.2%    92.1%     0.0563
+     ffn      4     102 MB    73.0%x   83.2%     0.1719
+```
+
+The embedding and the attention projections will not take 6 bits on this model. The feed-forward matrices will, and cost nothing for it. That is the asymmetry a single number hides:
+
+| | resident | top-1 |
+|---|---|---|
+| uniform 8-bit | 142 MB | 95.2% |
+| **derived mix** — `embed=8 attn=8 ffn=6` | **122 MB** | **95.2%** |
+| uniform 6-bit | 109 MB | 88.9% |
+
+14% less memory than 8-bit at identical agreement, and 6.3 points more top-1 than the uniform rung nearest its size.
+
+**It reports a loss as a loss.** On `granite-3.1-1b-a400m` no group tolerated a narrower width, the derived mix came out identical to uniform 8-bit, and the run says so — *"dominated by 8-bit: at least as much agreement for at most as many bytes… the honest conclusion is to use a uniform width."* A search that only ever announces wins is not a measurement.
+
+**It measures the mix, rather than assembling it.** A group's cost measured on its own does not have to be its cost alongside the others, so the derived mix is loaded and run as one model before anything is claimed about it. Where the search finds nothing and the mix comes out equal to the uniform rung, that final run is a consistency check: two separate loads of the same configuration have to agree.
+
+**It compares against the recipe, not just against uniform.** A model converted from a `_K_M` GGUF still carries llama.cpp's own choices in its dtypes, so the run measures those too and prints them beside the derived mix — on Granite, `Q4_K×144, Q6_K×25`, 876 MB at 93.2%. Beating uniform is the easy half; the real question is whether measuring beats inheriting.
+
+The budget is a share of what the base rung itself achieves, not of the reference. Those are different questions — what quantizing this model costs at all, and what narrowing *this group* costs on top of that — and only the second is what the search chooses on. On a model where uniform 8-bit has already given up five points, a budget stated against the reference is unreachable for every group at every width, and the search would return the base width and call it a derived mix.
+
 ## What's in the Database
 
 ```
@@ -1294,7 +1330,7 @@ Note that GGUF and safetensors use different tensor names (`blk.0.attn_q.weight`
 
 ## Tests
 
-Sixteen suites, 415 explicit checks, run with `uv run python tests/<name>.py`. They need no framework and skip rather than fail when a model or an optional dependency is absent.
+Seventeen suites, 452 explicit checks, run with `uv run pytest`. They skip rather than fail when a model or an optional dependency is absent.
 
 The references they check against — transformers for logits, peft for LoRA adapters, torch, and MLX on Apple silicon — are declared as a dev dependency group, so `uv sync` installs them and does not remove them. That is worth stating because getting it wrong is quiet: when those packages went missing, the three suites that compare reminis against a reference implementation degraded to skips and went on reporting PASS.
 
@@ -1304,6 +1340,7 @@ The references they check against — transformers for logits, peft for LoRA ada
 | `test_diff`, `test_lowrank` | Delta packs, hash-verified apply, low-rank encoding |
 | `test_bitplane` | Bit-plane delta encoding: reversibility, refusals, older packs still read |
 | `test_sweep` | Precision sweeps: agreement maths, resident-size prediction, reference choice |
+| `test_bitmix` | Per-group widths: the grouping, the size accounting, and that the width asked for is the width applied |
 | `test_quantize` | Q8_0 and Q4_0 block layouts, checked against the gguf package's dequantizer |
 | `test_safetensors`, `test_lora_adapter` | Safetensors both directions, peft agreement |
 | `test_track`, `test_blame_bisect`, `test_registry` | Training logs, blame, bisect, rollback, many models in one file |

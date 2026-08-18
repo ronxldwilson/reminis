@@ -24,6 +24,7 @@ from collections import OrderedDict
 
 import numpy as np
 
+from reminis import bitmix
 from reminis.backend import best_group as _best_group
 from reminis.backend import select as select_backend
 from reminis.db import open_for_read
@@ -106,32 +107,13 @@ class WeightStore:
     Cached mode reads each tensor once and keeps the float32 copy. Streaming
     mode reads it every single time it is used and keeps nothing, which is
     the mode that makes the "the model lives in the database" claim literal.
+
+    Which weights a chosen width applies to, and which group each of them
+    belongs to, both live in `bitmix`. The packed index needs the same
+    answer, and a tensor stored there that this store would not have packed
+    comes back in a shape the forward pass does not expect, so the two
+    cannot be allowed to hold separate copies of the list.
     """
-
-    # Weights worth keeping packed: the per-layer matrices, which are almost
-    # all of a model's bytes and are only ever used as the right-hand side of
-    # a matrix multiply. Embeddings are indexed row-wise rather than
-    # multiplied, and norms are tiny, so neither is packed.
-    _PACKABLE = (
-        "attn_q.weight", "attn_k.weight", "attn_v.weight", "attn_output.weight",
-        "ffn_gate.weight", "ffn_up.weight", "ffn_down.weight",
-        # Mixture-of-experts weights are stacked 3-D tensors and are most of
-        # such a model's bytes, so they matter more here than anything else.
-        "ffn_gate_exps.weight", "ffn_up_exps.weight", "ffn_down_exps.weight",
-        # A recurrent block names its projections differently, and on a model
-        # that is three-quarters recurrent those names are most of the
-        # weights: leaving them off this list left 11 GB of a 13.8 GB model
-        # expanded to float16, which is the whole difference between fitting
-        # on a 16 GB machine and not.
-        "attn_qkv.weight", "attn_gate.weight", "ssm_out.weight",
-    )
-
-    # The embedding table is indexed rather than multiplied, but on a model
-    # with tied weights it is also the output projection -- and there it is
-    # the single largest read of every token. Packing it pays for the whole
-    # output side, and the handful of rows an embedding lookup needs are
-    # decoded individually.
-    _PACKABLE_EMBED = ("token_embd.weight", "output.weight")
 
     def __init__(self, db_path: str, stream: bool = False, backend=None,
                  pack_bits=None, pack_group: int = 128,
@@ -379,9 +361,7 @@ class WeightStore:
                 self.backend.eval(arr)
                 del arr32
                 bits = (nearest_bits(dtype) if self.pack_bits == "native"
-                        else None)
-                if isinstance(self.pack_bits, int):
-                    bits = self.pack_bits
+                        else self.bits_for(name))
                 if (bits is not None and self.backend.can_pack()
                         and self._packable(name)):
                     arr = self.backend.pack(
@@ -436,7 +416,7 @@ class WeightStore:
                 f"nor a quantization reminis can unpack."
             )
         if self._should_pack(name):
-            arr = self.backend.pack(arr, self.pack_bits,
+            arr = self.backend.pack(arr, self.bits_for(name),
                                     _best_group(arr.shape[-1], self.pack_group),
                                     self.pack_compact)
             self.packed += 1
@@ -462,6 +442,13 @@ class WeightStore:
         layout = self._packed_layouts.get(name)
         if layout is None or not self.backend.can_pack():
             return None
+        # A mix asks for a different width per role, and the index holds one.
+        # Taking the index's width there would silently overrule the thing
+        # being measured, so a tensor whose role wants something else is read
+        # and packed the ordinary way instead. The single-width case keeps its
+        # old behaviour: the index wins, and `infer` says that it did.
+        if isinstance(self.pack_bits, dict) and self.bits_for(name) != layout.bits:
+            return None
 
         with self.conn.blobopen("packed_index", "block", layout.row_id,
                                 readonly=True) as handle:
@@ -478,17 +465,29 @@ class WeightStore:
             self._cache[name] = arr
         return arr
 
+    def bits_for(self, name: str):
+        """The width this weight is to be packed at, or None to leave it wide.
+
+        `pack_bits` is one width for the whole model in the ordinary case.
+        It can also be a map from role to width -- what `sweep --mix`
+        derives -- and then the width is looked up per tensor. A role the
+        map does not mention is left at full precision rather than given a
+        default, so a mix that names three of four groups says so in what it
+        loads instead of quietly packing the fourth.
+        """
+        if isinstance(self.pack_bits, dict):
+            return self.pack_bits.get(bitmix.role_of(name))
+        return self.pack_bits if isinstance(self.pack_bits, int) else None
+
     def _should_pack(self, name: str) -> bool:
         return (
-            isinstance(self.pack_bits, int)
+            self.bits_for(name) is not None
             and self.backend.can_pack()
             and self._packable(name)
         )
 
     def _packable(self, name: str) -> bool:
-        if name in self._PACKABLE_EMBED:
-            return True
-        return name.startswith("blk.") and name.endswith(self._PACKABLE)
+        return bitmix.is_packable(name)
 
     def _native_pack(self, name, blob, dtype, dims):
         """The stored blocks handed to the backend without being unpacked.

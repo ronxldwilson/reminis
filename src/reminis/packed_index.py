@@ -36,22 +36,19 @@ import ast
 import sqlite3
 import time
 
-from reminis import blockindex
+from reminis import bitmix, blockindex
 
-# The suffixes worth storing packed: the per-layer matrices, which are
-# nearly all of a model's bytes and are only ever the right-hand side of a
-# matrix multiply. This mirrors `WeightStore._PACKABLE`, and the two must
-# agree -- a tensor packed here that the store would not have packed would
-# be read back into a shape the forward pass does not expect.
-PACKABLE = (
-    "attn_q.weight", "attn_k.weight", "attn_v.weight", "attn_output.weight",
-    "ffn_gate.weight", "ffn_up.weight", "ffn_down.weight",
-    "attn_qkv.weight", "attn_gate.weight", "ssm_out.weight",
-)
+# The suffixes worth storing packed, taken from the same place the store
+# takes them: a tensor packed here that the store would not have packed comes
+# back in a shape the forward pass does not expect, so the two cannot be
+# allowed to drift. The stacked expert matrices are the one deliberate
+# omission -- they have their own table, one expert to a row, because reading
+# a whole stack to use four of thirty-two is what that table exists to avoid.
+PACKABLE = bitmix.DENSE_MATRIX
 
 # The vocabulary-sized matrices, which are not per-layer but are the two
 # largest tensors in most models and the most expensive to unpack.
-PACKABLE_EMBED = ("token_embd.weight", "output.weight")
+PACKABLE_EMBED = bitmix.PACKABLE_EMBED
 
 DEFAULT_BITS = 4
 DEFAULT_GROUP = 128

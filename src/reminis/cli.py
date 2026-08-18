@@ -190,7 +190,7 @@ def cmd_quantize(args, parser):
 
 
 def cmd_sweep(args, parser):
-    from reminis.sweep import sweep
+    from reminis.sweep import mix_sweep, sweep
 
     widths = []
     for piece in args.bits.split(","):
@@ -206,10 +206,17 @@ def cmd_sweep(args, parser):
     if not widths:
         parser.error("--bits needs at least one width")
 
-    sweep(
+    if args.mix and len(widths) < 2:
+        parser.error("--mix needs at least two widths to choose between")
+    if not 0.0 < args.budget <= 1.0:
+        parser.error("--budget is a top-1 agreement fraction, between 0 and 1")
+
+    run = mix_sweep if args.mix else sweep
+    extra = {"budget": args.budget} if args.mix else {}
+    run(
         args.database, widths, prompt=args.prompt,
         backend=None if args.backend == "auto" else args.backend,
-        kv_bits=args.kv_bits,
+        kv_bits=args.kv_bits, **extra,
     )
 
 
@@ -605,6 +612,16 @@ def build_parser() -> argparse.ArgumentParser:
     p_sweep.add_argument(
         "--kv-bits", type=int, choices=(4, 8), metavar="BITS",
         help="Also compress the key/value cache to this many bits",
+    )
+    p_sweep.add_argument(
+        "--mix", action="store_true",
+        help="Measure each group of tensors separately and derive a width per "
+             "group for this model, instead of one width for all of it",
+    )
+    p_sweep.add_argument(
+        "--budget", type=float, default=0.99, metavar="FRACTION",
+        help="With --mix, the top-1 agreement a group must hold to keep a "
+             "narrower width (default 0.99)",
     )
     p_sweep.set_defaults(func=cmd_sweep)
 
