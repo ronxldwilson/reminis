@@ -19,6 +19,7 @@ against llama.cpp token for token rather than by eye.
 """
 
 import heapq
+import re
 from functools import lru_cache
 
 from reminis.errors import UnsupportedModel
@@ -187,7 +188,58 @@ def _numeric_array(meta: dict, key: str) -> list:
     ]
 
 
-class SPMTokenizer:
+class _SpecialTokens:
+    """The part of encoding that does not depend on which BPE this is.
+
+    All three tokenizers below open the same way: emit the beginning-of-text
+    token, cut the text on the special-token pattern, hand back a special's
+    id directly rather than letting the merge algorithm take it apart, and
+    run everything else through their own encoder. That was written out
+    three times, which is three places to fix when the handling of a special
+    is wrong -- and getting one of them wrong is silent, because a special
+    that goes through the merge path still produces plausible ids.
+
+    Subclasses supply `_encode_chunk`, which sees only ordinary text.
+    """
+
+    def _init_specials(self, types) -> None:
+        """Collect the special tokens and the pattern that finds them.
+
+        Longest first, so a vocabulary holding both `<|im_end|>` and `<|im|>`
+        cuts at the longer one -- `re` alternation takes the first branch
+        that matches, not the longest.
+        """
+        self.specials = sorted(
+            (self.tokens[i] for i, t in enumerate(types) if int(t) in (3, 4)),
+            key=len, reverse=True,
+        )
+        self._special_pattern = (
+            re.compile("(" + "|".join(re.escape(s) for s in self.specials) + ")")
+            if self.specials else None
+        )
+
+    def _encode_chunk(self, text: str) -> list[int]:
+        raise NotImplementedError
+
+    def encode(self, text: str, add_special: bool = True) -> list[int]:
+        ids = []
+        if add_special and self.add_bos and self.bos_id is not None:
+            ids.append(self.bos_id)
+
+        chunks = (
+            self._special_pattern.split(text) if self._special_pattern else [text]
+        )
+        for chunk in chunks:
+            if not chunk:
+                continue
+            if chunk in self.ids and chunk in self.specials:
+                ids.append(self.ids[chunk])
+                continue
+            ids.extend(self._encode_chunk(chunk))
+        return ids
+
+
+class SPMTokenizer(_SpecialTokens):
     """SentencePiece, as llama.cpp implements it.
 
     There is no merge list. Every token carries a score, and the algorithm
@@ -222,17 +274,7 @@ class SPMTokenizer:
                     self.byte_ids[int(text[3:5], 16)] = i
         self.id_to_byte = {i: b for b, i in self.byte_ids.items()}
 
-        self.specials = sorted(
-            (self.tokens[i] for i, t in enumerate(types) if int(t) in (3, 4)),
-            key=len, reverse=True,
-        )
-        import re
-
-        self._re = re
-        self._special_pattern = (
-            re.compile("(" + "|".join(re.escape(s) for s in self.specials) + ")")
-            if self.specials else None
-        )
+        self._init_specials(types)
 
         self.bos_id = _int_or_none(meta.get("tokenizer.ggml.bos_token_id"))
         self.eos_id = _int_or_none(meta.get("tokenizer.ggml.eos_token_id"))
@@ -246,22 +288,7 @@ class SPMTokenizer:
         ).lower() == "true"
         self.chat_template = meta.get("tokenizer.chat_template", "")
 
-    def encode(self, text: str, add_special: bool = True) -> list[int]:
-        ids = []
-        if add_special and self.add_bos and self.bos_id is not None:
-            ids.append(self.bos_id)
-
-        chunks = self._special_pattern.split(text) if self._special_pattern else [text]
-        for chunk in chunks:
-            if not chunk:
-                continue
-            if chunk in self.ids and chunk in self.specials:
-                ids.append(self.ids[chunk])
-                continue
-            ids.extend(self._encode_piece(chunk))
-        return ids
-
-    def _encode_piece(self, text: str) -> list[int]:
+    def _encode_chunk(self, text: str) -> list[int]:
         # Every stretch of ordinary text gets the leading space, not just the
         # first: "x[INST]y" encodes its "y" as "_y", the same as its "x".
         # Checked against llama.cpp, which does the same.
@@ -354,12 +381,10 @@ class SPMTokenizer:
         return ""
 
 
-class BPETokenizer:
+class BPETokenizer(_SpecialTokens):
     """Byte-level BPE, rebuilt from the vocabulary and merges in the database."""
 
     def __init__(self, meta: dict):
-        import re
-
         self.tokens = _parse_array(meta, "tokenizer.ggml.tokens")
         merges = _parse_array(meta, "tokenizer.ggml.merges")
         if not self.tokens or not merges:
@@ -389,10 +414,7 @@ class BPETokenizer:
             t[0] if isinstance(t, (list, tuple)) else t
             for t in _parse_array(meta, "tokenizer.ggml.token_type")
         ]
-        self.specials = sorted(
-            (self.tokens[i] for i, t in enumerate(types) if int(t) in (3, 4)),
-            key=len, reverse=True,
-        )
+        self._init_specials(types)
 
         pre = meta.get("tokenizer.ggml.pre", "default")
         if pre in ("gpt-4o", "qwen35"):
@@ -411,11 +433,6 @@ class BPETokenizer:
             self.pattern = re.compile(
                 _PRETOKENIZERS.get(pre, _PRETOKENIZERS["default"])
             )
-        self._special_pattern = (
-            re.compile("(" + "|".join(re.escape(s) for s in self.specials) + ")")
-            if self.specials else None
-        )
-        self._re = re
 
         self.bos_id = _int_or_none(meta.get("tokenizer.ggml.bos_token_id"))
         self.eos_id = _int_or_none(meta.get("tokenizer.ggml.eos_token_id"))
@@ -425,30 +442,18 @@ class BPETokenizer:
         self._byte_to_char, self._char_to_byte = _byte_unicode_maps()
         self._bpe_cache: dict[str, list[str]] = {}
 
-    def encode(self, text: str, add_special: bool = True) -> list[int]:
+    def _encode_chunk(self, chunk: str) -> list[int]:
         ids = []
-        if add_special and self.add_bos and self.bos_id is not None:
-            ids.append(self.bos_id)
-
-        chunks = (
-            self._special_pattern.split(text) if self._special_pattern else [text]
-        )
-        for chunk in chunks:
-            if not chunk:
-                continue
-            if chunk in self.ids and chunk in self.specials:
-                ids.append(self.ids[chunk])
-                continue
-            for piece in self.pattern.findall(chunk):
-                encoded = "".join(self._byte_to_char[b] for b in piece.encode("utf-8"))
-                for token in self._bpe(encoded):
-                    token_id = self.ids.get(token)
-                    if token_id is None:
-                        # Every single byte is in the vocabulary, so falling
-                        # back to bytes always terminates.
-                        ids.extend(self.ids[c] for c in token if c in self.ids)
-                    else:
-                        ids.append(token_id)
+        for piece in self.pattern.findall(chunk):
+            encoded = "".join(self._byte_to_char[b] for b in piece.encode("utf-8"))
+            for token in self._bpe(encoded):
+                token_id = self.ids.get(token)
+                if token_id is None:
+                    # Every single byte is in the vocabulary, so falling
+                    # back to bytes always terminates.
+                    ids.extend(self.ids[c] for c in token if c in self.ids)
+                else:
+                    ids.append(token_id)
         return ids
 
     def _bpe(self, word: str) -> list[str]:
@@ -536,35 +541,23 @@ class PieceBPETokenizer(BPETokenizer):
             parts.append(current)
         return parts
 
-    def encode(self, text: str, add_special: bool = True) -> list[int]:
+    def _encode_chunk(self, chunk: str) -> list[int]:
         ids = []
-        if add_special and self.add_bos and self.bos_id is not None:
-            ids.append(self.bos_id)
-
-        chunks = (
-            self._special_pattern.split(text) if self._special_pattern else [text]
-        )
-        for chunk in chunks:
-            if not chunk:
-                continue
-            if chunk in self.ids and chunk in self.specials:
-                ids.append(self.ids[chunk])
-                continue
-            marked = chunk.replace(" ", self.SPACE)
-            if self.add_space_prefix and not marked.startswith(self.SPACE):
-                marked = self.SPACE + marked
-            for word in self._split(marked):
-                for token in self._bpe(word):
-                    token_id = self.ids.get(token)
-                    if token_id is not None:
-                        ids.append(token_id)
-                        continue
-                    # No piece for this text: spell it out a byte at a
-                    # time, which the vocabulary always has room for.
-                    for value in token.encode("utf-8"):
-                        piece = self._byte_piece.get(value)
-                        if piece is not None:
-                            ids.append(self.ids[piece])
+        marked = chunk.replace(" ", self.SPACE)
+        if self.add_space_prefix and not marked.startswith(self.SPACE):
+            marked = self.SPACE + marked
+        for word in self._split(marked):
+            for token in self._bpe(word):
+                token_id = self.ids.get(token)
+                if token_id is not None:
+                    ids.append(token_id)
+                    continue
+                # No piece for this text: spell it out a byte at a time,
+                # which the vocabulary always has room for.
+                for value in token.encode("utf-8"):
+                    piece = self._byte_piece.get(value)
+                    if piece is not None:
+                        ids.append(self.ids[piece])
         return ids
 
     def decode(self, ids: list[int]) -> str:
