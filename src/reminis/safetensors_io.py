@@ -21,6 +21,7 @@ import sqlite3
 import time
 from pathlib import Path
 
+from reminis.converter import human_bytes
 from reminis.db import read_blobs_ahead
 from reminis.dtypes import (
     DTYPE_SYSTEM_GGUF,
@@ -307,12 +308,9 @@ def safetensors_to_sqlite(
                 total_bytes += len(blob)
 
                 if verbose:
-                    size_kb = len(blob) / 1024
-                    unit = "KB" if size_kb < 1024 else "MB"
-                    shown = size_kb if unit == "KB" else size_kb / 1024
                     print(
                         f"  [{total_tensors}] {name:60s} {str(logical_shape):20s} "
-                        f"{dtype:6s} {shown:8.1f} {unit}"
+                        f"{dtype:6s} {human_bytes(len(blob))}"
                     )
 
     conn.executemany(

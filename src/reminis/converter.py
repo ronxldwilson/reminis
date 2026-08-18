@@ -88,6 +88,22 @@ META_TYPE_MAP = {
 }
 
 
+def human_bytes(n_bytes: int) -> str:
+    """A tensor's size as the progress lines print it: "   123.4 KB".
+
+    Four call sites worked this out for themselves -- the same three lines
+    and the same 1024 KB threshold, one of them naming the result
+    `size_display` and the rest `shown`, which is what a copy looks like
+    after a while. Only the threshold is shared here; the surrounding line
+    is not, because the column widths genuinely differ (safetensors names
+    are longer than GGUF ones and are given ten more characters).
+    """
+    size_kb = n_bytes / 1024
+    unit = "KB" if size_kb < 1024 else "MB"
+    shown = size_kb if unit == "KB" else size_kb / 1024
+    return f"{shown:8.1f} {unit}"
+
+
 def _extract_field_value(field):
     """Extract a Python value from a GGUFReader field."""
     if not field.types:
@@ -411,12 +427,9 @@ def gguf_to_sqlite(gguf_path: str, db_path: str | None = None, verbose: bool = T
                             blob = view[start:start + t["n_bytes"]]
                             previous = blob
                             if verbose:
-                                size_kb = t["n_bytes"] / 1024
-                                unit = "KB" if size_kb < 1024 else "MB"
-                                shown = size_kb if unit == "KB" else size_kb / 1024
                                 print(f"  [{i+1}/{len(tensors)}] {t['name']:50s} "
                                       f"{str(t['shape']):20s} {t['dtype']:8s} "
-                                      f"{shown:8.1f} {unit}")
+                                      f"{human_bytes(t['n_bytes'])}")
                             yield (t["name"], json.dumps(t["shape"]), t["dtype"],
                                    t["dtype_id"], t["n_elements"], t["n_bytes"], blob)
                     finally:
@@ -483,12 +496,9 @@ def _gguf_to_sqlite_via_reader(gguf_path, db_path: str, verbose: bool, t0: float
                 shape = [int(x) for x in tensor.shape]
                 n_bytes = int(tensor.n_bytes)
                 if verbose:
-                    size_kb = n_bytes / 1024
-                    unit = "KB" if size_kb < 1024 else "MB"
-                    shown = size_kb if unit == "KB" else size_kb / 1024
                     print(f"  [{i+1}/{len(reader.tensors)}] {tensor.name:50s} "
                           f"{str(shape):20s} {tensor.tensor_type.name:8s} "
-                          f"{shown:8.1f} {unit}")
+                          f"{human_bytes(n_bytes)}")
                 yield (tensor.name, json.dumps(shape), tensor.tensor_type.name,
                        tensor.tensor_type.value, int(tensor.n_elements), n_bytes,
                        tensor.data.tobytes())
@@ -639,10 +649,8 @@ def sqlite_to_gguf(db_path: str, gguf_path: str | None = None, verbose: bool = T
         del blob  # one tensor resident at a time, not the whole model
 
         if verbose:
-            size_kb = n_bytes / 1024
-            unit = "KB" if size_kb < 1024 else "MB"
-            size_display = size_kb if unit == "KB" else size_kb / 1024
-            print(f"  [{i+1}/{len(plan)}] {name:50s} {str(shape):20s} {dtype_name:8s} {size_display:8.1f} {unit}")
+            print(f"  [{i+1}/{len(plan)}] {name:50s} {str(shape):20s} "
+                  f"{dtype_name:8s} {human_bytes(n_bytes)}")
 
     fout.flush()
     conn.close()
