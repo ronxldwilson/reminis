@@ -31,7 +31,7 @@ import numpy as np
 
 from gguf.constants import GGMLQuantizationType
 
-from reminis.db import INSERT_TENSOR, open_read_only
+from reminis.db import INSERT_TENSOR, SELECT_TENSOR_ROWS, open_read_only
 from reminis.dtypes import is_float_dtype, to_float32
 
 BLOCK = 32
@@ -201,10 +201,7 @@ def quantize_model(
     started = time.perf_counter()
     stats = {"quantized": 0, "copied": 0, "raw_bytes": 0, "new_bytes": 0}
 
-    rows = src.execute(
-        "SELECT name, shape, dtype, dtype_id, n_elements, n_bytes, data "
-        "FROM tensors ORDER BY id"
-    )
+    rows = src.execute(SELECT_TENSOR_ROWS)
     pool = ThreadPoolExecutor(max_workers=min(os.cpu_count() or 4, 8))
     try:
         for name, shape_json, dtype, dtype_id, n_elements, n_bytes, blob in rows:

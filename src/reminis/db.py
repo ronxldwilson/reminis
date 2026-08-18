@@ -301,6 +301,22 @@ def insert_sql(table: str, columns, verb: str = "INSERT") -> str:
     )
 
 
+def select_sql(table: str, columns, suffix: str = "") -> str:
+    """A SELECT naming `columns`, in the order they are declared.
+
+    The read-side counterpart of `insert_sql`, and it exists for the same
+    reason. `registry.add_base` reads a row with one of these and binds it
+    straight into an INSERT built from the same tuple -- so a column added
+    to one list and not the other does not raise, it silently writes the
+    values into the wrong columns.
+    """
+    return f"SELECT {', '.join(columns)} FROM {table}{suffix}"
+
+
+# Every caller that walks a whole model wants the same seven columns in
+# declaration order, oldest row first.
+SELECT_TENSOR_ROWS = select_sql("tensors", TENSOR_COLUMNS, " ORDER BY id")
+
 INSERT_TENSOR = insert_sql("tensors", TENSOR_COLUMNS)
 INSERT_OR_REPLACE_TENSOR = insert_sql("tensors", TENSOR_COLUMNS, "INSERT OR REPLACE")
 

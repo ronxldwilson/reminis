@@ -33,6 +33,7 @@ import time
 from reminis.db import (
     INSERT_REGISTRY_TENSOR,
     INSERT_TENSOR,
+    SELECT_TENSOR_ROWS,
     TENSOR_COLUMN_DDL,
     open_for_append,
     open_for_bulk_write,
@@ -348,10 +349,7 @@ class Registry:
 
             n_tensors = 0
             total = 0
-            for row in src.execute(
-                "SELECT name, shape, dtype, dtype_id, n_elements, n_bytes, data "
-                "FROM tensors ORDER BY id"
-            ):
+            for row in src.execute(SELECT_TENSOR_ROWS):
                 self.conn.execute(
                     INSERT_REGISTRY_TENSOR,
                     (model_id, *row),

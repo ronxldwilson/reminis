@@ -10,6 +10,7 @@ from pathlib import Path
 
 import numpy as np
 
+from .db import SELECT_TENSOR_ROWS
 from .dtypes import is_float_dtype, to_float32
 
 # The two values viewer_template.html leaves open. Spelled out rather than
@@ -97,9 +98,7 @@ def generate_viewer(db_path: str, output_path: str | None = None, verbose: bool 
 
     # Gather tensor info + stats
     tensors = []
-    rows = conn.execute(
-        "SELECT name, shape, dtype, dtype_id, n_elements, n_bytes, data FROM tensors ORDER BY id"
-    ).fetchall()
+    rows = conn.execute(SELECT_TENSOR_ROWS).fetchall()
 
     for name, shape_str, dtype_name, dtype_id, n_elements, n_bytes, data_blob in rows:
         shape = json.loads(shape_str)
