@@ -13,6 +13,7 @@ The numbers quoted below were measured on a 2.5 GB model; see CHANGELOG.md
 for the releases they come from.
 """
 
+import os
 import sqlite3
 
 # A file that did not exist a moment ago has nothing to roll back to, so the
@@ -107,6 +108,60 @@ def open_read_only(db_path: str) -> sqlite3.Connection:
     return sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
 
 
+def mmap_bytes(db_path: str) -> int:
+    """How much of the file to map, which is all of it or none of it.
+
+    Mapping the file rather than copying each blob through sqlite's own
+    buffer measured 4.1 GB/s to 6.7 GB/s on a 258 MB model, and it is free
+    there because the whole thing fits in memory several times over.
+
+    It stops being free when the file is larger than the machine. A mapped
+    page that has been touched stays resident until the kernel decides
+    otherwise, so on a 22.9 GB database with 16 GB of RAM the map competes
+    for memory with the weights the model is trying to keep, and every read
+    pays for it: measured 1.70 ms per expert block mapped against 0.46 ms
+    unmapped, which is 3.7x the wrong way.
+
+    So this maps the file when it comfortably fits and does not when it does
+    not, rather than asking for a fixed number of gigabytes and hoping. Half
+    of physical memory is the line, which is where the two measured points
+    fall either side of: a 4.4 GB model on a 16 GB machine is 7% faster
+    mapped, and a 22.9 GB one is 3.7x slower.
+
+    This lived on WeightStore, and the three other places that map a file
+    each named their own constant instead -- 8 GB here, 32 GB in the expert
+    index, nothing at all in packed_index. The 32 GB is the number the
+    paragraph above was written to argue against, on the mixture-of-experts
+    models where an index is worth building in the first place.
+    """
+    try:
+        size = os.path.getsize(db_path)
+        available = os.sysconf("SC_PHYS_PAGES") * os.sysconf("SC_PAGE_SIZE")
+    except (OSError, ValueError, AttributeError):
+        return 0
+    return size if size * 2 <= available else 0
+
+
+def open_for_read(db_path: str, check_same_thread: bool = True) -> sqlite3.Connection:
+    """Open a model to read tensors out of, mapped if the file fits.
+
+    ``query_only`` so a stray write raises rather than changing a model
+    someone is reading, and the map sized by the policy above.
+
+    This is ``open_read_only`` plus the map: ``mode=ro`` is enforced by
+    SQLite rather than by convention, and it raises on a missing file
+    instead of creating an empty one to fail against later. The callers
+    unified here were split between the two -- the read-ahead pool used
+    ``mode=ro``, the weight store a plain connect -- and ``mode=ro`` is the
+    one that cannot be got wrong.
+    """
+    conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True,
+                           check_same_thread=check_same_thread)
+    conn.execute("PRAGMA query_only = 1")
+    conn.execute(f"PRAGMA mmap_size = {mmap_bytes(db_path)}")
+    return conn
+
+
 # How many bytes of read-ahead to hold. The things being read are whole
 # tensors and one of them can be half a gigabyte, so this is a byte budget
 # rather than a count -- a fixed queue depth would hold four embedding
@@ -154,12 +209,9 @@ def read_blobs_ahead(db_path: str, names, threads: int = READ_THREADS,
     def connection():
         conn = getattr(local, "conn", None)
         if conn is None:
-            conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True,
-                                   check_same_thread=False)
-            conn.execute("PRAGMA query_only=1")
             # Mapping the file rather than copying each blob through
             # SQLite's own buffer: 15079 MB/s against 11486 on four threads.
-            conn.execute("PRAGMA mmap_size=8589934592")
+            conn = open_for_read(db_path, check_same_thread=False)
             local.conn = conn
         return conn
 

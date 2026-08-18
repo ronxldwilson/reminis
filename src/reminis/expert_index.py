@@ -38,6 +38,8 @@ import time
 
 import numpy as np
 
+from reminis.db import mmap_bytes
+
 # The suffixes of the stacked 3-D expert tensors. Everything else in a
 # mixture-of-experts model -- the router, the per-expert biases, attention --
 # is small enough to hold whole and is left alone.
@@ -175,7 +177,11 @@ def build(db_path: str, backend=None, bits: int = DEFAULT_BITS,
         )
 
     conn = sqlite3.connect(db_path)
-    conn.execute("PRAGMA mmap_size = 34359738368")
+    # Reading every expert to quantize it, so the map is worth having -- but
+    # sized against the machine rather than at a constant 32 GB, which on a
+    # mixture-of-experts model large enough to want an index was the case
+    # mmap_bytes measured at 3.7x slower.
+    conn.execute(f"PRAGMA mmap_size = {mmap_bytes(db_path)}")
     conn.executescript(SCHEMA)
     conn.execute("DELETE FROM expert_index")
     conn.execute("DELETE FROM expert_index_layout")

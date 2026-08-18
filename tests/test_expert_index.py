@@ -310,7 +310,7 @@ def test_preload():
 def test_mmap_decision():
     """Mapping the file is right when it fits and wrong when it does not."""
     print("\nDeciding whether to map the file")
-    from reminis.infer import WeightStore
+    from reminis.db import mmap_bytes
 
     import os
 
@@ -319,7 +319,7 @@ def test_mmap_decision():
         small = Path(tmp) / "small.db"
         small.write_bytes(b"\x00" * 4096)
         check("a small file is mapped whole",
-              WeightStore._mmap_size(str(small)) == 4096)
+              mmap_bytes(str(small)) == 4096)
 
         # A file a quarter the size of memory or larger stops being free to
         # map: its pages compete with the weights the model wants to keep.
@@ -327,6 +327,6 @@ def test_mmap_decision():
         with open(big, "wb") as fh:
             fh.truncate(memory)
         check("a file the size of memory is not mapped",
-              WeightStore._mmap_size(str(big)) == 0)
+              mmap_bytes(str(big)) == 0)
         check("a missing file does not raise",
-              WeightStore._mmap_size(str(Path(tmp) / "nope.db")) == 0)
+              mmap_bytes(str(Path(tmp) / "nope.db")) == 0)

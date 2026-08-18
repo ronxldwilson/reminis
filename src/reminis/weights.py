@@ -19,7 +19,6 @@ is at most half of physical memory -- worth 7% on a file that fits, and
 
 import ast
 import os
-import sqlite3
 import threading
 from collections import OrderedDict
 
@@ -27,6 +26,7 @@ import numpy as np
 
 from reminis.backend import best_group as _best_group
 from reminis.backend import select as select_backend
+from reminis.db import open_for_read
 from reminis.dtypes import (
     dequantize_to_float32,
     is_float_dtype,
@@ -53,11 +53,10 @@ class _IndexReader:
     and none of them hold the interpreter lock while they wait.
     """
 
-    def __init__(self, db_path: str, workers: int = 4, mmap_size: int = 0):
+    def __init__(self, db_path: str, workers: int = 4):
         from concurrent.futures import ThreadPoolExecutor
 
         self.path = db_path
-        self.mmap_size = mmap_size
         self._local = threading.local()
         self._pool = ThreadPoolExecutor(max_workers=workers,
                                         thread_name_prefix="reminis-expert")
@@ -68,9 +67,7 @@ class _IndexReader:
     def _conn(self):
         conn = getattr(self._local, "conn", None)
         if conn is None:
-            conn = sqlite3.connect(self.path, check_same_thread=False)
-            conn.execute("PRAGMA query_only = 1")
-            conn.execute(f"PRAGMA mmap_size = {self.mmap_size}")
+            conn = open_for_read(self.path, check_same_thread=False)
             self._local.conn = conn
         return conn
 
@@ -159,9 +156,7 @@ class WeightStore:
         self._expert_layouts = {}
         self._expert_hits = 0
         self._expert_misses = 0
-        self.conn = sqlite3.connect(db_path)
-        self.conn.execute("PRAGMA query_only = 1")
-        self.conn.execute(f"PRAGMA mmap_size = {self._mmap_size(db_path)}")
+        self.conn = open_for_read(db_path)
         self._cache: dict[str, np.ndarray] = {}
         self.bytes_read = 0
         self.reads = 0
@@ -189,37 +184,7 @@ class WeightStore:
         widths = {layout.bits for layout in self._packed_layouts.values()}
         self.index_bits = widths.pop() if len(widths) == 1 else None
         if self._expert_layouts and reader_threads:
-            self._reader = _IndexReader(db_path, workers=reader_threads,
-                                        mmap_size=self._mmap_size(db_path))
-
-    @staticmethod
-    def _mmap_size(db_path: str) -> int:
-        """How much of the file to map, which is all of it or none of it.
-
-        Mapping the file rather than copying each blob through sqlite's own
-        buffer measured 4.1 GB/s to 6.7 GB/s on a 258 MB model, and it is
-        free there because the whole thing fits in memory several times
-        over.
-
-        It stops being free when the file is larger than the machine. A
-        mapped page that has been touched stays resident until the kernel
-        decides otherwise, so on a 22.9 GB database with 16 GB of RAM the
-        map competes for memory with the weights the model is trying to
-        keep, and every read pays for it: measured 1.70 ms per expert block
-        mapped against 0.46 ms unmapped, which is 3.7x the wrong way.
-
-        So this maps the file when it comfortably fits and does not when it
-        does not, rather than asking for 32 GB and hoping. Half of physical
-        memory is the line, which is where the two measured points fall
-        either side of: a 4.4 GB model on a 16 GB machine is 7% faster
-        mapped, and a 22.9 GB one is 3.7x slower.
-        """
-        try:
-            size = os.path.getsize(db_path)
-            available = os.sysconf("SC_PHYS_PAGES") * os.sysconf("SC_PAGE_SIZE")
-        except (OSError, ValueError, AttributeError):
-            return 0
-        return size if size * 2 <= available else 0
+            self._reader = _IndexReader(db_path, workers=reader_threads)
 
     def has(self, name: str) -> bool:
         return name in self._shapes
@@ -286,8 +251,7 @@ class WeightStore:
     def _prefetch_conn(self):
         conn = getattr(self._prefetch_local, "conn", None)
         if conn is None:
-            conn = sqlite3.connect(self.path, check_same_thread=False)
-            conn.execute("PRAGMA query_only = 1")
+            conn = open_for_read(self.path, check_same_thread=False)
             self._prefetch_local.conn = conn
         return conn
 
