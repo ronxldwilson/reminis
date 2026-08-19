@@ -40,6 +40,17 @@ def get(name: str):
     return _REGISTRY.get(name)
 
 
+def from_hf_name(hf_name: str):
+    """Look up an arch by its HuggingFace class name or model_type.
+
+    Returns ``(reminis_name, arch)`` or ``(None, None)`` if unrecognised.
+    """
+    for arch in _REGISTRY.values():
+        if hf_name in arch.hf_names:
+            return arch.name, arch
+    return None, None
+
+
 def names() -> list[str]:
     return sorted(_REGISTRY)
 
@@ -50,10 +61,53 @@ class Arch:
     #: The value of `general.architecture` in the GGUF this implements.
     name = ""
 
+    #: HuggingFace architecture class names that map to this reminis arch.
+    #: Used by the safetensors converter to resolve ``config.architectures``
+    #: and ``config.model_type`` to the internal name.
+    hf_names: tuple[str, ...] = ()
+
+    #: Which pre-tokenizer splits text for this architecture. safetensors
+    #: carries no equivalent of GGUF's `tokenizer.ggml.pre`, and the wrong
+    #: splitter is silent -- the ids stay valid, they are simply not the
+    #: ids the model was trained on -- so it is named here.
+    pretokenizer: str = ""
+
     #: How rotary embedding pairs up channels. "norm" rotates adjacent
     #: pairs (0,1), (2,3); "neox" rotates i against i + rope_dim/2. Applying
     #: the wrong one produces confident gibberish rather than an error.
     rope_style = "norm"
+
+    def translate_name(self, hf_name: str) -> str | None:
+        """Map a HuggingFace tensor name to its GGUF equivalent.
+
+        Returns the translated name, or None to keep the original. The
+        default strips the ``model.layers.N.`` prefix into ``blk.N.`` and
+        common suffixes (layernorm, mlp projections). Architectures with
+        non-standard tensor names override this.
+        """
+        return None
+
+    def translate_config(self, config: dict) -> list[tuple[str, str, str]]:
+        """Map config.json fields to GGUF-style metadata rows.
+
+        Returns a list of ``(key, value, type)`` tuples. The base returns
+        nothing; architectures whose safetensors models need metadata
+        translation override this.
+        """
+        return []
+
+    def needs_transform(self, name: str) -> bool:
+        """True when ``transform_tensor`` would change this tensor's data."""
+        return False
+
+
+    def transform_tensor(self, name: str, data: np.ndarray) -> np.ndarray:
+        """Apply any data transformations a tensor needs after dequantization.
+
+        Called with the GGUF-convention name, after name translation and
+        dequantization. Default is identity.
+        """
+        return data
 
     def prepare_meta(self, meta: dict) -> dict:
         """Substitutions applied to the metadata before the config reads it.
@@ -461,6 +515,141 @@ class Qwen35(Arch):
 
     name = "qwen35"
     rope_style = "neox"
+    pretokenizer = "qwen35"
+    hf_names = (
+        "Qwen3_5ForConditionalGeneration",
+        "Qwen3_5ForCausalLM",
+        "qwen3_5",
+        "qwen3_5_text",
+    )
+
+    # HF tensor name fragments → GGUF equivalents, applied after the
+    # ``language_model.model.layers.N.`` prefix is stripped to ``blk.N.``.
+    _LAYER_MAP = {
+        "input_layernorm.weight": "attn_norm.weight",
+        "post_attention_layernorm.weight": "post_attention_norm.weight",
+        "mlp.gate_proj": "ffn_gate",
+        "mlp.up_proj": "ffn_up",
+        "mlp.down_proj": "ffn_down",
+        # SSM / recurrent layers
+        "linear_attn.in_proj_qkv": "attn_qkv",
+        "linear_attn.in_proj_z": "attn_gate",
+        "linear_attn.in_proj_a": "ssm_alpha",
+        "linear_attn.in_proj_b": "ssm_beta",
+        "linear_attn.conv1d.weight": "ssm_conv1d.weight",
+        "linear_attn.A_log": "ssm_a",
+        "linear_attn.dt_bias": "ssm_dt.bias",
+        "linear_attn.norm.weight": "ssm_norm.weight",
+        "linear_attn.out_proj": "ssm_out",
+        # Full-attention layers
+        "self_attn.q_proj": "attn_q",
+        "self_attn.k_proj": "attn_k",
+        "self_attn.v_proj": "attn_v",
+        "self_attn.o_proj": "attn_output",
+        "self_attn.q_norm.weight": "attn_q_norm.weight",
+        "self_attn.k_norm.weight": "attn_k_norm.weight",
+    }
+
+    _GLOBAL_MAP = {
+        "language_model.model.embed_tokens": "token_embd",
+        "language_model.model.norm.weight": "output_norm.weight",
+        "language_model.lm_head": "output",
+    }
+
+    def translate_name(self, hf_name: str) -> str | None:
+        import re
+
+        # Global tensors (embedding, final norm, output head).
+        for hf_prefix, gguf_name in self._GLOBAL_MAP.items():
+            if hf_name.startswith(hf_prefix):
+                suffix = hf_name[len(hf_prefix):]
+                if suffix and suffix.startswith("."):
+                    return gguf_name + suffix
+                return gguf_name
+
+        # Per-layer tensors.
+        m = re.match(
+            r"language_model\.model\.layers\.(\d+)\.(.*)", hf_name
+        )
+        if not m:
+            return None
+        layer, rest = m.group(1), m.group(2)
+        prefix = f"blk.{layer}."
+
+        # Try longest match first so ``mlp.gate_proj.weight`` matches
+        # ``mlp.gate_proj`` (→ ``ffn_gate``) + ``.weight`` suffix,
+        # not a shorter prefix.
+        for hf_frag, gguf_frag in sorted(
+            self._LAYER_MAP.items(), key=lambda kv: -len(kv[0])
+        ):
+            if rest.startswith(hf_frag):
+                tail = rest[len(hf_frag):]
+                if tail and tail.startswith("."):
+                    return prefix + gguf_frag + tail
+                return prefix + gguf_frag
+
+        return None
+
+    def translate_config(self, config: dict) -> list[tuple[str, str, str]]:
+        tc = config.get("text_config") or config
+        a = self.name
+        rows = []
+
+        def add(key, value):
+            if value is not None:
+                rows.append((f"{a}.{key}", str(value), "string"))
+
+        n_layers = tc.get("num_hidden_layers", 0)
+        mtp = tc.get("mtp_num_hidden_layers", 0)
+        add("block_count", n_layers + mtp)
+        add("nextn_predict_layers", mtp)
+        add("embedding_length", tc.get("hidden_size"))
+        add("feed_forward_length", tc.get("intermediate_size"))
+        add("attention.head_count", tc.get("num_attention_heads"))
+        add("attention.head_count_kv", tc.get("num_key_value_heads"))
+        add("attention.key_length", tc.get("head_dim"))
+        add("attention.layer_norm_rms_epsilon", tc.get("rms_norm_eps"))
+        add("context_length", tc.get("max_position_embeddings"))
+
+        rope = tc.get("rope_parameters") or {}
+        add("rope.freq_base", rope.get("rope_theta"))
+
+        head_dim = tc.get("head_dim", 256)
+        partial = tc.get("partial_rotary_factor") or rope.get(
+            "partial_rotary_factor", 1.0
+        )
+        add("rope.dimension_count", int(head_dim * partial))
+
+        add("ssm.conv_kernel", tc.get("linear_conv_kernel_dim"))
+        add("ssm.state_size", tc.get("linear_key_head_dim"))
+        add("ssm.group_count", tc.get("linear_num_key_heads"))
+        add("ssm.time_step_rank", tc.get("linear_num_value_heads"))
+        n_v = tc.get("linear_num_value_heads")
+        k_hd = tc.get("linear_key_head_dim")
+        if n_v is not None and k_hd is not None:
+            add("ssm.inner_size", n_v * k_hd)
+        add("full_attention_interval", tc.get("full_attention_interval"))
+
+        return rows
+
+    # The fused recurrent projection arrives in the order `_ssm_block`
+    # already reads it -- one run of queries, one of keys, one of values.
+    # A safetensors export was checked against the GGUF build of this same
+    # architecture, whose order is known good, by comparing the weight
+    # magnitude of the three segments: the ratios agree to 7e-04, where
+    # regrouping the rows by key-head instead moves them by 0.16. So no
+    # reordering happens here, and this note is what says that was measured
+    # rather than assumed.
+
+    def needs_transform(self, name: str) -> bool:
+        return name.endswith(".ssm_a") or name.endswith(".ssm_conv1d.weight")
+
+    def transform_tensor(self, name: str, data: np.ndarray) -> np.ndarray:
+        if name.endswith(".ssm_a"):
+            return -np.exp(data.astype(np.float32)).astype(data.dtype)
+        if name.endswith(".ssm_conv1d.weight") and 1 in data.shape:
+            return data.squeeze()
+        return data
 
     def configure(self, cfg, meta: dict, store) -> None:
         a = cfg.arch

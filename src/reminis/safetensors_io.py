@@ -21,6 +21,8 @@ import sqlite3
 import time
 from pathlib import Path
 
+import numpy as np
+
 from reminis.converter import human_bytes
 from reminis.db import read_blobs_ahead
 from reminis.dtypes import (
@@ -30,6 +32,8 @@ from reminis.dtypes import (
     SAFETENSORS_DTYPE_IDS,
     SAFETENSORS_DTYPES,
     dtype_system,
+    from_float32,
+    to_float32,
 )
 
 # A safetensors header is JSON describing tensor offsets; even for a very large
@@ -173,6 +177,62 @@ def _read_tokenizer(model_dir: Path) -> list[tuple[str, str, str]]:
     ]
 
 
+def _tokenizer_meta_from_config(config: dict, arch) -> list[tuple[str, str, str]]:
+    """The tokenizer settings a GGUF records and safetensors does not.
+
+    Two of these decide whether a run is right rather than merely fast.
+    The pre-tokenizer picks the splitter, and an unrecognised name falls
+    back to GPT-2's, which disagrees with this model on every number. The
+    end-of-sequence id is what lets generation stop; without it a reply
+    runs to the token limit whatever the model intended.
+    """
+    rows = []
+    if arch.pretokenizer:
+        rows.append(("tokenizer.ggml.pre", arch.pretokenizer, "string"))
+
+    gen = config.get("generation_config") or {}
+
+    def first(value):
+        """A model may name several end tokens; the reader takes one."""
+        if isinstance(value, (list, tuple)):
+            return value[0] if value else None
+        return value
+
+    bos = first(config.get("bos_token_id", gen.get("bos_token_id")))
+    eos = first(config.get("eos_token_id", gen.get("eos_token_id")))
+    if bos is not None:
+        rows.append(("tokenizer.ggml.bos_token_id", str(int(bos)), "string"))
+    if eos is not None:
+        rows.append(("tokenizer.ggml.eos_token_id", str(int(eos)), "string"))
+    return rows
+
+
+def _chat_template(model_dir: Path) -> list[tuple[str, str, str]]:
+    """A sibling chat template, which `--chat` needs and safetensors splits out.
+
+    Recent exports write it beside the model as ``chat_template.jinja``
+    rather than inside ``tokenizer_config.json``; both are read here so
+    `--chat` wraps the prompt the way the model was tuned for instead of
+    handing it a bare completion.
+    """
+    path = model_dir / "chat_template.jinja"
+    if path.exists():
+        try:
+            return [("tokenizer.chat_template", path.read_text(), "string")]
+        except OSError:
+            return []
+
+    config_path = model_dir / "tokenizer_config.json"
+    if config_path.exists():
+        try:
+            template = json.loads(config_path.read_text()).get("chat_template")
+        except (json.JSONDecodeError, OSError):
+            return []
+        if isinstance(template, str):
+            return [("tokenizer.chat_template", template, "string")]
+    return []
+
+
 def _default_db_path(src: Path) -> Path:
     """Where to put the database when the caller did not say.
 
@@ -185,6 +245,75 @@ def _default_db_path(src: Path) -> Path:
         # The model's identity is its directory, not the index filename.
         return src.parent.parent / f"{src.parent.name}.db"
     return src.with_suffix(".db")
+
+
+def _detect_mlx_affine(shards: list[Path]) -> bool:
+    """True when the model uses MLX-style affine quantization.
+
+    MLX quantizes a weight W as ``(packed_ints, scales, biases)`` where
+    ``W ≈ packed * scales + biases``. The three are stored as sibling
+    tensors named ``X.weight`` (U32), ``X.scales`` (BF16), ``X.biases``
+    (BF16). Detecting even one such triplet is enough.
+    """
+    names: set[str] = set()
+    for shard in shards:
+        header, _ = read_header(shard)
+        for name, entry in _entries(header).items():
+            names.add(name)
+    for name in names:
+        if (name.endswith(".weight")
+                and name[:-7] + ".scales" in names
+                and name[:-7] + ".biases" in names):
+            return True
+    return False
+
+
+def _infer_mlx_bits(config: dict) -> int:
+    """Read the quantization bit width from config.json."""
+    qc = config.get("quantization_config") or config.get("quantization") or {}
+    return int(qc.get("bits", 4))
+
+
+def _infer_mlx_group_size(config: dict) -> int:
+    """Read the group size from config.json."""
+    qc = config.get("quantization_config") or config.get("quantization") or {}
+    return int(qc.get("group_size", 64))
+
+
+def _build_tensor_index(
+    shards: list[Path],
+) -> dict[str, tuple[Path, int, str, list[int]]]:
+    """Map every tensor name to its location without reading data.
+
+    Returns ``{name: (shard_path, data_start, dtype, shape)}``.
+    """
+    index = {}
+    for shard in shards:
+        header, data_start = read_header(shard)
+        for name, entry in _entries(header).items():
+            dtype = entry["dtype"]
+            if dtype not in SAFETENSORS_DTYPES:
+                raise ValueError(
+                    f"Tensor '{name}' in {shard.name} has unknown dtype '{dtype}'"
+                )
+            index[name] = (shard, data_start, dtype, [int(x) for x in entry["shape"]],
+                           entry["data_offsets"])
+    return index
+
+
+def _read_one_tensor(
+    shard: Path, data_start: int, offsets: list[int],
+) -> bytes:
+    """Read a single tensor's bytes from a shard."""
+    start, end = offsets
+    with open(shard, "rb") as f:
+        f.seek(data_start + start)
+        blob = f.read(end - start)
+    if len(blob) != end - start:
+        raise ValueError(
+            f"{shard.name} ends early: expected {end - start} bytes, got {len(blob)}"
+        )
+    return blob
 
 
 def safetensors_to_sqlite(
@@ -237,11 +366,18 @@ def safetensors_to_sqlite(
     for key, value in config.items():
         meta_rows.append((f"config.{key}", json.dumps(value), "json"))
 
+    from reminis import arch as arch_registry
+
     arch_list = config.get("architectures") or []
-    if arch_list:
-        meta_rows.append(("general.architecture", str(arch_list[0]), "string"))
-    elif config.get("model_type"):
-        meta_rows.append(("general.architecture", str(config["model_type"]), "string"))
+    hf_arch = arch_list[0] if arch_list else config.get("model_type", "")
+    resolved_name, resolved_arch = arch_registry.from_hf_name(str(hf_arch))
+    if resolved_name:
+        meta_rows.append(("general.architecture", resolved_name, "string"))
+        meta_rows.extend(resolved_arch.translate_config(config))
+        meta_rows.extend(_tokenizer_meta_from_config(config, resolved_arch))
+        meta_rows.extend(_chat_template(model_dir))
+    elif hf_arch:
+        meta_rows.append(("general.architecture", str(hf_arch), "string"))
     if model_dir.name:
         meta_rows.append(("general.name", model_dir.name, "string"))
 
@@ -253,65 +389,69 @@ def safetensors_to_sqlite(
     total_tensors = 0
     total_bytes = 0
 
+    # Collect shard-level metadata.
     for shard in shards:
-        header, data_start = read_header(shard)
-
+        header, _ = read_header(shard)
         for key, value in (header.get("__metadata__") or {}).items():
             meta_rows.append((f"st.{key}", str(value), "string"))
 
-        entries = _entries(header)
-        # Read in file order so we stream forward through the shard rather
-        # than seeking backwards for every tensor.
-        ordered = sorted(entries.items(), key=lambda kv: kv[1]["data_offsets"][0])
+    # Detect MLX-style affine quantization and build a tensor index
+    # (location only, no data loaded yet).
+    is_mlx_affine = _detect_mlx_affine(shards)
+    tensor_index = _build_tensor_index(shards)
+    mlx_bits = _infer_mlx_bits(config) if is_mlx_affine else 4
 
-        with open(shard, "rb") as f:
-            for name, entry in ordered:
-                dtype = entry["dtype"]
-                if dtype not in SAFETENSORS_DTYPES:
-                    raise ValueError(
-                        f"Tensor '{name}' in {shard.name} has unknown dtype '{dtype}'"
-                    )
-                start, end = entry["data_offsets"]
-                f.seek(data_start + start)
-                blob = f.read(end - start)
-                if len(blob) != end - start:
-                    raise ValueError(
-                        f"{shard.name} ends early while reading '{name}': "
-                        f"expected {end - start} bytes, got {len(blob)}"
-                    )
+    if is_mlx_affine:
+        meta_rows.append(("reminis.mlx_affine_bits",
+                          str(mlx_bits), "string"))
+        meta_rows.append(("reminis.mlx_affine_group_size",
+                          str(_infer_mlx_group_size(config)), "string"))
 
-                logical_shape = [int(x) for x in entry["shape"]]
-                n_elements = 1
-                for d in logical_shape:
-                    n_elements *= d
+    for name in sorted(tensor_index):
+        shard, data_start, dtype, logical_shape, offsets = tensor_index[name]
+        blob = _read_one_tensor(shard, data_start, offsets)
 
-                expected = n_elements * SAFETENSORS_DTYPES[dtype]
-                if len(blob) != expected:
-                    raise ValueError(
-                        f"Tensor '{name}' declares shape {logical_shape} of {dtype} "
-                        f"({expected} bytes) but its offsets span {len(blob)}"
-                    )
+        n_elements = 1
+        for d in logical_shape:
+            n_elements *= d
 
-                conn.execute(
-                    INSERT_OR_REPLACE_TENSOR,
-                    (
-                        name,
-                        json.dumps(logical_shape[::-1]),
-                        dtype,
-                        SAFETENSORS_DTYPE_IDS[dtype],
-                        n_elements,
-                        len(blob),
-                        blob,
-                    ),
-                )
-                total_tensors += 1
-                total_bytes += len(blob)
+        # Translate name.
+        out_name = name
+        if resolved_arch is not None:
+            translated = resolved_arch.translate_name(name)
+            if translated is not None:
+                out_name = translated
 
-                if verbose:
-                    print(
-                        f"  [{total_tensors}] {name:60s} {str(logical_shape):20s} "
-                        f"{dtype:6s} {human_bytes(len(blob))}"
-                    )
+        # Apply tensor-level transforms (e.g. A_log → -exp(A_log)).
+        if resolved_arch is not None and resolved_arch.needs_transform(out_name):
+            arr = to_float32(blob, dtype).reshape(logical_shape)
+            arr = resolved_arch.transform_tensor(out_name, arr)
+            logical_shape = list(arr.shape)
+            n_elements = arr.size
+            blob = from_float32(arr, dtype)
+            del arr
+
+        conn.execute(
+            INSERT_OR_REPLACE_TENSOR,
+            (
+                out_name,
+                json.dumps(logical_shape[::-1]),
+                dtype,
+                SAFETENSORS_DTYPE_IDS[dtype],
+                n_elements,
+                len(blob),
+                blob,
+            ),
+        )
+        del blob
+        total_tensors += 1
+        total_bytes += n_elements * SAFETENSORS_DTYPES[dtype]
+
+        if verbose:
+            print(
+                f"  [{total_tensors}] {out_name:60s} {str(logical_shape):20s} "
+                f"{dtype:6s} {human_bytes(n_elements * SAFETENSORS_DTYPES[dtype])}"
+            )
 
     conn.executemany(
         "INSERT OR REPLACE INTO model_meta (key, value, type) VALUES (?, ?, ?)",
