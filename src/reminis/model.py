@@ -180,6 +180,22 @@ class Model:
     def close(self):
         self.store.close()
 
+    # -- undoing a forward pass -------------------------------------------
+
+    def snapshot_state(self):
+        """Everything a forward pass would change besides the KV cache.
+
+        None means there is nothing: an attention-only model keeps its
+        whole history in the cache, so `KVCache.rollback` undoes a pass by
+        itself. A recurrent or hybrid one returns an opaque value for
+        `restore_state`, and a caller that has to choose between rolling
+        back and recomputing can branch on which it got.
+        """
+        return self.cfg.spec.snapshot_state(self)
+
+    def restore_state(self, snapshot) -> None:
+        self.cfg.spec.restore_state(self, snapshot)
+
     # -- resident experts --------------------------------------------------
 
     # How much of the device's working set the expert index may claim. The

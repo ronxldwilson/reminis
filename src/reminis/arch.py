@@ -131,6 +131,23 @@ class Arch:
         """The last step, after the output projection."""
         return logits
 
+    def snapshot_state(self, model):
+        """Whatever this architecture carries between calls, saved.
+
+        Attention keeps its history in the key/value cache, which can be
+        truncated, so a purely attentional architecture has nothing here
+        and returns None -- which is also the signal to a caller that
+        `KVCache.rollback` is the whole of undoing a forward pass.
+
+        A recurrent architecture is the other case: its history is folded
+        into a hidden state with no per-token record left to truncate, so
+        the only way back is to have kept a copy.
+        """
+        return None
+
+    def restore_state(self, model, snapshot) -> None:
+        """Put back what `snapshot_state` returned."""
+
 
 # The llama family and its near neighbours: one shared block, distinguished
 # only by how rotary embedding is laid out.
@@ -1052,14 +1069,28 @@ class Qwen35(Arch):
 
         return x + model._linear(out, p + "attn_output.weight")
 
+    def _states(self, model):
+        states = getattr(model, "_ssm_states", None)
+        if states is None:
+            states = SSMState(model.cfg.n_layers, model.backend)
+            model._ssm_states = states
+        return states
+
+    def snapshot_state(self, model):
+        """Three quarters of this model's layers are recurrent, so a
+        forward pass cannot be undone by truncating the key/value cache
+        alone -- the DeltaNet state and the convolution window have
+        already absorbed the tokens."""
+        return self._states(model).snapshot()
+
+    def restore_state(self, model, snapshot) -> None:
+        self._states(model).restore(snapshot)
+
     def block(self, model, x, layer: int, cache, offset: int):
         cfg = model.cfg
         p = f"blk.{layer}."
 
-        ssm_states = getattr(model, "_ssm_states", None)
-        if ssm_states is None:
-            ssm_states = SSMState(cfg.n_layers, model.backend)
-            model._ssm_states = ssm_states
+        ssm_states = self._states(model)
 
         if cfg.is_ssm_layer[layer]:
             x = self._ssm_block(model, x, layer, ssm_states, offset)
@@ -1076,12 +1107,26 @@ class Qwen35(Arch):
 
 
 class SSMState:
-    """Hidden state for DeltaNet layers — conv buffers and scan states."""
+    """Hidden state for DeltaNet layers — conv buffers and scan states.
+
+    Every update below replaces an entry rather than writing into one --
+    the scan builds a new array each step and `set_ssm` swaps it in -- so
+    a snapshot is a copy of the two lists and not of the arrays they hold.
+    That is what makes rolling a rejected speculation back cheap: the old
+    state stays alive because the snapshot still refers to it, and the new
+    one is dropped when the snapshot is put back.
+    """
 
     def __init__(self, n_layers, backend):
         self._conv = [None] * n_layers
         self._ssm = [None] * n_layers
         self.backend = backend
+
+    def snapshot(self):
+        return list(self._conv), list(self._ssm)
+
+    def restore(self, snapshot) -> None:
+        self._conv, self._ssm = list(snapshot[0]), list(snapshot[1])
 
     def get_conv(self, layer):
         return self._conv[layer]
