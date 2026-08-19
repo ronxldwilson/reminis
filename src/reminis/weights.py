@@ -32,6 +32,7 @@ from reminis.dtypes import (
     dequantize_to_float32,
     is_float_dtype,
     is_quantized_dtype,
+    to_float32,
     to_float32_any,
 )
 from reminis.errors import UnsupportedModel
@@ -158,6 +159,9 @@ class WeightStore:
         # packing was asked for, since it holds nothing else.
         self._packed_layouts = read_packed_layouts(self.conn)
         self.from_index = 0
+        # MLX affine quantization: triplets of .weight (U32) + .scales +
+        # .biases, adopted into the backend's packed layout unchanged.
+        self._mlx_bits, self._mlx_group = self._read_mlx_meta()
         # The width the index was built at, when it is of one mind about it.
         # A run asking for a different one gets the index's, because
         # rebuilding it per run is the cost it exists to remove -- but it
@@ -167,6 +171,89 @@ class WeightStore:
         self.index_bits = widths.pop() if len(widths) == 1 else None
         if self._expert_layouts and reader_threads:
             self._reader = _IndexReader(db_path, workers=reader_threads)
+
+    def _read_mlx_meta(self) -> tuple[int, int]:
+        """The MLX affine (bits, group_size), or (0, 0) for a non-MLX model.
+
+        The recorded width is the one the export was made at. It is a
+        default rather than the truth for every tensor -- see
+        `_mlx_bits_for`, which reads each tensor's own width off its
+        shapes so a model may mix widths.
+        """
+        rows = dict(self.conn.execute(
+            "SELECT key, value FROM model_meta WHERE key IN "
+            "('reminis.mlx_affine_bits', 'reminis.mlx_affine_group_size')"
+        ))
+        bits = rows.get("reminis.mlx_affine_bits")
+        group = rows.get("reminis.mlx_affine_group_size")
+        return (int(bits), int(group)) if bits else (0, 0)
+
+    def _mlx_bits_for(self, packed_cols: int, scale_cols: int) -> int:
+        """This tensor's own width, derived from how far its words unpack.
+
+        A group covers `group_size` weights and gets one scale, so the
+        logical width is `scale_cols * group_size`; the packed row holds
+        that many weights in `packed_cols` 32-bit words. Dividing gives the
+        bits per weight.
+
+        Reading it per tensor rather than trusting the file-level value is
+        what lets one model hold more than one width -- keeping the output
+        projection at 4 bits over a 2-bit stack costs a few hundred
+        megabytes and is the difference between text and noise, since a
+        vocabulary-wide matrix at 2 bits picks tokens close to at random.
+        """
+        logical = scale_cols * self._mlx_group
+        if not logical or (packed_cols * 32) % logical:
+            return self._mlx_bits
+        return (packed_cols * 32) // logical
+
+    def _is_mlx_triplet(self, name: str) -> bool:
+        """True when ``name`` is a .weight backed by MLX affine .scales/.biases."""
+        if not self._mlx_bits or not name.endswith(".weight"):
+            return False
+        return (name[:-7] + ".scales") in self._shapes
+
+    def _adopt_mlx_affine(self, name: str):
+        """Hand an MLX affine triplet to the backend still packed.
+
+        MLX's affine quantization is the same representation the backend's
+        own packed weights use -- uint32 words, a scale and a bias per
+        group -- so the three tensors are uploaded as they are. Nothing is
+        dequantized: a 4-bit 27B model stays 15 GB in memory rather than
+        becoming the 55 GB its float form would need.
+        """
+        stem = name[:-7]
+        w_shape, _ = self._shapes[name]
+        s_shape, _ = self._shapes[stem + ".scales"]
+
+        blobs = {
+            row[0]: row[1]
+            for row in self.conn.execute(
+                "SELECT name, data FROM tensors WHERE name IN (?, ?, ?)",
+                (name, stem + ".scales", stem + ".biases"),
+            )
+        }
+
+        w_dims = tuple(ast.literal_eval(w_shape))[::-1]
+        s_dims = tuple(ast.literal_eval(s_shape))[::-1]
+
+        words = np.frombuffer(blobs[name], dtype=np.uint32).reshape(w_dims)
+        scales = to_float32(blobs[stem + ".scales"], "BF16").reshape(s_dims)
+        biases = to_float32(blobs[stem + ".biases"], "BF16").reshape(s_dims)
+
+        bits = self._mlx_bits_for(w_dims[-1], s_dims[-1])
+        # The logical width is what the packing expands to, not the word count.
+        logical = (w_dims[0], w_dims[-1] * (32 // bits))
+
+        self.bytes_read += sum(len(b) for b in blobs.values())
+        self.reads += 1
+        self.packed += 1
+        self.packed_native += 1
+
+        return self.backend.adopt_packed(
+            words, scales, biases, bits, self._mlx_group,
+            logical, self.pack_compact,
+        )
 
     def has(self, name: str) -> bool:
         return name in self._shapes
@@ -214,8 +301,18 @@ class WeightStore:
             self.PREFETCH_MAX, max(self.PREFETCH_MIN, size // 10))
         # Anything the packed index already holds needs no unpacking, so
         # reading ahead for it would be work done twice and thrown away.
-        self._prefetch_order = [n for n in names if n in self._shapes
-                                and n not in self._packed_layouts]
+        #
+        # The dtype filter is the same one `_unpack_one` applies, hoisted
+        # here where the answer is already known. Left to the worker it
+        # costs a full blob read per tensor before the row is discarded --
+        # on a model whose weights are all adopted rather than unpacked,
+        # that is the entire file read off disk and dropped.
+        self._prefetch_order = [
+            n for n in names
+            if n in self._shapes
+            and n not in self._packed_layouts
+            and is_quantized_dtype(self._shapes[n][1])
+        ]
         if not self._prefetch_order:
             return
         self._prefetch_done = {}
@@ -370,6 +467,14 @@ class WeightStore:
                     self.packed += 1
                 self.dequantized += 1
 
+            if not self.stream:
+                self._cache[name] = arr
+            return arr
+
+        # MLX affine: three rows in the database are one packed weight, and
+        # the backend takes that layout directly.
+        if self._is_mlx_triplet(name):
+            arr = self._adopt_mlx_affine(name)
             if not self.stream:
                 self._cache[name] = arr
             return arr
