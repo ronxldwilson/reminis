@@ -134,3 +134,26 @@ class KVCache:
     @property
     def length(self) -> int:
         return self._used
+
+    def rollback(self, length: int) -> None:
+        """Forget every token past `length`, keeping the ones before it.
+
+        Speculative decoding runs tokens through the model before it knows
+        whether they are wanted, so it needs a way to un-run the ones that
+        turn out not to be. Nothing has to be erased: the buffers are
+        preallocated and every read is bounded by the counter, so lowering
+        the counter is what makes the rejected span invisible, and the next
+        token overwrites it. That is the whole of the rollback the
+        attention layers need, and it costs nothing.
+
+        What it does *not* cover is a layer that carries state rather than
+        keys and values. A recurrent layer folds each token into a hidden
+        state and keeps no per-token record to truncate, so rolling one
+        back is `Model.snapshot_state`, not this.
+        """
+        if not 0 <= length <= self._used:
+            raise ValueError(
+                f"Cannot roll a cache holding {self._used} tokens back to "
+                f"{length}"
+            )
+        self._used = length
