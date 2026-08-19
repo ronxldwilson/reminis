@@ -11,6 +11,75 @@ release below had to pass.
 
 ## Unreleased
 
+### Speculative decoding: `--draft`
+
+Closes #28. Decoding is memory-bound at batch size one -- every weight is read
+to produce a single token -- so reading the weights once to *check* five tokens
+costs about what reading them once to produce one costs. Something cheap
+proposes k tokens, the model verifies them as one batch, and the proposals it
+agreed with are kept.
+
+The output does not change. The accept/reject rule returns exactly the target's
+own distribution, so a run with a draft and a run without it are the same model
+at different speeds -- which is what `tests/test_speculative.py` pins, by
+comparing whole greedy sequences rather than timings.
+
+Two drafters, and they are told apart by what they cost:
+
+| `--draft` | what it is | extra memory |
+|---|---|---|
+| `ngram` | proposes whatever followed the last few tokens the last time they appeared | none |
+| `path/to.db` | a smaller model sharing the target's tokenizer | the draft model |
+| `registry.db#name` | one model out of a registry, materialised for the run | the draft model |
+
+On `Qwen3.8-27B-UD-IQ2_M` (10.4 GB, 3-bit packed index) on an M5 with 16 GB,
+asked to quote a passage back and comment on it -- the case n-gram lookup is
+for, where the answer repeats the question:
+
+| | tok/s | tokens per pass |
+|---|---|---|
+| no draft | 9.5 | 1.00 |
+| `--draft ngram --draft-tokens 4` | **14.7** | **2.02** |
+
+90% of proposals accepted, byte-identical output, and nothing extra resident.
+For reference, `llama-bench` on the same file on the same machine reports 9.25
+tok/s.
+
+The other half of that measurement, which matters as much: asked instead to
+explain why the sky is blue, the same flag gives 19% acceptance, 1.03 tokens
+per pass, and 9.8 tok/s against a 9.8 tok/s baseline. n-gram drafting proposes
+from the context, so it helps where the answer repeats the input -- quoting,
+summarising, editing code -- and on prose the model is inventing there is
+nothing to look up. Breaking even is the right expectation there, and it is
+what happens.
+
+Because the ids have to mean the same thing in both models, a draft model's
+tokenizer is compared against the target's at load rather than trusted -- a
+mismatched pair does not fail, it silently rejects everything and runs slower
+than not having bothered. reminis keeps the tokenizer in the database next to
+the weights, so this is a comparison of two blobs.
+
+#### What a rejected pass costs, and the recurrent case
+
+The issue named KV-cache rollback as the one prerequisite, and for attention it
+is: `KVCache.rollback` lowers a counter, the buffers are preallocated, and the
+next token overwrites the rejected span. Free.
+
+A recurrent layer cannot be rolled back at all. It folds each token into a
+hidden state and keeps no per-token record to truncate -- and qwen35, which is
+the model above, is three-quarters Gated DeltaNet. So `Arch` grew
+`snapshot_state`/`restore_state`: None for an attention-only architecture, and
+for qwen35 the conv windows and scan states, which is a copy of two lists
+rather than of the arrays in them because the scan replaces entries instead of
+writing into them.
+
+On a partial acceptance there the whole pass is undone and its accepted prefix
+is pushed back into the *next* verification batch, which has to happen anyway.
+That trades arithmetic for a trip to memory on a machine where the trip to
+memory is the entire cost, and it is why nothing has to hold a state per
+speculated position -- which at 3.1 MB a layer across 48 recurrent layers would
+have been 150 MB per token of lookahead.
+
 ### A width per group, measured for the model rather than inherited
 
 `reminis sweep --mix` groups a model's tensors by role -- `embed`, `attn`,

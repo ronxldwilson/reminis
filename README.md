@@ -588,6 +588,41 @@ Measured on a 1536-token context:
 
 llama.cpp has the same feature as `-ctk`/`-ctv`, and unlike its weight quantization that one *is* a runtime flag — this is the one place the two tools line up directly.
 
+### Speculative decoding: reading the weights once for several tokens
+
+Decoding is memory-bound at batch size one. Every weight in the model is read to produce a single token, which is why the rate is the model's size divided by the machine's memory bandwidth and almost nothing else — on `Qwen3.8-27B-UD-IQ2_M`, 10.4 GB a token at 102 ms a token is an implied 100 GB/s, which is the bus rather than the arithmetic.
+
+So reading the weights once to *check* five tokens costs about what reading them once to produce one costs. `--draft` has something cheap propose the next k tokens, runs them as a single batch, and keeps the ones the model agreed with.
+
+**The output does not change.** The accept/reject rule returns exactly the target's own distribution — greedy accepts a proposal only where `argmax` would have chosen it, and at temperature a proposal drawn with probability `q` is kept with probability `min(1, p/q)` under the target's `p`, with the replacement drawn from the difference. `tests/test_speculative.py` pins this by comparing whole greedy sequences with and without a drafter, on both an attention model and a recurrent one.
+
+| `--draft` | what proposes | extra memory |
+|---|---|---|
+| `ngram` | whatever followed the last few tokens the last time they appeared in the context | none |
+| `path/to.db` | a smaller model sharing the target's tokenizer | the draft model |
+| `registry.db#name` | one model out of a registry — draft and target in one file | the draft model |
+
+On `Qwen3.8-27B-UD-IQ2_M` (10.4 GB resident, 3-bit packed index) on an M5 with 16 GB, asked to quote a passage back and comment on it:
+
+| | tok/s | tokens per pass of the model |
+|---|---|---|
+| no draft | 9.5 | 1.00 |
+| `--draft ngram --draft-tokens 4` | **14.7** | **2.02** |
+
+90% of proposals accepted, byte-identical output, nothing extra resident. For reference, `llama-bench` on the same GGUF on the same machine reports 9.25 tok/s.
+
+**And the honest other half:** asked to explain why the sky is blue, the same flag gives 19% acceptance, 1.03 tokens per pass, and 9.8 tok/s against a 9.8 tok/s baseline — no gain and no loss. n-gram drafting proposes from the context, so it helps exactly where the answer repeats the input: quoting, summarising, editing code, answering from a document. On prose the model is inventing, there is nothing to look up, and the right expectation is that it breaks even.
+
+A draft *model* is the case that does not depend on the prompt, and it is the one where reminis' storage is an advantage rather than beside the point. Draft and target have to share a tokenizer for the ids to line up, and reminis keeps the tokenizer in the database next to the weights — so the pair is compared at load rather than trusted. A mismatched pair does not fail; it silently rejects everything and runs slower than not having bothered. The fingerprint is the vocabulary hashed plus the family that reads it, and deliberately not the special-token ids: two builds from one family often disagree about whether to record a `bos_token_id`, which changes the meaning of no id.
+
+#### What a rejected pass costs
+
+The prerequisite is being able to un-run a forward pass. For attention that is `KVCache.rollback`, and it is free: the buffers are preallocated, every read is bounded by a counter, so lowering the counter is the whole of it and the next token overwrites the rejected span.
+
+A recurrent layer cannot be rolled back at all. It folds each token into a hidden state and keeps no per-token record to truncate — and `qwen35`, the model measured above, is three-quarters Gated DeltaNet. So `Arch` gained `snapshot_state`/`restore_state`: `None` for an attention-only architecture, which is also how a caller knows the counter is enough, and for qwen35 the conv windows and scan states. That snapshot is a copy of two *lists* rather than of the arrays in them, because the scan builds a new state each step instead of writing into the old one.
+
+On a partial acceptance there, the whole pass is undone and its accepted prefix is pushed back into the next verification batch — which has to happen anyway. That spends arithmetic to save a trip to memory, on a machine where the trip to memory is the entire cost. It is also why nothing has to hold a state per speculated position: at 3.1 MB a layer across 48 recurrent layers, that would have been 150 MB per token of lookahead, on a machine that has 12.7 GB of working set and is already using 10.4 of it.
+
 ### Backends: numpy, MLX, CuPy
 
 `reminis run` computes through whichever array library suits the machine — **MLX** on Apple silicon, **CuPy** on NVIDIA, **numpy** everywhere. numpy stays the reference implementation: it is the one whose logits are checked against `transformers`, and the others earn their place by agreeing with it.
@@ -1110,6 +1145,9 @@ reminis run model.db "The capital of France is" --stream
 
 # Pick the array library by hand; auto uses the fastest one available
 reminis run model.db "The capital of France is" --backend numpy
+
+# Guess the next few tokens and check them in one pass
+reminis run model.db "Summarise the passage above." --draft ngram
 ```
 
 `--stream` holds nothing in memory between uses, so peak memory is one layer rather than one model, and a 258 MB database serves 2,796 MB of reads across 2,457 queries to generate eight tokens. It is the thesis in one flag — the model is data, paged in on demand — and it is a demonstration, not a deployment mode. It costs about 1.2 seconds per gigabyte of model per token, so it does not let a large model run on a small machine, and [it is not trying to](#what-this-is-and-what-it-is-not).
