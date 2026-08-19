@@ -102,10 +102,16 @@ __all__ = [
 # ---------------------------------------------------------------- sampling
 
 
-def _sample(logits: np.ndarray, temperature: float, top_p: float, rng) -> int:
-    if temperature <= 0:
-        return int(np.argmax(logits))
+def _probs(logits: np.ndarray, temperature: float, top_p: float) -> np.ndarray:
+    """The distribution the next token is drawn from, over the whole vocabulary.
 
+    Kept as a full-width vector with the tokens outside the nucleus set to
+    zero, rather than as a shortlist. Sampling only needs the shortlist,
+    but speculative decoding has to compare the target's distribution with
+    the draft's token by token, and two shortlists of different tokens do
+    not line up. One vector per vocabulary is a megabyte and the comparison
+    is then an array subtraction.
+    """
     scaled = logits.astype(np.float32) / np.float32(temperature)
     scaled = scaled - np.max(scaled)
     np.exp(scaled, out=scaled)
@@ -117,10 +123,16 @@ def _sample(logits: np.ndarray, temperature: float, top_p: float, rng) -> int:
         # Keep the smallest set of tokens whose mass reaches top_p, always
         # including the first one so the set is never empty.
         keep = int(np.searchsorted(cumulative, top_p) + 1)
-        chosen = order[:keep]
-        renormalised = probs[chosen] / probs[chosen].sum()
-        return int(rng.choice(chosen, p=renormalised))
+        probs[order[keep:]] = 0.0
+        probs /= probs.sum()
 
+    return probs
+
+
+def _sample(logits: np.ndarray, temperature: float, top_p: float, rng) -> int:
+    if temperature <= 0:
+        return int(np.argmax(logits))
+    probs = _probs(logits, temperature, top_p)
     return int(rng.choice(len(probs), p=probs))
 
 
@@ -143,6 +155,8 @@ def generate(
     expert_cache: int = 0,
     expert_bits: int | None = None,
     preload: bool = False,
+    draft: str | None = None,
+    draft_tokens: int = 4,
 ) -> dict:
     """Generate text from a model stored in a reminis database.
 
@@ -170,6 +184,16 @@ def generate(
         think: On a reasoning model, leave its thinking channel open rather
             than closing it immediately. The answer then arrives after the
             working, which needs a token budget to match.
+        draft: Propose tokens with something cheap and check them against
+            this model in batches, which is faster because checking five
+            tokens reads the weights once where producing five reads them
+            five times. Either "ngram", to draft from the context with no
+            second model, or the path to a smaller model that shares this
+            one's tokenizer. The output is the same either way -- what
+            changes is how many passes it takes.
+        draft_tokens: How many tokens to propose per round. Too few wastes
+            the batch; too many spends draft time on proposals that a
+            rejection earlier in the round throws away.
         stop_at_eos: Stop when the model emits its end-of-text token.
         verbose: Print the header, the prompt, and the closing timings. The
             generated text itself is printed either way, so that piping the
@@ -196,6 +220,7 @@ def generate(
                   f"{loaded['seconds']:.0f}s")
     tok = model.tokenizer
     rng = np.random.default_rng(seed)
+    speculator = None
 
     try:
         text = _apply_chat_template(prompt, tok, think) if chat else prompt
@@ -237,8 +262,26 @@ def generate(
                       f"      To run at another width: reminis prepare "
                       f"<db> --weights --bits N   (or --weights --drop)")
 
-        cache = KVCache(model.cfg.n_layers, capacity=len(tokens) + max_tokens,
+        # Speculation overruns: a round reads `draft_tokens` past the end
+        # before finding out how many of them were wanted, and on a model
+        # whose state cannot be rolled back it re-reads a queue of up to
+        # 2(k+1) accepted tokens alongside them. The cache is given room
+        # for the worst of that rather than doubling in the middle of a
+        # round -- it would still be correct, only slower and larger.
+        headroom = 3 * draft_tokens + 5 if draft else 0
+        capacity = len(tokens) + max_tokens + headroom
+        cache = KVCache(model.cfg.n_layers, capacity=capacity,
                         backend=chosen, quantize_bits=kv_bits)
+
+        if draft:
+            from reminis.speculative import Speculator, open_drafter
+            drafter = open_drafter(draft, model, capacity=capacity,
+                                   temperature=temperature, top_p=top_p,
+                                   rng=rng, backend=chosen, pack_bits=pack_bits)
+            speculator = Speculator(model, drafter, draft_tokens)
+            if verbose:
+                print(f"drafting {draft_tokens} tokens a round from "
+                      f"{drafter.description}")
 
         t0 = time.time()
         logits = model.forward(tokens, cache, offset=0)
@@ -256,19 +299,28 @@ def generate(
                 f"      Use --pack 8 to quantize them instead."
             )
 
-        produced = []
-        t1 = time.time()
-        for _ in range(max_tokens):
-            token_id = _sample(logits, temperature, top_p, rng)
-            if stop_at_eos and tok.eos_id is not None and token_id == tok.eos_id:
-                break
-            produced.append(token_id)
+        def emit(token_id: int):
             piece = tok.decode_one(token_id)
             if on_token:
                 on_token(piece)
             else:
                 print(piece, end="", flush=True)
-            logits = model.forward([token_id], cache, offset=cache.length)
+
+        produced = []
+        t1 = time.time()
+        if speculator is not None:
+            produced = speculator.generate(
+                logits, tokens, cache, max_tokens, temperature, top_p, rng,
+                eos_id=tok.eos_id, stop_at_eos=stop_at_eos, on_token=emit,
+            )
+        else:
+            for _ in range(max_tokens):
+                token_id = _sample(logits, temperature, top_p, rng)
+                if stop_at_eos and tok.eos_id is not None and token_id == tok.eos_id:
+                    break
+                produced.append(token_id)
+                emit(token_id)
+                logits = model.forward([token_id], cache, offset=cache.length)
 
         decode_seconds = time.time() - t1
         completion = tok.decode(produced)
@@ -280,6 +332,16 @@ def generate(
             print(f"\n{len(tokens)} prompt tokens in {prefill_seconds:.2f}s, "
                   f"{len(produced)} generated in {decode_seconds:.2f}s "
                   f"({rate:.1f} tok/s)")
+            if speculator is not None:
+                # The number worth reading is tokens per pass. Acceptance
+                # says how good the drafter is; passes say what that was
+                # worth, since a pass is one read of the weights and a read
+                # of the weights is what a token costs without all this.
+                per_pass = len(produced) / speculator.passes if speculator.passes else 0
+                print(f"\n{speculator.accepted}/{speculator.proposed} proposals "
+                      f"accepted ({speculator.acceptance:.0%}) over "
+                      f"{speculator.rounds} rounds, "
+                      f"{per_pass:.2f} tokens per pass of the model")
             read = model.store.bytes_read / (1024 ** 2)
             if stream:
                 print(f"Read {read:,.0f} MB from SQLite across "
@@ -299,8 +361,13 @@ def generate(
             "queries": model.store.reads,
             "backend": chosen.name,
             "packed_tensors": model.store.packed,
+            "draft_accepted": speculator.accepted if speculator else 0,
+            "draft_proposed": speculator.proposed if speculator else 0,
+            "model_passes": speculator.passes if speculator else None,
         }
     finally:
+        if speculator is not None:
+            speculator.drafter.close()
         model.close()
 
 
@@ -347,6 +414,8 @@ def run_cli(args, on_error=None):
             pack_bits=args.pack, kv_bits=args.kv_bits,
             expert_cache=0 if args.experts in (None, "all") else args.experts,
             preload=args.experts == "all",
+            draft=getattr(args, "draft", None),
+            draft_tokens=getattr(args, "draft_tokens", 4),
         )
     except (UnsupportedModel, ValueError, FileNotFoundError) as exc:
         print(f"Error: {exc}")

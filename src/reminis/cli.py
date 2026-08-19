@@ -85,6 +85,8 @@ def cmd_run(args, parser):
         if not args.experts.isdigit() or int(args.experts) < 1:
             parser.error("--experts takes a positive number, or 'all'")
         args.experts = int(args.experts)
+    if args.draft_tokens < 1:
+        parser.error("--draft-tokens must be at least 1")
     from reminis.infer import run_cli
     run_cli(args)
 
@@ -393,6 +395,24 @@ def build_parser() -> argparse.ArgumentParser:
              "Holding all of gpt-oss-20b's is 8.4 GB and takes it from 0.7 "
              "to 41 tok/s; a number smaller than the model runs it in less "
              "memory than it would otherwise need, more slowly.",
+    )
+    p_run.add_argument(
+        "--draft", metavar="SOURCE",
+        help="Speculative decoding: propose the next few tokens with "
+             "something cheap and check them against this model in one "
+             "batch. Decoding is memory-bound, so checking five tokens "
+             "reads the weights once where producing five reads them five "
+             "times, and the output is unchanged -- the accept/reject rule "
+             "returns the target's own distribution. Either 'ngram', to "
+             "draft from the context with no second model, or the path to "
+             "a smaller model sharing this one's tokenizer, or "
+             "'registry.db#name' to take the draft out of a registry.",
+    )
+    p_run.add_argument(
+        "--draft-tokens", type=int, default=4, metavar="K",
+        help="How many tokens --draft proposes each round (default 4). "
+             "Too few wastes the batch; too many spends draft time on "
+             "proposals a rejection earlier in the round throws away.",
     )
     p_run.add_argument("-q", "--quiet", action="store_true", help="Suppress progress output")
     p_run.set_defaults(func=cmd_run)
