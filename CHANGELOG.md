@@ -70,6 +70,112 @@ produce; `prepare_datasets.py`, `finetune_all.py`, `benchmark.py`, and
 `benchmark_perplexity.py` rebuild all of it from a downloaded base model, and
 the fine-tuning run resumes from its last checkpoint if it is interrupted.
 
+#### Then merging the ten back into one
+
+`merge_experiment.py` asks the question the ten packs raise: how much of ten
+specialists survives being averaged into a single model. Base is 15.30 mean
+perplexity across the ten splits and the specialist diagonal -- each domain
+scored by the model trained on it, which is ten models -- is 3.60. One merged
+model:
+
+| merge | mean ppl | of the way from base to specialists |
+|---|---|---|
+| `ties` (8 domains) | 4.47 | 92.5% |
+| `linear` (10) | 4.54 | 92.0% |
+| `task-arithmetic` (10) scale 0.1 | 4.54 | 92.0% |
+| `linear` (8 domains) | 4.56 | 91.8% |
+| `task-arithmetic` (10) scale 0.3 | 4.84 | 89.4% |
+| `task-arithmetic` (10) scale 1.0 | 113.57 | destroyed |
+
+Its delta against base is 101 MB, marginally *smaller* than any single
+fine-tune's 107 MB, so one model competent across all ten costs 1.10 GB against
+2.12 GB for the ten specialists kept separately.
+
+Three things worth recording, none of them expected:
+
+**The method barely matters.** Linear, TIES, and task arithmetic at 0.1 are
+three distinct operations and they agree to within 0.09 perplexity. Averaging
+is what helps; how you average is noise at this scale. TIES costs 50.5s against
+linear's 4s -- the trim threshold needs a pass over each tensor -- and buys one
+thing: legal, 5.7 against linear's 7.9 on the same eight models. Legal is the
+smallest split at 89 examples, so trimming to the top 20% appears to protect a
+signal a plain mean dilutes. A narrow win, but a real one.
+
+**Merging eight models improved the two they had never seen.** `linear8` never
+touched science or sql and scores 5.6 and 3.6 on them, against base's 17.6 and
+20.0. Putting those two domains *into* the merge moves them to 5.4 and 3.1.
+That is the same finding the individual fine-tunes gave, sharpened: at this
+size what LoRA mostly teaches is the shape of an instruction-response pair, and
+the subject is a thin layer on top of it.
+
+**Scale 1.0 is outside the basin.** Ten task vectors summed at full strength
+give 113.57, seven times worse than not having merged at all. `--scale` is the
+whole difference between a merge and a broken model here, and 0.1 -- which for
+ten inputs is the mean of the task vectors -- is where it lands.
+
+The ten-way merges are composed in two stages, because `reminis merge` attaches
+at most 8 databases. That composition is exact for linear (the 8-way mean
+weighted 8 against two singles is the 10-way mean) and for task arithmetic
+(task vectors add, so stage 1 at scale 1.0 then stage 2 at S gives
+`base + S * sum(ten)`). It is not exact for TIES, whose trimming and sign
+election run across the whole set at once, so TIES runs natively over eight
+domains with a linear merge of the same eight as its control -- which is what
+makes science and sql a held-out pair rather than an omission.
+
+#### The merged model is the better generalist and loses every domain
+
+Two comparisons, and they point opposite ways. Across all ten splits the merge
+at 4.54 beats every individual fine-tune, the best of which is `ft_finance` at
+4.85 and the worst `ft_legal` at 6.32. On each domain's own split it loses to
+the model trained on it, ten times out of ten -- by 6% on finance, 12% on code,
+and 73% on legal.
+
+The size of that loss tracks how idiosyncratic the domain is. Code, math and
+medicine give up 11-16%; legal and sql give up 50-73%. Legal is 89 examples
+with a rigid answer format and sql is syntax, and an average washes exactly
+that kind of signal out. It is also why TIES's trimming won on legal and
+nowhere else.
+
+#### Whether a better merge could beat a specialist: no
+
+`specialist_plus.py` tests the obvious repair. A specialist trained on 89 legal
+examples might be short of the shape-of-an-answer signal the other nine learned
+from four thousand, so keep its task vector whole and add a fraction of theirs:
+`base + tv_d + alpha * sum(others)`. Since `ta10_s10` is already
+`base + sum(all ten)`, that is a two-input merge weighted `[1-alpha, alpha]`
+rather than a ten-input one.
+
+It does not work, on any of three domains at any of three alphas:
+
+| domain | base | plain merge | specialist | a=0.05 | a=0.1 | a=0.2 |
+|---|---|---|---|---|---|---|
+| legal | 29.69 | 8.20 | **4.74** | 4.76 | 4.81 | 5.16 |
+| sql | 19.98 | 3.11 | **2.07** | 2.07 | 2.09 | 2.23 |
+| code | 6.28 | 2.50 | **2.23** | 2.26 | 2.32 | 2.55 |
+
+Monotone decay in alpha, nine losses out of nine. The premise was wrong about
+where the shared signal lives: it is in *every* task vector including the
+specialist's own, so `sum(others)` contributes nine redundant copies of what
+the specialist already has plus nine domains' worth of specifics that are noise
+for this one. And a specialist is what gradient descent produced while directly
+minimising loss on that domain -- a linear combination in weight space has no
+particular reason to beat the optimiser at its own objective, and does not.
+
+What alpha is good for is buying breadth cheaply. At 0.05 the home domain gives
+up 0-1.3% and the ten-domain mean improves 4.7-6.2%:
+
+| domain, a=0.05 | own split | ten-domain mean |
+|---|---|---|
+| legal | 4.76 vs 4.74 (+0.4%) | 5.93 vs 6.32 (-6.2%) |
+| sql | 2.07 vs 2.07 (0.0%) | 5.11 vs 5.42 (-5.7%) |
+| code | 2.26 vs 2.23 (+1.3%) | 4.85 vs 5.09 (-4.7%) |
+
+The pack is 123 MB rather than the specialist's 107 MB, since it carries a
+trace of all ten task vectors rather than one. So the four options, in the
+order the choice actually gets made: the specialist when the domain is known,
+the specialist at alpha 0.05 when it is known but not certain, the ten-way
+merge when it is not known, and task arithmetic at scale 1.0 never.
+
 ### Speculative decoding: `--draft`
 
 Closes #28. Decoding is memory-bound at batch size one -- every weight is read

@@ -57,5 +57,7 @@ bench_*.json
 experiments/multidomain/base_model/
 experiments/multidomain/fused_models/
 experiments/multidomain/reminis_dbs/
+experiments/multidomain/merged_dbs/
+experiments/multidomain/merged_models/
 experiments/multidomain/logs/
 *_delta.bin

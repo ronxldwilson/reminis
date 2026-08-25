@@ -1,0 +1,163 @@
+{
+  "results": {
+    "sp_legal_a005": {
+      "domain": "legal",
+      "alpha": 0.05,
+      "scores": {
+        "code": 3.39,
+        "creative": 7.04,
+        "finance": 12.04,
+        "history": 6.73,
+        "legal": 4.76,
+        "math": 2.64,
+        "medical": 5.18,
+        "reasoning": 4.78,
+        "science": 7.93,
+        "sql": 4.82
+      }
+    },
+    "sp_legal_a01": {
+      "domain": "legal",
+      "alpha": 0.1,
+      "scores": {
+        "code": 3.39,
+        "creative": 7.04,
+        "finance": 11.91,
+        "history": 6.14,
+        "legal": 4.81,
+        "math": 2.59,
+        "medical": 4.92,
+        "reasoning": 4.29,
+        "science": 7.53,
+        "sql": 4.44
+      }
+    },
+    "sp_legal_a02": {
+      "domain": "legal",
+      "alpha": 0.2,
+      "scores": {
+        "code": 3.63,
+        "creative": 7.62,
+        "finance": 12.31,
+        "history": 5.63,
+        "legal": 5.16,
+        "math": 2.64,
+        "medical": 4.77,
+        "reasoning": 3.8,
+        "science": 7.32,
+        "sql": 4.36
+      }
+    },
+    "sp_sql_a005": {
+      "domain": "sql",
+      "alpha": 0.05,
+      "scores": {
+        "code": 2.79,
+        "creative": 5.36,
+        "finance": 9.15,
+        "history": 5.45,
+        "legal": 9.86,
+        "math": 2.31,
+        "medical": 4.02,
+        "reasoning": 3.86,
+        "science": 6.25,
+        "sql": 2.07
+      }
+    },
+    "sp_sql_a01": {
+      "domain": "sql",
+      "alpha": 0.1,
+      "scores": {
+        "code": 2.81,
+        "creative": 5.38,
+        "finance": 9.17,
+        "history": 5.11,
+        "legal": 8.99,
+        "math": 2.27,
+        "medical": 3.95,
+        "reasoning": 3.58,
+        "science": 6.08,
+        "sql": 2.09
+      }
+    },
+    "sp_sql_a02": {
+      "domain": "sql",
+      "alpha": 0.2,
+      "scores": {
+        "code": 3.0,
+        "creative": 5.73,
+        "finance": 9.58,
+        "history": 4.69,
+        "legal": 8.11,
+        "math": 2.3,
+        "medical": 3.94,
+        "reasoning": 3.28,
+        "science": 5.94,
+        "sql": 2.23
+      }
+    },
+    "sp_code_a005": {
+      "domain": "code",
+      "alpha": 0.05,
+      "scores": {
+        "code": 2.26,
+        "creative": 5.0,
+        "finance": 8.35,
+        "history": 4.93,
+        "legal": 9.4,
+        "math": 2.16,
+        "medical": 3.75,
+        "reasoning": 3.51,
+        "science": 5.87,
+        "sql": 3.23
+      }
+    },
+    "sp_code_a01": {
+      "domain": "code",
+      "alpha": 0.1,
+      "scores": {
+        "code": 2.32,
+        "creative": 5.07,
+        "finance": 8.52,
+        "history": 4.67,
+        "legal": 8.65,
+        "math": 2.15,
+        "medical": 3.73,
+        "reasoning": 3.3,
+        "science": 5.78,
+        "sql": 3.13
+      }
+    },
+    "sp_code_a02": {
+      "domain": "code",
+      "alpha": 0.2,
+      "scores": {
+        "code": 2.55,
+        "creative": 5.61,
+        "finance": 9.28,
+        "history": 4.49,
+        "legal": 8.01,
+        "math": 2.23,
+        "medical": 3.89,
+        "reasoning": 3.15,
+        "science": 5.87,
+        "sql": 3.22
+      }
+    }
+  },
+  "specialists": {
+    "legal": 4.74,
+    "sql": 2.07,
+    "code": 2.23
+  },
+  "base": {
+    "legal": 29.69,
+    "sql": 19.98,
+    "code": 6.28
+  },
+  "plain_merge": {
+    "legal": 8.2,
+    "sql": 3.11,
+    "code": 2.5
+  }
+}

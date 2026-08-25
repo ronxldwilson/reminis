@@ -15,6 +15,8 @@ uv run experiments/multidomain/fix_remaining.py         # datasets the first pas
 uv run experiments/multidomain/finetune_all.py          # ~25 min, 10 LoRA runs
 uv run experiments/multidomain/benchmark.py             # fuse, convert, diff, generate
 uv run experiments/multidomain/benchmark_perplexity.py  # ~5 min, the real measurement
+uv run experiments/multidomain/merge_experiment.py      # ~4 min, ten models into one
+uv run experiments/multidomain/specialist_plus.py       # ~6 min, can a merge beat one?
 ```
 
 `finetune_all.py` draws a live dashboard: per-domain progress, loss, tokens/sec,
@@ -34,7 +36,9 @@ datasets/         10 domains x train/valid/test.jsonl        (3 MB, tracked)
 adapters/         10 LoRA adapters                           (267 MB)
 fused_models/     10 standalone models, adapter merged in    (9.3 GB)
 reminis_dbs/      11 databases + 10 delta packs              (11 GB)
-logs/             per-domain training logs
+merged_dbs/       merge outputs, plus specialist+alpha ones  (15 GB)
+merged_models/    the same, exported so mlx_lm can load them (15 GB)
+logs/             per-domain training and benchmark logs
 ```
 
 ## The domains
@@ -89,6 +93,65 @@ the ten splits; the worst fine-tune averages 6.3 and the best 4.9. At this size
 — 200 iterations, eight layers, 500 examples — LoRA is teaching the shape of an
 instruction-response pair at least as much as any one subject, and none of the
 ten forgot anything measurable.
+
+## Merging the ten into one
+
+`merge_experiment.py`. Base averages 15.30 across the ten splits; the
+specialist diagonal — each domain scored by the model trained on it, which is
+ten models — averages 3.60. One merged model:
+
+| merge | mean ppl | of the way from base to specialists |
+|---|---|---|
+| `ties` (8 domains) | 4.47 | 92.5% |
+| `linear` (10) | 4.54 | 92.0% |
+| `task-arithmetic` (10) scale 0.1 | 4.54 | 92.0% |
+| `linear` (8 domains) | 4.56 | 91.8% |
+| `task-arithmetic` (10) scale 0.3 | 4.84 | 89.4% |
+| `task-arithmetic` (10) scale 1.0 | 113.57 | destroyed |
+
+Its delta against base is 101 MB, so one model competent across all ten costs
+1.10 GB against 2.12 GB for the ten specialists kept apart.
+
+Three things, none of them expected. **The method barely matters** — linear,
+TIES and task arithmetic at 0.1 are distinct operations that agree to within
+0.09 perplexity; TIES costs 50.5s against linear's 4s and wins only on legal
+(5.7 against 7.9), the smallest split, where trimming protects a signal a mean
+dilutes. **Merging eight models improved the two they never saw** — the
+eight-way merges score 5.6 and 3.6 on science and sql against base's 17.6 and
+20.0, and adding those domains only moves them to 5.4 and 3.1. **Scale 1.0 is
+outside the basin** — ten task vectors at full strength are seven times worse
+than not merging.
+
+The ten-way merges compose in two stages because `reminis merge` attaches at
+most 8 databases. That is exact for linear and task arithmetic and not for
+TIES, so TIES runs natively over eight domains with a matched linear control —
+which is what makes science and sql held out rather than dropped.
+
+## Better generalist, worse specialist
+
+Across all ten splits the merge at 4.54 beats every individual fine-tune (best
+`ft_finance` 4.85, worst `ft_legal` 6.32). On each domain's own split it loses
+to that domain's model ten times out of ten — 6% on finance, 12% on code, 73%
+on legal. The gap tracks how idiosyncratic the domain is; legal is 89 examples
+with a rigid format, sql is syntax, and an average washes that out.
+
+`specialist_plus.py` tries the repair: keep a domain's task vector whole and
+add a fraction of the other nine, `base + tv_d + alpha * sum(others)`. Since
+`ta10_s10` is already `base + sum(all ten)`, that is a two-input merge weighted
+`[1-alpha, alpha]`.
+
+| domain | base | plain merge | specialist | a=0.05 | a=0.1 | a=0.2 |
+|---|---|---|---|---|---|---|
+| legal | 29.69 | 8.20 | **4.74** | 4.76 | 4.81 | 5.16 |
+| sql | 19.98 | 3.11 | **2.07** | 2.07 | 2.09 | 2.23 |
+| code | 6.28 | 2.50 | **2.23** | 2.26 | 2.32 | 2.55 |
+
+Monotone decay, nine losses out of nine. The premise was wrong about where the
+shared signal lives — it is in every task vector including the specialist's
+own, so `sum(others)` adds nine redundant copies of what the specialist has
+plus nine domains' specifics that are noise for this one. What alpha buys is
+breadth: at 0.05 the home domain gives up 0-1.3% and the ten-domain mean
+improves 4.7-6.2%, in a 123 MB pack rather than 107 MB.
 
 ## A negative result about the metric
 

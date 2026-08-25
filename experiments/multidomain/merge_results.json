@@ -1,0 +1,104 @@
+{
+  "merged": {
+    "linear8": {
+      "code": 2.47,
+      "creative": 4.76,
+      "finance": 8.15,
+      "history": 4.4,
+      "legal": 7.86,
+      "math": 2.07,
+      "medical": 3.52,
+      "reasoning": 3.11,
+      "science": 5.6,
+      "sql": 3.63
+    },
+    "ties8": {
+      "code": 2.69,
+      "creative": 5.06,
+      "finance": 8.79,
+      "history": 3.99,
+      "legal": 5.7,
+      "math": 2.07,
+      "medical": 3.68,
+      "reasoning": 2.82,
+      "science": 5.9,
+      "sql": 4.03
+    },
+    "linear10": {
+      "code": 2.5,
+      "creative": 4.78,
+      "finance": 8.15,
+      "history": 4.51,
+      "legal": 8.2,
+      "math": 2.09,
+      "medical": 3.51,
+      "reasoning": 3.17,
+      "science": 5.36,
+      "sql": 3.11
+    },
+    "ta10_s01": {
+      "code": 2.5,
+      "creative": 4.79,
+      "finance": 8.14,
+      "history": 4.51,
+      "legal": 8.2,
+      "math": 2.09,
+      "medical": 3.51,
+      "reasoning": 3.17,
+      "science": 5.35,
+      "sql": 3.1
+    },
+    "ta10_s03": {
+      "code": 3.06,
+      "creative": 5.81,
+      "finance": 9.73,
+      "history": 4.3,
+      "legal": 7.33,
+      "math": 2.26,
+      "medical": 3.9,
+      "reasoning": 2.96,
+      "science": 5.72,
+      "sql": 3.36
+    },
+    "ta10_s10": {
+      "code": 304.84,
+      "creative": 170.76,
+      "finance": 168.7,
+      "history": 62.51,
+      "legal": 76.72,
+      "math": 40.31,
+      "medical": 67.66,
+      "reasoning": 44.36,
+      "science": 75.68,
+      "sql": 124.13
+    }
+  },
+  "base": {
+    "code": 6.28,
+    "creative": 9.61,
+    "finance": 23.05,
+    "history": 15.47,
+    "legal": 29.69,
+    "math": 4.14,
+    "medical": 13.94,
+    "reasoning": 13.25,
+    "science": 17.63,
+    "sql": 19.98
+  },
+  "specialists": {
+    "code": 2.23,
+    "creative": 4.01,
+    "finance": 7.7,
+    "history": 3.28,
+    "legal": 4.74,
+    "math": 1.8,
+    "medical": 3.16,
+    "reasoning": 2.5,
+    "science": 4.49,
+    "sql": 2.07
+  },
+  "held_out_for_eight_way": [
+    "science",
+    "sql"
+  ]
+}
