@@ -11,6 +11,65 @@ release below had to pass.
 
 ## Unreleased
 
+### Eleven models in one file: a ten-domain fine-tune, measured
+
+`experiments/multidomain/` is the delta-pack claim put to a test with a number
+on the other side of it. Qwen2.5-0.5B-Instruct, ten LoRA fine-tunes on ten
+unrelated corpora -- code, creative writing, finance, history, legal, math,
+medicine, reasoning, science, SQL -- and then the two questions worth asking:
+what does keeping all eleven cost, and is each one actually better at the thing
+it was trained on.
+
+Storage, for a base and ten derived models:
+
+| | total |
+|---|---|
+| eleven safetensors directories | 11.00 GB |
+| eleven reminis databases | 10.99 GB |
+| one base database and ten delta packs | **2.12 GB** |
+
+80.7% off, and the reason is visible in `reminis diff`: each fine-tune changed
+56 of the model's 290 tensors, so each pack is ~112 MB against a 999 MB model.
+Storing the models separately saves nothing -- a database of one model is the
+model. The saving is entirely in the file format understanding that eleven
+models are related, which is the thing this project claims and had not yet
+measured at this shape.
+
+The capability question needed a better instrument than the first one used. A
+keyword-match score over generated answers put the *base* model on top at 0.88
+against a best fine-tune of 0.87, which is not a result about models -- it is a
+result about a metric that cannot tell "mentions insulin" from "is right about
+insulin". Perplexity on each domain's held-out split, 30 samples each, says
+something else:
+
+| model | own domain | base on the same | change |
+|---|---|---|---|
+| ft_sql | 2.07 | 19.98 | -89.6% |
+| ft_legal | 4.74 | 29.69 | -84.0% |
+| ft_reasoning | 2.50 | 13.25 | -81.1% |
+| ft_history | 3.28 | 15.47 | -78.8% |
+| ft_medical | 3.16 | 13.94 | -77.3% |
+| ft_science | 4.49 | 17.63 | -74.5% |
+| ft_finance | 7.70 | 23.05 | -66.6% |
+| ft_code | 2.23 | 6.28 | -64.5% |
+| ft_creative | 4.01 | 9.61 | -58.3% |
+| ft_math | 1.80 | 4.14 | -56.5% |
+
+The second finding is the one that was not expected: every fine-tune improved
+every *other* domain too. Base averages 15.3 across the ten splits; the worst
+fine-tune averages 6.3 and the best 4.9. At this size -- 200 iterations, eight
+layers, 500 examples -- LoRA is teaching the model the shape of an
+instruction-response pair more than it is teaching any one subject, and none of
+the ten forgot anything measurable. A larger model, longer training, or more
+data would be a different experiment, and the scripts are checked in so it can
+be run.
+
+The repo carries the scripts, the training splits, the adapter configs, and
+both result files. It does not carry the ~21 GB of weights and databases they
+produce; `prepare_datasets.py`, `finetune_all.py`, `benchmark.py`, and
+`benchmark_perplexity.py` rebuild all of it from a downloaded base model, and
+the fine-tuning run resumes from its last checkpoint if it is interrupted.
+
 ### Speculative decoding: `--draft`
 
 Closes #28. Decoding is memory-bound at batch size one -- every weight is read

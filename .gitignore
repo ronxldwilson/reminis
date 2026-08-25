@@ -49,3 +49,13 @@ eval-data/
 # by `python bench.py --json <file>`; the numbers that matter live in
 # CHANGELOG.md.
 bench_*.json
+
+# Multi-domain experiment: weights, databases, and delta packs. All of it is
+# rebuilt by the scripts in experiments/multidomain/ from a downloaded base
+# model, so the repo carries the scripts, the training data, and the results
+# and none of the ~21 GB they produce.
+experiments/multidomain/base_model/
+experiments/multidomain/fused_models/
+experiments/multidomain/reminis_dbs/
+experiments/multidomain/logs/
+*_delta.bin

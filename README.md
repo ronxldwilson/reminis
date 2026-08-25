@@ -925,6 +925,35 @@ It depends entirely on how much of the model the fine-tune touched.
 
 The second row is the honest one for full fine-tuning. Every tensor changed, with ~97% of individual values differing in each.
 
+### Eleven models in one file: ten fine-tunes, measured end to end
+
+`experiments/multidomain/` runs the whole claim at once. Qwen2.5-0.5B-Instruct, ten LoRA fine-tunes on ten unrelated corpora — code, creative writing, finance, history, legal, math, medicine, reasoning, science, SQL — and then the question the delta pack exists to answer: what does keeping all eleven cost?
+
+| | total |
+|---|---|
+| eleven safetensors directories | 11.00 GB |
+| eleven reminis databases | 10.99 GB |
+| **one base database and ten delta packs** | **2.12 GB** |
+
+80.7% off, and `reminis diff` shows why: each fine-tune changed 56 of the model's 290 tensors, so each pack is ~112 MB against a 999 MB model. Note the middle row — storing eleven models as eleven databases saves nothing, because a database of one model *is* the model. The entire saving comes from the file format knowing the eleven are related.
+
+The other half of the experiment is whether each one actually learned its subject. Perplexity on each domain's held-out split:
+
+| model | own domain | base on the same | change |
+|---|---|---|---|
+| ft_sql | 2.07 | 19.98 | **-89.6%** |
+| ft_legal | 4.74 | 29.69 | **-84.0%** |
+| ft_reasoning | 2.50 | 13.25 | **-81.1%** |
+| ft_history | 3.28 | 15.47 | **-78.8%** |
+| ft_medical | 3.16 | 13.94 | **-77.3%** |
+| ft_code | 2.23 | 6.28 | **-64.5%** |
+
+Every fine-tune also improved every *other* domain: base averages 15.3 perplexity across the ten splits, the worst fine-tune 6.3 and the best 4.9. At this size — 200 iterations, eight layers, 500 examples — LoRA teaches the shape of an instruction-response pair at least as much as it teaches any one subject, and nothing measurable was forgotten.
+
+One negative result worth keeping: the first pass scored generated answers by keyword match and put the *base* model on top, 0.88 against a best fine-tune of 0.87. That is not a fact about the models. A keyword score cannot tell "mentions insulin" from "is right about insulin", and the perplexity table above is the same eleven models under an instrument that can.
+
+The repo carries the scripts, the training splits, and both result files — not the ~21 GB of weights they produce. `prepare_datasets.py`, `finetune_all.py`, `benchmark.py`, and `benchmark_perplexity.py` rebuild all of it from a downloaded base model, and the fine-tuning run resumes from its last checkpoint if interrupted.
+
 ### Bit-plane splitting, and where the floor actually is
 
 A 16-bit float interleaves a highly predictable exponent with mantissa bits a fine-tune randomises. Handed the delta as one stream, a general-purpose compressor sees every predictable exponent run chopped up by noise every other byte. Splitting the delta into two streams — one per byte position — and compressing each separately took the full fine-tune above from **58.4% to 50.4%**.

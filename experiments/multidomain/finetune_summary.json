@@ -1,0 +1,44 @@
+{
+  "elapsed_seconds": 0.0006029605865478516,
+  "results": {
+    "done": 10,
+    "skipped": 0,
+    "failed": 0
+  },
+  "domains": {
+    "code": "done",
+    "creative": "done",
+    "finance": "done",
+    "history": "done",
+    "legal": "done",
+    "math": "done",
+    "medical": "done",
+    "reasoning": "done",
+    "science": "done",
+    "sql": "done"
+  },
+  "final_losses": {
+    "code": null,
+    "creative": null,
+    "finance": null,
+    "history": null,
+    "legal": null,
+    "math": null,
+    "medical": null,
+    "reasoning": null,
+    "science": null,
+    "sql": null
+  },
+  "times_seconds": {
+    "code": null,
+    "creative": null,
+    "finance": null,
+    "history": null,
+    "legal": null,
+    "math": null,
+    "medical": null,
+    "reasoning": null,
+    "science": null,
+    "sql": null
+  }
+}
