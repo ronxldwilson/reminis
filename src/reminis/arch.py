@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import json
 import math
+import re
 
 import numpy as np
 
@@ -77,24 +78,107 @@ class Arch:
     #: the wrong one produces confident gibberish rather than an error.
     rope_style = "norm"
 
+    #: The llama-family safetensors block, in the spelling transformers uses,
+    #: against the one GGUF uses. Longest fragment wins, so `mlp.gate_proj`
+    #: beats `mlp.gate`, and whatever follows the fragment -- `.weight`,
+    #: `.bias` -- is carried across untouched.
+    _HF_LAYER_MAP = {
+        "self_attn.q_proj": "attn_q",
+        "self_attn.k_proj": "attn_k",
+        "self_attn.v_proj": "attn_v",
+        "self_attn.o_proj": "attn_output",
+        "self_attn.q_norm": "attn_q_norm",
+        "self_attn.k_norm": "attn_k_norm",
+        "mlp.gate_proj": "ffn_gate",
+        "mlp.up_proj": "ffn_up",
+        "mlp.down_proj": "ffn_down",
+        "input_layernorm": "attn_norm",
+        "post_attention_layernorm": "ffn_norm",
+    }
+
+    #: The tensors that sit outside the repeating block.
+    _HF_GLOBAL_MAP = {
+        "model.embed_tokens": "token_embd",
+        "model.norm": "output_norm",
+        "lm_head": "output",
+    }
+
     def translate_name(self, hf_name: str) -> str | None:
         """Map a HuggingFace tensor name to its GGUF equivalent.
 
         Returns the translated name, or None to keep the original. The
-        default strips the ``model.layers.N.`` prefix into ``blk.N.`` and
-        common suffixes (layernorm, mlp projections). Architectures with
-        non-standard tensor names override this.
+        default handles the llama-family layout -- ``model.layers.N.`` into
+        ``blk.N.``, and the projection and norm spellings that go with it.
+        Architectures with non-standard tensor names override this.
+
+        A name with no mapping is kept rather than guessed at. It will then
+        be missing under the name the model asks for, and `reminis run` says
+        which tensor it wanted -- which is a better failure than inventing a
+        translation and loading the wrong weight into the right slot.
         """
+        for hf_prefix, gguf_name in self._HF_GLOBAL_MAP.items():
+            if hf_name == hf_prefix or hf_name.startswith(hf_prefix + "."):
+                return gguf_name + hf_name[len(hf_prefix):]
+
+        m = re.match(r"model\.layers\.(\d+)\.(.*)", hf_name)
+        if not m:
+            return None
+        layer, rest = m.group(1), m.group(2)
+
+        for hf_frag, gguf_frag in sorted(
+            self._HF_LAYER_MAP.items(), key=lambda kv: -len(kv[0])
+        ):
+            if rest == hf_frag or rest.startswith(hf_frag + "."):
+                return f"blk.{layer}.{gguf_frag}{rest[len(hf_frag):]}"
         return None
 
     def translate_config(self, config: dict) -> list[tuple[str, str, str]]:
         """Map config.json fields to GGUF-style metadata rows.
 
-        Returns a list of ``(key, value, type)`` tuples. The base returns
-        nothing; architectures whose safetensors models need metadata
-        translation override this.
+        Returns a list of ``(key, value, type)`` tuples. The default covers
+        the hyperparameters `ModelConfig` reads for a llama-family block.
+
+        Three of these have defaults in the reader that are wrong for most
+        models -- rope's base is 10000 where Qwen2 uses 1000000, and the RMS
+        epsilon is 1e-5 where it uses 1e-6 -- and being wrong there is not an
+        error, it is slightly wrong text. So they are written out from
+        config.json rather than left to fall back.
         """
-        return []
+        tc = config.get("text_config") or config
+        a = self.name
+        rows = []
+
+        def add(key, value):
+            if value is not None:
+                rows.append((f"{a}.{key}", str(value), "string"))
+
+        add("block_count", tc.get("num_hidden_layers"))
+        add("embedding_length", tc.get("hidden_size"))
+        add("feed_forward_length", tc.get("intermediate_size"))
+        add("attention.head_count", tc.get("num_attention_heads"))
+        add("attention.head_count_kv", tc.get("num_key_value_heads"))
+        add("attention.key_length", tc.get("head_dim"))
+        add("attention.layer_norm_rms_epsilon", tc.get("rms_norm_eps"))
+        add("context_length", tc.get("max_position_embeddings"))
+
+        # rope_theta moved into a nested dict in newer configs; older ones
+        # keep it at the top level.
+        rope = tc.get("rope_parameters") or {}
+        add("rope.freq_base", tc.get("rope_theta", rope.get("rope_theta")))
+
+        scaling = tc.get("rope_scaling") or {}
+        if isinstance(scaling, dict) and scaling:
+            kind = scaling.get("rope_type") or scaling.get("type")
+            add("rope.scaling.type", kind)
+            add("rope.scaling.factor", scaling.get("factor"))
+            add("rope.scaling.original_context_length",
+                scaling.get("original_max_position_embeddings"))
+
+        # Mixture of experts, where the model has one.
+        add("expert_count", tc.get("num_experts", tc.get("num_local_experts")))
+        add("expert_used_count", tc.get("num_experts_per_tok"))
+
+        return rows
 
     def needs_transform(self, name: str) -> bool:
         """True when ``transform_tensor`` would change this tensor's data."""
@@ -151,16 +235,34 @@ class Arch:
 
 # The llama family and its near neighbours: one shared block, distinguished
 # only by how rotary embedding is laid out.
-for _name, _style in (
-    ("gpt-oss", "neox"),
-    ("llama", "norm"),
-    ("mistral", "norm"),
-    ("granite", "norm"),
-    ("granitemoe", "norm"),
-    ("qwen2", "neox"),
-    ("qwen2moe", "neox"),
+#
+# `hf_names` is what lets the safetensors converter recognise a config.json,
+# and recognising it is what runs the name and metadata translation above --
+# so an architecture left with no names here converts to a database that
+# stores fine and cannot be run. That is deliberate for the ones that have
+# it. The pre-tokenizer is the reason: an unset one falls back to GPT-2's
+# splitter, which produces valid ids that are not the ids the model was
+# trained on, and no error anywhere. Naming an architecture here without
+# knowing its splitter would trade a loud failure for a silent one, so the
+# list holds only what has been run and checked against a reference
+# implementation. Adding one is a small job -- name it, name its splitter,
+# and extend tests/test_safetensors_run.py -- and is worth doing per model
+# someone actually has.
+for _name, _style, _hf, _pre in (
+    ("gpt-oss", "neox", (), ""),
+    ("llama", "norm", (), ""),
+    ("mistral", "norm", (), ""),
+    ("granite", "norm", (), ""),
+    ("granitemoe", "norm", (), ""),
+    ("qwen2", "neox", ("Qwen2ForCausalLM", "qwen2"), "qwen2"),
+    ("qwen2moe", "neox", (), ""),
 ):
-    register(type(f"_{_name}", (Arch,), {"name": _name, "rope_style": _style}))
+    register(type(f"_{_name}", (Arch,), {
+        "name": _name,
+        "rope_style": _style,
+        "hf_names": _hf,
+        "pretokenizer": _pre,
+    }))
 
 
 def _as_list(value):
