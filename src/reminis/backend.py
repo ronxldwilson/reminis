@@ -295,6 +295,8 @@ class Backend:
         """
         return x
 
+    _rope_cache: tuple | None = None
+
     def rope(self, x, dims, traditional, base, offset, freqs=None):
         """Rotary embedding on (batch, heads, tokens, dim).
 
@@ -303,17 +305,28 @@ class Backend:
         """
         xp = self.xp
         half = dims // 2
-        # `freqs`, when given, is the *period* of each rotary dimension --
-        # base ** (2i/d) -- which is the convention mlx's kernel uses, so the
-        # angle divides by it rather than multiplying.
-        if freqs is None:
-            periods = base ** (np.arange(half, dtype=np.float32) * 2.0 / dims)
+        n_tokens = x.shape[-2]
+        # Every layer rotates Q and K at the same position, so a decode step
+        # asks for the same table sixty times on a thirty-layer model. The
+        # key holds `freqs` by identity because it is an attribute of the
+        # config the model owns, alive for as long as the backend is.
+        cache_key = (dims, base, offset, n_tokens,
+                     id(freqs) if freqs is not None else None)
+        if self._rope_cache is not None and self._rope_cache[0] == cache_key:
+            cos, sin = self._rope_cache[1], self._rope_cache[2]
         else:
-            periods = np.asarray(freqs, dtype=np.float32)
-        pos = np.arange(offset, offset + x.shape[-2], dtype=np.float32)
-        angles = pos[:, None] / periods[None, :]
-        cos = self.from_numpy(np.cos(angles))[None, None]
-        sin = self.from_numpy(np.sin(angles))[None, None]
+            # `freqs`, when given, is the *period* of each rotary dimension --
+            # base ** (2i/d) -- which is the convention mlx's kernel uses, so
+            # the angle divides by it rather than multiplying.
+            if freqs is None:
+                periods = base ** (np.arange(half, dtype=np.float32) * 2.0 / dims)
+            else:
+                periods = np.asarray(freqs, dtype=np.float32)
+            pos = np.arange(offset, offset + n_tokens, dtype=np.float32)
+            angles = pos[:, None] / periods[None, :]
+            cos = self.from_numpy(np.cos(angles))[None, None]
+            sin = self.from_numpy(np.sin(angles))[None, None]
+            self._rope_cache = (cache_key, cos, sin)
 
         rot, rest = x[..., :dims], x[..., dims:]
         if traditional:
