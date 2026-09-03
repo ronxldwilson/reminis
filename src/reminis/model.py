@@ -618,6 +618,81 @@ class Model:
         return mask
 
     PREFILL_CHUNK = 512
+    _fast_decode_layers: list | None = None
+
+    def _build_fast_decode(self):
+        """Pre-resolve per-layer weights for the inlined decode loop.
+
+        The generic _block reads norms by name, checks for MoE, sinks,
+        sliding windows, and residual scaling every layer every token.
+        During single-token decode none of that changes, so resolving it
+        once turns thirty dictionary lookups and branch checks per token
+        into a single list traversal.
+        """
+        cfg = self.cfg
+        if (cfg.is_moe or self.store.stream or self.store.pack_bits is not None
+                or cfg.sliding_window or cfg.residual_scale != 1.0):
+            return
+        from reminis.arch import Arch
+        if type(cfg.spec).block is not Arch.block:
+            return
+        layers = []
+        for i in range(cfg.n_layers):
+            attn_norm, ffn_norm, p = self._layer_weights(i)
+            qkv_w, qkv_b = self._fused_cache.get((i, "qkv")) or self._fused(
+                i, "qkv", ["attn_q.weight", "attn_k.weight", "attn_v.weight"])
+            attn_out_w = self.store.get(p + "attn_output.weight")
+            attn_out_b = (self.store.get(p + "attn_output.bias").reshape(-1)
+                          if self.store.has(p + "attn_output.bias") else None)
+            gate_up_w, _ = self._fused_cache.get((i, "gate_up")) or self._fused(
+                i, "gate_up", ["ffn_gate.weight", "ffn_up.weight"])
+            ffn_down_w = self.store.get(p + "ffn_down.weight")
+            has_sinks = self.store.has(p + "attn_sinks.weight")
+            layers.append((attn_norm, ffn_norm, qkv_w, qkv_b, attn_out_w,
+                           attn_out_b, gate_up_w, ffn_down_w, has_sinks))
+        self._fast_decode_layers = layers
+
+    def _fast_decode_step(self, x, cache: "KVCache", offset: int):
+        """All layers in one tight loop, no per-layer branching."""
+        cfg = self.cfg
+        b = self.backend
+        xp = b.xp
+        cut_q = cfg.n_heads * cfg.head_dim
+        cut_k = cut_q + cfg.n_kv_heads * cfg.head_dim
+        scale = cfg.attn_scale
+        n_kv = cfg.n_kv_heads
+        repeat = cfg.n_heads // n_kv
+
+        for i, (attn_norm, ffn_norm, qkv_w, qkv_b, attn_out_w,
+                attn_out_b, gate_up_w, ffn_down_w, has_sinks) in enumerate(
+                    self._fast_decode_layers):
+            h = b.rms_norm(x, attn_norm, cfg.rms_eps)
+            qkv = h @ qkv_w.T
+            if qkv_b is not None:
+                qkv = qkv + qkv_b
+            q = qkv[:, :cut_q].reshape(1, cfg.n_heads, cfg.head_dim).transpose(1, 0, 2)[None]
+            k = qkv[:, cut_q:cut_k].reshape(1, n_kv, cfg.head_dim).transpose(1, 0, 2)[None]
+            v = qkv[:, cut_k:].reshape(1, n_kv, cfg.head_dim).transpose(1, 0, 2)[None]
+
+            q = b.rope(q, cfg.rope_dim, cfg.rope_style == "norm",
+                       cfg.rope_base, offset, cfg.rope_freqs)
+            k = b.rope(k, cfg.rope_dim, cfg.rope_style == "norm",
+                       cfg.rope_base, offset, cfg.rope_freqs)
+
+            k_all, v_all = cache.append(i, k, v)
+
+            sinks = None
+            if has_sinks:
+                sinks = self.store.get(f"blk.{i}.attn_sinks.weight").reshape(-1)
+            out = b.attention(q, k_all, v_all, scale, None, sinks)
+            out = out[0].transpose(1, 0, 2).reshape(1, cfg.n_heads * cfg.head_dim)
+            attn_out = out @ attn_out_w.T
+            if attn_out_b is not None:
+                attn_out = attn_out + attn_out_b
+            x = x + attn_out
+
+            x = b.fused_ffn(x, ffn_norm, gate_up_w, ffn_down_w, cfg.rms_eps)
+        return x
 
     def forward(self, tokens: list[int], cache: "KVCache", offset: int,
                 all_positions: bool = False) -> np.ndarray:
@@ -649,14 +724,19 @@ class Model:
                                 all_positions=False)
 
         b = self.backend
+        use_fast = (n == 1 and not all_positions
+                    and self._fast_decode_layers is not None)
         with b.errstate():
             embed = self.store.get("token_embd.weight")
             x = b.take_rows(embed, b.xp.array(np.asarray(tokens, dtype=np.int32)))
             if self.cfg.embedding_scale != 1.0:
                 x = x * self.cfg.embedding_scale
 
-            for layer in range(self.cfg.n_layers):
-                x = self._block(x, layer, cache, offset)
+            if use_fast:
+                x = self._fast_decode_step(x, cache, offset)
+            else:
+                for layer in range(self.cfg.n_layers):
+                    x = self._block(x, layer, cache, offset)
 
             x = b.rms_norm(x, self.store.get("output_norm.weight").reshape(-1),
                            self.cfg.rms_eps)
@@ -680,6 +760,8 @@ class Model:
                 "The forward pass produced non-finite logits. The weights in "
                 "this database do not form a working model."
             )
+        if self._fast_decode_layers is None and n > 1:
+            self._build_fast_decode()
         return logits
 
     def _forward_chunk(self, tokens: list[int], cache: "KVCache",
