@@ -617,6 +617,8 @@ class Model:
         self._mask_cache[key] = mask
         return mask
 
+    PREFILL_CHUNK = 512
+
     def forward(self, tokens: list[int], cache: "KVCache", offset: int,
                 all_positions: bool = False) -> np.ndarray:
         """Logits for the last token of `tokens`, or for every one of them.
@@ -636,6 +638,16 @@ class Model:
         finite. The logits are checked explicitly below instead, which
         catches a genuinely broken forward pass without the noise.
         """
+        n = len(tokens)
+        chunk = self.PREFILL_CHUNK
+        if n > chunk and not all_positions:
+            for start in range(0, n - chunk, chunk):
+                self._forward_chunk(tokens[start:start + chunk], cache,
+                                    offset + start)
+            return self.forward(tokens[-(n % chunk or chunk):], cache,
+                                offset + n - (n % chunk or chunk),
+                                all_positions=False)
+
         b = self.backend
         with b.errstate():
             embed = self.store.get("token_embd.weight")
@@ -669,3 +681,20 @@ class Model:
                 "this database do not form a working model."
             )
         return logits
+
+    def _forward_chunk(self, tokens: list[int], cache: "KVCache",
+                       offset: int) -> None:
+        """Run a chunk of tokens through the blocks, populating the KV cache.
+
+        No logits are computed — the output projection is skipped since only
+        the last chunk needs it. This is the inner loop of chunked prefill.
+        """
+        b = self.backend
+        with b.errstate():
+            embed = self.store.get("token_embd.weight")
+            x = b.take_rows(embed, b.xp.array(np.asarray(tokens, dtype=np.int32)))
+            if self.cfg.embedding_scale != 1.0:
+                x = x * self.cfg.embedding_scale
+            for layer in range(self.cfg.n_layers):
+                x = self._block(x, layer, cache, offset)
+            b.eval(x)
