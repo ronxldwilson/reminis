@@ -440,6 +440,50 @@ class NumpyBackend(Backend):
     def silu(self, x):
         return x / (1.0 + np.exp(-x, dtype=np.float32))
 
+    ATTN_KV_TILE = 512
+
+    def attention(self, q, k, v, scale, mask=None, sinks=None):
+        xp = self.xp
+        n_heads, n_kv = q.shape[1], k.shape[1]
+        repeat = n_heads // n_kv
+        b, _, t, d = q.shape
+        s = k.shape[-2]
+
+        if s <= self.ATTN_KV_TILE or t == 1 or sinks is not None:
+            return super().attention(q, k, v, scale, mask, sinks)
+
+        qh = q.reshape(b, n_kv, repeat, t, d)
+        kh = k[:, :, None]
+        vh = v[:, :, None]
+        dv = vh.shape[-1]
+
+        out_shape = qh.shape[:-1] + (dv,)
+        acc = xp.zeros(out_shape, dtype=xp.float32)
+        row_max = xp.full(out_shape[:-1] + (1,), -xp.inf, dtype=xp.float32)
+        row_sum = xp.zeros(out_shape[:-1] + (1,), dtype=xp.float32)
+
+        for j in range(0, s, self.ATTN_KV_TILE):
+            end = min(j + self.ATTN_KV_TILE, s)
+            kj = kh[..., j:end, :]
+            vj = vh[..., j:end, :]
+            scores = (qh @ xp.swapaxes(kj, -1, -2)) * scale
+            if mask is not None:
+                scores = xp.where(mask[..., j:end], scores, -xp.inf)
+
+            tile_max = xp.maximum(xp.max(scores, axis=-1, keepdims=True), -1e30)
+            new_max = xp.maximum(row_max, tile_max)
+
+            exp_scores = xp.exp(scores - new_max)
+            tile_sum = xp.sum(exp_scores, axis=-1, keepdims=True)
+
+            correction = xp.exp(row_max - new_max)
+            acc = acc * correction + exp_scores @ vj
+            row_sum = row_sum * correction + tile_sum
+            row_max = new_max
+
+        out = (acc / row_sum).reshape(b, n_heads, t, dv)
+        return out
+
 
 class MLXBackend(Backend):
     """Apple silicon, through mlx.
