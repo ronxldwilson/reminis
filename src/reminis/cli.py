@@ -379,6 +379,13 @@ def build_parser() -> argparse.ArgumentParser:
              "form, so it is otherwise rebuilt at 4 bits and grows.",
     )
     p_run.add_argument(
+        "--pack-group", type=int, default=128, metavar="N",
+        help="How many weights share one scale when --pack re-quantizes "
+             "(default 128). Smaller groups round more finely and read more "
+             "scales; which is fastest is a property of the GPU rather than "
+             "of the model, so it is worth measuring on a new machine.",
+    )
+    p_run.add_argument(
         "--kv-bits", type=int, choices=(4, 8), metavar="BITS",
         help="Compress the key/value cache to this many bits. The weights "
              "are a fixed cost but the cache grows with the context, so at "

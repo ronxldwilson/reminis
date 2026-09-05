@@ -1208,6 +1208,347 @@ class Qwen35(Arch):
         return x + model._linear(b.silu(gate) * up, p + "ffn_down.weight")
 
 
+@register
+class Lfm2(Arch):
+    """Liquid Foundation Model 2: hybrid conv-attention with gated short convolutions.
+
+    Two kinds of layer, specified by config.layer_types:
+
+    **Conv layers** project the input to 3x the model width (B, C, x),
+    element-multiply B*x, run a depthwise causal conv1d (kernel=3), gate
+    the result by C, and project back. The gating makes this a multiplicative
+    filter rather than a plain convolution, which is how a 3-wide kernel
+    manages to carry information across a sequence.
+
+    **Attention layers** are standard grouped-query attention with RMS-normed
+    queries and keys, RoPE, and no output gate.
+
+    Both types share a SwiGLU feed-forward (w1, w2, w3) after the mixing.
+
+    The model norms the embedding after the stack rather than before the
+    output projection -- the weight is called `embedding_norm` rather than
+    the usual `model.norm`. Embeddings are tied.
+    """
+
+    name = "lfm2"
+    rope_style = "neox"
+    pretokenizer = "llama-bpe"
+    hf_names = ("Lfm2ForCausalLM", "lfm2")
+
+    _LAYER_MAP = {
+        "self_attn.q_proj": "attn_q",
+        "self_attn.k_proj": "attn_k",
+        "self_attn.v_proj": "attn_v",
+        "self_attn.out_proj": "attn_output",
+        "self_attn.q_layernorm": "attn_q_norm",
+        "self_attn.k_layernorm": "attn_k_norm",
+        "conv.in_proj": "conv_in_proj",
+        "conv.out_proj": "conv_out_proj",
+        "conv.conv": "conv_conv",
+        "feed_forward.w1": "ffn_gate",
+        "feed_forward.w3": "ffn_up",
+        "feed_forward.w2": "ffn_down",
+        "operator_norm": "attn_norm",
+        "ffn_norm": "ffn_norm",
+    }
+
+    _GLOBAL_MAP = {
+        "model.embed_tokens": "token_embd",
+        "model.embedding_norm": "output_norm",
+    }
+
+    def prepare_meta(self, meta: dict) -> dict:
+        out = {}
+        kv = meta.get(f"{self.name}.attention.head_count_kv")
+        if kv is not None:
+            values = _as_list(kv)
+            nonzero = [int(v) for v in values if int(v) > 0]
+            if nonzero:
+                out[f"{self.name}.attention.head_count_kv"] = max(nonzero)
+        return out
+
+    def translate_name(self, hf_name: str) -> str | None:
+        for hf_prefix, gguf_name in self._GLOBAL_MAP.items():
+            if hf_name == hf_prefix or hf_name.startswith(hf_prefix + "."):
+                return gguf_name + hf_name[len(hf_prefix):]
+
+        m = re.match(r"model\.layers\.(\d+)\.(.*)", hf_name)
+        if not m:
+            return None
+        layer, rest = m.group(1), m.group(2)
+        prefix = f"blk.{layer}."
+
+        for hf_frag, gguf_frag in sorted(
+            self._LAYER_MAP.items(), key=lambda kv: -len(kv[0])
+        ):
+            if rest == hf_frag or rest.startswith(hf_frag + "."):
+                return prefix + gguf_frag + rest[len(hf_frag):]
+        return None
+
+    def translate_config(self, config: dict) -> list[tuple[str, str, str]]:
+        tc = config.get("text_config") or config
+        a = self.name
+        rows = []
+
+        def add(key, value):
+            if value is not None:
+                rows.append((f"{a}.{key}", str(value), "string"))
+
+        add("block_count", tc.get("num_hidden_layers"))
+        add("embedding_length", tc.get("hidden_size") or tc.get("block_dim"))
+        add("feed_forward_length", tc.get("intermediate_size"))
+        add("attention.head_count", tc.get("num_attention_heads") or tc.get("num_heads"))
+        add("attention.head_count_kv", tc.get("num_key_value_heads"))
+        add("attention.layer_norm_rms_epsilon", tc.get("norm_eps") or tc.get("block_norm_eps"))
+        add("context_length", tc.get("max_position_embeddings"))
+
+        rope = tc.get("rope_parameters") or {}
+        add("rope.freq_base", tc.get("rope_theta", rope.get("rope_theta")))
+
+        layer_types = tc.get("layer_types", [])
+        add("layer_types", json.dumps(layer_types))
+        add("conv_L_cache", tc.get("conv_L_cache", 3))
+
+        return rows
+
+    def configure(self, cfg, meta: dict, store) -> None:
+        a = cfg.arch
+
+        def num(key, default=None):
+            value = meta.get(f"{a}.{key}")
+            if value is None:
+                return default
+            return (float(value) if "." in str(value) or "e" in str(value).lower()
+                    else int(value))
+
+        layer_types_raw = meta.get(f"{a}.layer_types")
+        if layer_types_raw:
+            layer_types = json.loads(layer_types_raw) if isinstance(layer_types_raw, str) else layer_types_raw
+        else:
+            kv_raw = meta.get(f"{a}.attention.head_count_kv", "[]")
+            kv_per_layer = _as_list(kv_raw)
+            layer_types = [
+                "full_attention" if int(v) > 0 else "conv"
+                for v in kv_per_layer
+            ]
+        cfg.lfm2_layer_types = layer_types
+        cfg.lfm2_is_conv = [t != "full_attention" for t in layer_types]
+        conv_kernel = num("conv_L_cache") or num("shortconv.l_cache") or 3
+        cfg.lfm2_conv_kernel = int(conv_kernel)
+
+        if all(cfg.lfm2_is_conv):
+            raise ValueError(
+                "This model has no attention layers, so there is nothing "
+                "to populate the key/value cache."
+            )
+
+        # The KV cache advances its length counter on the last layer that
+        # calls append. For a hybrid model the last layer may be a conv that
+        # never appends, so point the cache at the last attention layer.
+        last_attn = max(i for i, is_conv in enumerate(cfg.lfm2_is_conv) if not is_conv)
+        cfg.last_kv_layer = last_attn
+
+    def _conv_layer(self, model, layer):
+        """Names, norm and the conv kernel for one conv layer, resolved once.
+
+        The kernel arrives as (channels, 1, k) or (k, 1, channels) depending
+        on which converter wrote it, and the block wants it as k rows of
+        channel-wide weights. Squeezing and transposing that per token per
+        layer was 20 reshapes a token that always produced the same array.
+        """
+        cache = getattr(model, "_lfm2_conv_cache", None)
+        if cache is None:
+            cache = {}
+            model._lfm2_conv_cache = cache
+        entry = cache.get(layer)
+        if entry is not None:
+            return entry
+
+        store = model.store
+        p = f"blk.{layer}."
+        if store.has(p + "conv_in_proj.weight"):
+            in_w = p + "conv_in_proj.weight"
+            conv_w = p + "conv_conv.weight"
+            out_w = p + "conv_out_proj.weight"
+        else:
+            in_w = p + "shortconv.in_proj.weight"
+            conv_w = p + "shortconv.conv.weight"
+            out_w = p + "shortconv.out_proj.weight"
+
+        kernel = store.get(conv_w).squeeze()
+        if kernel.ndim == 1:
+            kernel = kernel.reshape(-1, 1)
+        # Rows must be taps, columns channels. A square kernel is ambiguous
+        # and does not occur -- k is 3 and channels is thousands.
+        if kernel.shape[0] == model.cfg.d_model:
+            kernel = kernel.T
+        kernel = model.backend.contiguous(kernel)
+        # The taps are read one at a time in the conv; slicing them once here
+        # keeps that out of the per-token path.
+        taps = [kernel[j] for j in range(kernel.shape[0])]
+
+        norm = store.get(p + "attn_norm.weight").reshape(-1)
+        entry = (in_w, out_w, norm, taps)
+        if not store.stream:
+            cache[layer] = entry
+        return entry
+
+    def _causal_conv1d(self, model, x, taps, conv_state):
+        b = model.backend
+        xp = b.xp
+        k_size = len(taps)
+
+        if conv_state is None:
+            conv_state = b.zeros((k_size - 1, x.shape[-1]))
+        padded = xp.concatenate([conv_state, x], axis=0)
+
+        n = x.shape[0]
+        out = padded[0:n] * taps[0]
+        for j in range(1, k_size):
+            out = out + padded[j:j + n] * taps[j]
+
+        return out, padded[-(k_size - 1):]
+
+    def _conv_block(self, model, x, layer, conv_states, offset):
+        b = model.backend
+        cfg = model.cfg
+        in_w, out_w, norm, taps = self._conv_layer(model, layer)
+
+        h = b.rms_norm(x, norm, cfg.rms_eps)
+        proj = model._linear(h, in_w)
+
+        third = proj.shape[-1] // 3
+        gate_b = proj[:, :third]
+        gate_c = proj[:, third:2 * third]
+        value = proj[:, 2 * third:]
+
+        conv_out, new_conv = self._causal_conv1d(
+            model, gate_b * value, taps, conv_states.get_conv(layer))
+        conv_states.set_conv(layer, new_conv)
+
+        return x + model._linear(gate_c * conv_out, out_w)
+
+    def _attn_layer(self, model, layer):
+        """The three norms one attention layer reads, resolved once."""
+        cache = getattr(model, "_lfm2_attn_cache", None)
+        if cache is None:
+            cache = {}
+            model._lfm2_attn_cache = cache
+        entry = cache.get(layer)
+        if entry is not None:
+            return entry
+
+        store = model.store
+        p = f"blk.{layer}."
+        entry = (
+            store.get(p + "attn_norm.weight").reshape(-1),
+            store.get(p + "attn_q_norm.weight").reshape(-1),
+            store.get(p + "attn_k_norm.weight").reshape(-1),
+        )
+        if not store.stream:
+            cache[layer] = entry
+        return entry
+
+    def _attn_block(self, model, x, layer, cache, offset):
+        b = model.backend
+        cfg = model.cfg
+        p = f"blk.{layer}."
+        n_tokens = x.shape[0]
+        attn_norm, q_norm, k_norm = self._attn_layer(model, layer)
+
+        h = b.rms_norm(x, attn_norm, cfg.rms_eps)
+
+        q = model._linear(h, p + "attn_q.weight")
+        k = model._linear(h, p + "attn_k.weight")
+        v = model._linear(h, p + "attn_v.weight")
+
+        q = q.reshape(n_tokens, cfg.n_heads, cfg.head_dim)
+        k = k.reshape(n_tokens, cfg.n_kv_heads, cfg.head_dim)
+        v = v.reshape(n_tokens, cfg.n_kv_heads, cfg.head_dim)
+
+        q = b.rms_norm(q, q_norm, cfg.rms_eps)
+        k = b.rms_norm(k, k_norm, cfg.rms_eps)
+
+        q = q.transpose(1, 0, 2)[None]
+        k = k.transpose(1, 0, 2)[None]
+        v = v.transpose(1, 0, 2)[None]
+
+        q = b.rope(q, cfg.rope_dim, False, cfg.rope_base, offset, cfg.rope_freqs)
+        k = b.rope(k, cfg.rope_dim, False, cfg.rope_base, offset, cfg.rope_freqs)
+
+        k_all, v_all = cache.append(layer, k, v)
+
+        mask = None
+        if n_tokens > 1:
+            mask = model._causal_mask(n_tokens, offset, k_all.shape[-2], 0)
+
+        out = b.attention(q, k_all, v_all, cfg.attn_scale, mask, None)
+        out = out[0].transpose(1, 0, 2).reshape(n_tokens, cfg.n_heads * cfg.head_dim)
+
+        return x + model._linear(out, p + "attn_output.weight")
+
+    def _states(self, model):
+        states = getattr(model, "_lfm2_conv_states", None)
+        if states is None:
+            states = _Lfm2ConvState(model.cfg.n_layers)
+            model._lfm2_conv_states = states
+        return states
+
+    def snapshot_state(self, model):
+        return self._states(model).snapshot()
+
+    def restore_state(self, model, snapshot) -> None:
+        self._states(model).restore(snapshot)
+
+    def _ffn_norm(self, model, layer):
+        cache = getattr(model, "_lfm2_ffn_cache", None)
+        if cache is None:
+            cache = {}
+            model._lfm2_ffn_cache = cache
+        norm = cache.get(layer)
+        if norm is None:
+            norm = model.store.get(f"blk.{layer}.ffn_norm.weight").reshape(-1)
+            if not model.store.stream:
+                cache[layer] = norm
+        return norm
+
+    def block(self, model, x, layer: int, cache, offset: int):
+        cfg = model.cfg
+        b = model.backend
+        p = f"blk.{layer}."
+
+        conv_states = self._states(model)
+
+        if cfg.lfm2_is_conv[layer]:
+            x = self._conv_block(model, x, layer, conv_states, offset)
+        else:
+            x = self._attn_block(model, x, layer, cache, offset)
+
+        norm = self._ffn_norm(model, layer)
+        h = b.rms_norm(x, norm, cfg.rms_eps)
+        gate, up = model._gate_up(h, layer, p)
+        return x + model._linear(b.silu(gate) * up, p + "ffn_down.weight")
+
+
+class _Lfm2ConvState:
+    """Conv state carried across tokens for Lfm2 conv layers."""
+
+    def __init__(self, n_layers):
+        self._conv = [None] * n_layers
+
+    def snapshot(self):
+        return list(self._conv)
+
+    def restore(self, snapshot) -> None:
+        self._conv = list(snapshot)
+
+    def get_conv(self, layer):
+        return self._conv[layer]
+
+    def set_conv(self, layer, state):
+        self._conv[layer] = state
+
+
 class SSMState:
     """Hidden state for DeltaNet layers — conv buffers and scan states.
 

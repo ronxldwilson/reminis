@@ -22,7 +22,8 @@ class KVCache:
     """
 
     def __init__(self, n_layers: int, capacity: int | None = None, backend=None,
-                 quantize_bits: int | None = None):
+                 quantize_bits: int | None = None,
+                 last_append_layer: int | None = None):
         self.k = [None] * n_layers
         self.v = [None] * n_layers
         self.capacity = capacity
@@ -34,6 +35,7 @@ class KVCache:
         self._packed_k = [None] * n_layers
         self._packed_v = [None] * n_layers
         self._used = 0
+        self._last_append = last_append_layer if last_append_layer is not None else n_layers - 1
 
     def _empty(self, size, like, n_tokens):
         """A cache buffer shaped like `like` but with room for `size` tokens."""
@@ -70,7 +72,7 @@ class KVCache:
 
         # The counter advances once per token, not once per layer, so it is
         # updated on the last layer only -- every layer sees the same span.
-        if layer == len(self.k) - 1:
+        if layer == self._last_append:
             self._used = used + n
         return buf_k[..., :used + n, :], buf_v[..., :used + n, :]
 
@@ -115,7 +117,7 @@ class KVCache:
             for buffer, part in zip(buffers, packed):
                 buffer[..., used:used + n, :] = part
 
-        if layer == len(self.k) - 1:
+        if layer == self._last_append:
             self._used = used + n
 
         span = used + n

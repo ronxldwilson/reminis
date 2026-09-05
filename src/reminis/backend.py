@@ -216,6 +216,12 @@ class Backend:
         """x @ w.T, whether w is a plain matrix or a packed one."""
         return x @ w.T
 
+    def concat_weights(self, weights):
+        """Stack weights along their output dimension, or None if it cannot."""
+        if any(isinstance(w, QuantizedWeight) for w in weights):
+            return None
+        return self.contiguous(self.xp.concatenate(list(weights), axis=0))
+
     def quantize_kv(self, x, bits, group_size):
         """Compress cached keys or values. None when unsupported."""
         return None
@@ -675,6 +681,33 @@ class MLXBackend(Backend):
         return self.mx.quantized_matmul(
             x, w.q, w.scales, w.biases, transpose=True,
             group_size=w.group_size, bits=w.bits,
+        )
+
+    def concat_weights(self, weights):
+        """Stack weights along their output dimension, packed or not.
+
+        Two projections read one after the other are two passes over
+        memory and two dispatches; stacked they are one of each. Packed
+        weights stack without unpacking -- the words, the scales and the
+        biases are all row-major over output rows -- provided they agree
+        on width and grouping. Returns None when they do not, and the
+        caller keeps them separate.
+        """
+        mx = self.mx
+        if not any(isinstance(w, QuantizedWeight) for w in weights):
+            return self.contiguous(mx.concatenate([w for w in weights], axis=0))
+        if not all(isinstance(w, QuantizedWeight) for w in weights):
+            return None
+        first = weights[0]
+        if any(w.bits != first.bits or w.group_size != first.group_size
+               or w.shape[1] != first.shape[1] for w in weights):
+            return None
+        return QuantizedWeight(
+            mx.concatenate([w.q for w in weights], axis=0),
+            mx.concatenate([w.scales for w in weights], axis=0),
+            mx.concatenate([w.biases for w in weights], axis=0),
+            first.group_size, first.bits,
+            (sum(w.shape[0] for w in weights), first.shape[1]),
         )
 
     def to_compute32(self, x):

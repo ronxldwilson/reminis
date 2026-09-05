@@ -118,13 +118,33 @@ def _probs(logits: np.ndarray, temperature: float, top_p: float) -> np.ndarray:
     probs = scaled / np.sum(scaled)
 
     if 0 < top_p < 1:
-        order = np.argsort(probs)[::-1]
-        cumulative = np.cumsum(probs[order])
+        n = probs.size
+        # The nucleus is the head of the distribution, so only the largest
+        # few entries can be in it. Partitioning a candidate block off and
+        # ordering that is far cheaper than ordering the whole vocabulary:
+        # at 128k entries the full argsort measured 12.4 ms a token against
+        # a 32 ms forward pass, which made sampling a third of the run.
+        # The block grows until it holds enough mass to reach top_p, so the
+        # answer is the same one the full ordering gives.
+        block = 256
+        while True:
+            if block >= n:
+                order = np.argsort(probs)[::-1]
+            else:
+                head = np.argpartition(probs, n - block)[n - block:]
+                order = head[np.argsort(probs[head])[::-1]]
+            cumulative = np.cumsum(probs[order])
+            if block >= n or cumulative[-1] >= top_p:
+                break
+            block *= 4
+
         # Keep the smallest set of tokens whose mass reaches top_p, always
         # including the first one so the set is never empty.
         keep = int(np.searchsorted(cumulative, top_p) + 1)
-        probs[order[keep:]] = 0.0
-        probs /= probs.sum()
+        nucleus = order[:keep]
+        kept = probs[nucleus]
+        probs = np.zeros_like(probs)
+        probs[nucleus] = kept / kept.sum()
 
     return probs
 
@@ -133,7 +153,15 @@ def _sample(logits: np.ndarray, temperature: float, top_p: float, rng) -> int:
     if temperature <= 0:
         return int(np.argmax(logits))
     probs = _probs(logits, temperature, top_p)
-    return int(rng.choice(len(probs), p=probs))
+    # `rng.choice(n, p=probs)` validates and accumulates the whole vocabulary
+    # on every call. Once a nucleus has been taken only a handful of entries
+    # are non-zero, so the draw is a walk over those.
+    nonzero = np.flatnonzero(probs)
+    if nonzero.size == 1:
+        return int(nonzero[0])
+    cumulative = np.cumsum(probs[nonzero])
+    pick = np.searchsorted(cumulative, rng.random() * cumulative[-1])
+    return int(nonzero[min(int(pick), nonzero.size - 1)])
 
 
 def generate(
@@ -151,6 +179,7 @@ def generate(
     on_token=None,
     backend: str | None = None,
     pack_bits=None,
+    pack_group: int = 128,
     kv_bits: int | None = None,
     expert_cache: int = 0,
     expert_bits: int | None = None,
@@ -209,6 +238,7 @@ def generate(
 
     chosen = select_backend("inference", backend)
     model = Model(db_path, stream=stream, backend=chosen, pack_bits=pack_bits,
+                  pack_group=pack_group,
                   expert_cache=expert_cache, expert_bits=expert_bits)
     if preload:
         if verbose:
@@ -271,7 +301,8 @@ def generate(
         headroom = 3 * draft_tokens + 5 if draft else 0
         capacity = len(tokens) + max_tokens + headroom
         cache = KVCache(model.cfg.n_layers, capacity=capacity,
-                        backend=chosen, quantize_bits=kv_bits)
+                        backend=chosen, quantize_bits=kv_bits,
+                        last_append_layer=getattr(model.cfg, 'last_kv_layer', None))
 
         if draft:
             from reminis.speculative import Speculator, open_drafter
@@ -411,7 +442,8 @@ def run_cli(args, on_error=None):
             seed=args.seed, stream=args.stream, chat=args.chat,
             think=getattr(args, 'think', False),
             verbose=not args.quiet, backend=args.backend,
-            pack_bits=args.pack, kv_bits=args.kv_bits,
+            pack_bits=args.pack, pack_group=getattr(args, "pack_group", 128),
+            kv_bits=args.kv_bits,
             expert_cache=0 if args.experts in (None, "all") else args.experts,
             preload=args.experts == "all",
             draft=getattr(args, "draft", None),
