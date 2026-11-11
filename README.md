@@ -1077,6 +1077,26 @@ Verified against peft itself: the applied result is compared tensor-by-tensor ag
 
 `modules_to_save` tensors — ones peft trained outright rather than through a factor pair — are carried in the pack in full. Embedding LoRA (`lora_embedding_A/B`) is not handled yet, and reminis refuses such an adapter rather than writing a pack that quietly omits part of it.
 
+## Training a LoRA adapter, inside the database
+
+`reminis finetune train` does the training the packs above were carrying: LoRA against a base model, with the adapter, the Adam moments and the loss history stored as rows of the run database rather than as loose files. A run is one SQLite file — a copy of the base plus the training tables — so `reminis log`, `reminis blame` and `reminis bisect` read it like any other tracked run, and a checkpoint is a few `INSERT`s rather than a directory of shards.
+
+```bash
+reminis finetune train base.db --data corpus.jsonl -o run.db --steps 200
+reminis finetune merge run.db -o merged.db
+```
+
+The merge is the machinery from the section above, not new arithmetic: the adapter is exported in peft's format, converted to a delta pack by `reminis lora`, and applied by `reminis apply` — which verifies the result against a hash recorded when the pack was written. `--adapter-dir` keeps the peft-shaped export beside the merge.
+
+What it is honest about:
+
+- **MLX only.** Autodiff needs it; numpy and CuPy are refused. Training always runs in float32, whatever the file stores — a float16 backward pass overflows gradients long before it fails loudly.
+- **LoRA scope only.** Dense attention architectures; mixture-of-experts and custom-block architectures are refused. Quantized target tensors are refused — a packed weight can be multiplied but not differentiated.
+- **One sequence at a time.** The model has no batch dimension yet ([#25](https://github.com/ronxldwilson/reminis/issues/25)), so `--batch-size` sequences are run individually inside one autograd graph, not stacked.
+- **Resume is real.** `--resume` (or `LoRATrainer(..., resume=True)`) restores the adapter, the Adam moments and the step counter from the newest checkpoint in the run database.
+
+Verified against peft itself: on a tiny float32 Qwen2, one backward pass from `LoRATrainer` matches peft's gradients on the same adapter values to within 1e-5 relative — and the merge, which has its own hash verification, reproduces `base + (alpha/r) · B @ A` exactly.
+
 ## Many models in one database
 
 A base model and everything fine-tuned from it can live in a single file. Base models store their weights outright; anything derived stores **only what differs**, using the same verified delta encodings as `reminis diff`.
@@ -1485,6 +1505,7 @@ The checks are written to fail for the right reason. Where a property could pass
 - [x] Write quantized models, not only read them (`reminis quantize`, Q8_0 and Q4_0)
 - [x] Safetensors input and output, sharded and BF16 (`reminis convert ./model/`)
 - [x] peft LoRA adapters as exact delta packs (`reminis lora`)
+- [x] LoRA training inside the database (`reminis finetune`), adapter and optimizer state as rows, resume from a checkpoint ([#30](https://github.com/ronxldwilson/reminis/issues/30))
 - [x] Fine-tune tracking with edit logs (`reminis log`)
 - [x] Hash-verified rewind to a snapshot (`reminis rollback`)
 - [x] Measured why *surgical* rollback of a mid-run step does not work

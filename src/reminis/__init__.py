@@ -4,6 +4,7 @@ __version__ = "0.34.0"
 
 from reminis.converter import gguf_to_sqlite, sqlite_to_gguf
 from reminis.diff import apply_delta, diff_models
+from reminis.finetune import LoRATrainer, merge_run
 from reminis.infer import generate
 from reminis.lora import lora_to_delta_pack
 from reminis.merge import merge_models
@@ -27,4 +28,6 @@ __all__ = [
     "TrainingLog",
     "rollback_to_step",
     "state_dict_to_sqlite",
+    "LoRATrainer",
+    "merge_run",
 ]

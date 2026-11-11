@@ -173,6 +173,45 @@ def cmd_registry(args, parser):
     _run_registry(args, args.registry_parser)
 
 
+def cmd_finetune(args, parser):
+    if args.finetune_command is None:
+        args.finetune_parser.print_help()
+        sys.exit(1)
+    if args.finetune_command == "train":
+        from reminis.finetune import LoRATrainer
+
+        if args.resume:
+            trainer = LoRATrainer(args.run, args.run, resume=True)
+        else:
+            trainer = LoRATrainer(
+                args.base, args.out,
+                rank=args.rank, alpha=args.alpha,
+                targets=args.targets.split(","),
+                seed=args.seed, use_rslora=args.rslora,
+            )
+        try:
+            trainer.train(
+                args.data, steps=args.steps, lr=args.lr,
+                batch_size=args.batch_size, seq_len=args.seq_len,
+                checkpoint_every=args.checkpoint_every,
+                log_every=args.log_every, weight_decay=args.weight_decay,
+                max_grad_norm=args.max_grad_norm, quiet=args.quiet,
+            )
+        finally:
+            trainer.close()
+    elif args.finetune_command == "merge":
+        from reminis.finetune import merge_run
+
+        try:
+            merge_run(
+                args.run, args.output, base_db=args.base, step=args.step,
+                keep_adapter=args.adapter_dir, quiet=args.quiet,
+            )
+        except ValueError as exc:
+            print(f"Error: {exc}")
+            sys.exit(1)
+
+
 def cmd_log(args, parser):
     _show_log(args.input, step=args.step, spikes_only=args.spikes)
 
@@ -574,6 +613,98 @@ def build_parser() -> argparse.ArgumentParser:
     p_rollback.add_argument("step", type=int, help="Snapshot step to restore")
     p_rollback.add_argument("-o", "--output", required=True, help="Output database path")
     p_rollback.set_defaults(func=cmd_rollback)
+
+    # finetune: LoRA training inside the database
+    p_ft = sub.add_parser(
+        "finetune",
+        help="Train a LoRA adapter on a model, in its own database",
+    )
+    p_ft.set_defaults(func=cmd_finetune, finetune_parser=p_ft)
+    ft_sub = p_ft.add_subparsers(dest="finetune_command")
+
+    ft_train = ft_sub.add_parser(
+        "train",
+        help="Train a LoRA adapter against a base model database",
+        description="Copies the base database to --out and trains a LoRA "
+                    "adapter in place, storing the adapter, the Adam "
+                    "moments and the loss history as rows of the run "
+                    "database. MLX only: autodiff needs it. Trains in "
+                    "float32 whatever the file stores.",
+    )
+    ft_train.add_argument("base", help="Path to the base model database")
+    ft_train.add_argument(
+        "--data", required=True,
+        help="A JSONL file: one document per line, with a `text` field "
+             "(or `prompt`/`completion`), or plain text lines",
+    )
+    ft_train.add_argument(
+        "-o", "--out", required=True,
+        help="Run database path (created; must differ from the base)",
+    )
+    ft_train.add_argument("--rank", type=int, default=8, help="LoRA rank (default 8)")
+    ft_train.add_argument("--alpha", type=float, default=16.0,
+                          help="LoRA alpha; scaling is alpha/rank (default 16)")
+    ft_train.add_argument(
+        "--targets", default="q,k,v,o,gate,up,down",
+        help="Comma-separated projection kinds to attach adapters to, drawn "
+             "from: q, k, v, o, gate, up, down (default: all of them)",
+    )
+    ft_train.add_argument("--lr", type=float, default=1e-4, help="Learning rate (default 1e-4)")
+    ft_train.add_argument("--steps", type=int, required=True, help="Optimizer steps to run")
+    ft_train.add_argument("--batch-size", type=int, default=1,
+                          help="Sequences averaged per step (default 1; "
+                               "sequences are run one at a time, no batch "
+                               "dimension yet)")
+    ft_train.add_argument("--seq-len", type=int, default=256,
+                          help="Training sequence length; shorter documents "
+                               "are skipped (default 256)")
+    ft_train.add_argument("--checkpoint-every", type=int, default=20,
+                          help="Write adapter and optimizer state every N "
+                               "steps (default 20)")
+    ft_train.add_argument("--log-every", type=int, default=1,
+                          help="Print progress every N steps (default 1)")
+    ft_train.add_argument("--weight-decay", type=float, default=0.0,
+                          help="AdamW weight decay (default 0)")
+    ft_train.add_argument("--max-grad-norm", type=float, default=1.0,
+                          help="Global gradient norm clip; 0 disables "
+                               "(default 1.0)")
+    ft_train.add_argument("--seed", type=int, default=0,
+                          help="Seed for the adapter's A init (default 0)")
+    ft_train.add_argument("--rslora", action="store_true",
+                          help="Use rank-stabilised scaling alpha/sqrt(r)")
+    ft_train.add_argument(
+        "--resume", action="store_true",
+        help="Continue the run in --out from its newest checkpoint; --data "
+             "and the hyperparameters apply from here",
+    )
+    ft_train.add_argument("-q", "--quiet", action="store_true",
+                          help="Suppress progress output")
+
+    ft_merge = ft_sub.add_parser(
+        "merge",
+        help="Fold a finished run's adapter into a full model database",
+        description="Exports the adapter in peft's format, converts it to a "
+                    "delta pack (`reminis lora`) and applies it to the base "
+                    "(`reminis apply`), so the result is hash-verified.",
+    )
+    ft_merge.add_argument("run", help="Path to the run database")
+    ft_merge.add_argument(
+        "-o", "--output", required=True,
+        help="Output model database path (base + adapter)",
+    )
+    ft_merge.add_argument(
+        "--base",
+        help="The base model database, if the one recorded in the run is "
+             "not where it lies",
+    )
+    ft_merge.add_argument("--step", type=int,
+                          help="Which checkpoint step to merge (default: newest)")
+    ft_merge.add_argument(
+        "--adapter-dir",
+        help="Also keep the exported peft-format adapter at this directory",
+    )
+    ft_merge.add_argument("-q", "--quiet", action="store_true",
+                          help="Suppress progress output")
 
     # prepare: build the materialized expert index
     p_prepare = sub.add_parser(

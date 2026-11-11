@@ -11,6 +11,33 @@ release below had to pass.
 
 ## Unreleased
 
+### Training inside the database: `reminis finetune`
+
+The verb the roadmap was missing. `reminis finetune train` runs LoRA against
+a base model on MLX, and stores everything the run is as rows of the run
+database: the adapter (`adapter_state`), the Adam moments
+(`optimizer_state`), and the loss and per-parameter gradient history in the
+same `steps` / `param_updates` schema `reminis log`, `blame` and `bisect`
+already read. A run is one file -- a copy of the base plus the training
+tables -- so a checkpoint is a few inserts and `--resume` restores the
+adapter, the moments and the step counter from the newest one.
+
+Verified against peft itself: on a tiny float32 Qwen2, one backward pass
+from `LoRATrainer` matches peft's gradients on the same adapter values to
+within 1e-5 relative. `reminis finetune merge` folds a finished run back
+into a full model through the machinery that was already verified -- the
+peft export, `reminis lora`, `reminis apply` with its hash check -- and the
+merged weights reproduce `base + (alpha/r) * B @ A` exactly.
+
+Honest limits, stated in `--help` and refused loudly rather than broken
+quietly: MLX only (autodiff is the one thing numpy and CuPy do not have),
+float32 always (a float16 backward overflows gradients long before it fails
+loudly), dense attention architectures only, quantized target tensors
+refused (a packed weight can be multiplied but not differentiated), and one
+sequence at a time while the model has no batch dimension (#25). QLoRA --
+adapters on top of frozen quantized weights, the natural fit the issue
+named -- is the next step and not built here.
+
 ### Eleven models in one file: a ten-domain fine-tune, measured
 
 `experiments/multidomain/` is the delta-pack claim put to a test with a number

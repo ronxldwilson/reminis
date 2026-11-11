@@ -76,6 +76,14 @@ class Model:
         self._layer_cache: dict[int, tuple] = {}
         self._mask_cache: dict = {}
         self._fused_cache: dict[tuple[int, str], tuple] = {}
+        # LoRA adapters, set by the fine-tuning path: {base tensor name:
+        # (A, B)}. A is (rank, in), B is (out, rank), and the update a linear
+        # applies is (x @ A.T) @ B.T * lora_scale. None here means every
+        # linear is exactly the weight in the database. Also disables the
+        # fused QKV / gate_up / compiled-FFN fast paths for the tensors it
+        # touches, since those bypass `_linear`.
+        self.lora: dict[str, tuple] | None = None
+        self.lora_scale: float = 1.0
         if pack_bits is not None and not stream and self.backend.can_pack():
             self._wire_memory()
             self.store.start_prefetch(self._load_order())
@@ -290,6 +298,11 @@ class Model:
 
     def _linear(self, x, name: str, bias: str | None = None):
         y = self.backend.matmul_weight(x, self.store.get(name))
+        if self.lora is not None:
+            factors = self.lora.get(name)
+            if factors is not None:
+                a, bb = factors
+                y = y + ((x @ a.T) @ bb.T) * self.lora_scale
         if bias and self.store.has(bias):
             y = y + self.store.get(bias).reshape(-1)
         return y
@@ -339,7 +352,13 @@ class Model:
         # chained 30-layer feed-forward it was 51.7 GB/s stacked against
         # 53.4 GB/s apart. At one token these matmuls are bandwidth-bound,
         # and one big read is no cheaper than two that saturate anyway.
-        if self.store.stream or self.store.pack_bits is not None:
+        # A LoRA adapter on any of the three needs them separate too, since
+        # the fused form is one matrix the adapter's factors do not name.
+        if self.store.stream or self.store.pack_bits is not None or (
+            self.lora is not None
+            and any((prefix + n) in self.lora for n in
+                    ("attn_q.weight", "attn_k.weight", "attn_v.weight"))
+        ):
             return (self._linear(h, prefix + "attn_q.weight", prefix + "attn_q.bias"),
                     self._linear(h, prefix + "attn_k.weight", prefix + "attn_k.bias"),
                     self._linear(h, prefix + "attn_v.weight", prefix + "attn_v.bias"))
@@ -359,7 +378,11 @@ class Model:
         return out[:, :cut_q], out[:, cut_q:cut_k], out[:, cut_k:]
 
     def _gate_up(self, h: np.ndarray, layer: int, prefix: str):
-        if self.store.stream or self.store.pack_bits is not None:
+        if self.store.stream or self.store.pack_bits is not None or (
+            self.lora is not None
+            and ((prefix + "ffn_gate.weight") in self.lora
+                 or (prefix + "ffn_up.weight") in self.lora)
+        ):
             return (self._linear(h, prefix + "ffn_gate.weight"),
                     self._linear(h, prefix + "ffn_up.weight"))
 
@@ -462,13 +485,20 @@ class Model:
             branch = self._linear(b.silu(gate) * up, p + "ffn_down.weight")
             return x + cfg.residual_scale * branch
 
-        gate_up, _ = self._fused_cache.get((layer, "gate_up")) or self._fused(
-            layer, "gate_up", ["ffn_gate.weight", "ffn_up.weight"])
-        if cfg.residual_scale != 1.0:
+        # A LoRA adapter on any of the feed-forward projections needs the
+        # spelled-out form, since the compiled path never touches `_linear`.
+        lora_ffn = self.lora is not None and (
+            (p + "ffn_gate.weight") in self.lora
+            or (p + "ffn_up.weight") in self.lora
+            or (p + "ffn_down.weight") in self.lora
+        )
+        if cfg.residual_scale != 1.0 or lora_ffn:
             h = b.rms_norm(x, ffn_norm, cfg.rms_eps)
             gate, up = self._gate_up(h, layer, p)
             branch = self._linear(b.silu(gate) * up, p + "ffn_down.weight")
             return x + cfg.residual_scale * branch
+        gate_up, _ = self._fused_cache.get((layer, "gate_up")) or self._fused(
+            layer, "gate_up", ["ffn_gate.weight", "ffn_up.weight"])
         return b.fused_ffn(x, ffn_norm, gate_up,
                            self.store.get(p + "ffn_down.weight"), cfg.rms_eps)
 
@@ -645,7 +675,8 @@ class Model:
         """
         cfg = self.cfg
         if (cfg.is_moe or self.store.stream or self.store.pack_bits is not None
-                or cfg.sliding_window or cfg.residual_scale != 1.0):
+                or cfg.sliding_window or cfg.residual_scale != 1.0
+                or self.lora is not None):
             return
         from reminis.arch import Arch
         if type(cfg.spec).block is not Arch.block:
@@ -709,7 +740,7 @@ class Model:
         return x
 
     def forward(self, tokens: list[int], cache: "KVCache", offset: int,
-                all_positions: bool = False) -> np.ndarray:
+                all_positions: bool = False, grad: bool = False):
         """Logits for the last token of `tokens`, or for every one of them.
 
         Decoding only ever needs the last position, so that is the default and
@@ -718,6 +749,13 @@ class Model:
         is what comparing two models position by position needs -- and doing it
         in one batched pass rather than one call per token is the difference
         between a matrix product and a few dozen matrix-vector products.
+
+        `grad=True` requires `all_positions=True` and returns the logits as a
+        live backend array rather than numpy, without evaluating anything, so
+        the whole pass stays one autograd graph on the lazy backends. This is
+        the fine-tuning path's forward pass; on the numpy backend it is only
+        meaningful as the reference the others are checked against, since
+        numpy has no autodiff.
 
         Floating-point warnings are silenced for the duration. Two of them
         would otherwise fire on every token for reasons that are not bugs:
@@ -728,6 +766,11 @@ class Model:
         catches a genuinely broken forward pass without the noise.
         """
         n = len(tokens)
+        if grad and not all_positions:
+            raise ValueError(
+                "forward(grad=True) is the teacher-forcing path and needs "
+                "logits at every position; pass all_positions=True"
+            )
         chunk = self.PREFILL_CHUNK
         if n > chunk and not all_positions:
             for start in range(0, n - chunk, chunk):
@@ -764,6 +807,11 @@ class Model:
             if self.cfg.logit_scale != 1.0:
                 logits = logits / self.cfg.logit_scale
             logits = self.cfg.spec.logits(self, logits)
+            if grad:
+                # Leave the graph alive: the caller is about to differentiate
+                # this. Nothing has been evaluated, so the array returned is
+                # a promise rather than a value.
+                return logits
             b.eval(logits)
 
         # Sampling happens in numpy whatever the backend: the vocabulary-sized
