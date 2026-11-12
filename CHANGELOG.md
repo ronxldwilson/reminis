@@ -9,6 +9,13 @@ rather than compared against a number from earlier in the day.
 `bench.py` produces these figures; `tests/test_prerelease.py` is the gate every
 release below had to pass.
 
+## 0.35.1 -- report the version that actually shipped
+
+0.35.0 shipped reporting itself as 0.34.0: `pyproject.toml` was bumped and
+`reminis.__version__` was not, and nothing checked they agreed. 0.35.1
+bumps both and adds a release-gate test that fails when they disagree.
+Otherwise identical to 0.35.0.
+
 ## 0.35.0 -- serve it, and a prefill that is not the bottleneck
 
 ### Serving: `reminis serve`

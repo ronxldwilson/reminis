@@ -62,6 +62,22 @@ def check(condition, label):
     ok(label)
 
 
+def test_the_version_reminis_reports_is_the_version_that_ships():
+    """`reminis --version` reads `__init__.__version__`; the release is
+    named by `pyproject.toml`. 0.35.0 shipped with the two disagreeing,
+    so every install claimed to be 0.34.0. Cheap to check, and it is a
+    release property -- one of the things this gate exists to catch.
+    """
+    with open(Path(__file__).resolve().parents[1] / "pyproject.toml") as handle:
+        text = handle.read()
+    match = next((line for line in text.splitlines() if line.startswith("version = ")), None)
+    assert match is not None, "pyproject.toml has no version line"
+    shipped = match.split('"')[1]
+    from reminis import __version__
+    check(__version__ == shipped,
+          f"reminis.__version__ is {__version__}, pyproject.toml says {shipped}")
+
+
 # ── 1. Bit-plane encoding (no model needed) ─────────────────────────────
 
 def test_bitplane():
