@@ -1179,13 +1179,14 @@ wheels = [
 
 [[package]]
 name = "reminis"
-version = "0.35.1"
+version = "0.35.2"
 source = { editable = "." }
 dependencies = [
     { name = "gguf" },
     { name = "numpy", version = "2.2.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
     { name = "numpy", version = "2.4.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version == '3.11.*'" },
     { name = "numpy", version = "2.5.1", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.12'" },
+    { name = "regex" },
     { name = "zstandard" },
 ]
 
@@ -1209,6 +1210,7 @@ requires-dist = [
     { name = "gguf", specifier = ">=0.16.0" },
     { name = "jinja2", marker = "extra == 'serve'", specifier = ">=3.1" },
     { name = "numpy", specifier = ">=1.24.0" },
+    { name = "regex", specifier = ">=2024.0" },
     { name = "zstandard", specifier = ">=0.22.0" },
 ]
 provides-extras = ["serve"]

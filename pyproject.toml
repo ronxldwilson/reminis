@@ -1,6 +1,6 @@
 [project]
 name = "reminis"
-version = "0.35.1"
+version = "0.35.2"
 description = "Store LLM weights in a SQLite database. Convert GGUF and safetensors losslessly, query, diff, and package fine-tunes as delta packs."
 readme = "README.md"
 requires-python = ">=3.10"
@@ -21,6 +21,7 @@ classifiers = [
 dependencies = [
     "gguf>=0.16.0",
     "numpy>=1.24.0",
+    "regex>=2024.0",
     "zstandard>=0.22.0",
 ]
 
@@ -28,7 +29,7 @@ dependencies = [
 # are imported at import time -- torch and transformers are reached for
 # inside the functions that need them, and the GPU backends are chosen at
 # runtime from whatever the machine has -- so they stay out of `dependencies`
-# and installing reminis stays a three-package affair.
+# and installing reminis stays a small affair.
 #
 # They are declared here rather than left to be installed by hand because
 # `uv sync` removes anything it does not know about. When that happened, the

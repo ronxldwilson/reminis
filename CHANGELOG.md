@@ -9,6 +9,17 @@ rather than compared against a number from earlier in the day.
 `bench.py` produces these figures; `tests/test_prerelease.py` is the gate every
 release below had to pass.
 
+## 0.35.2 -- a qwen35 tokenizer that works out of the box
+
+0.35.0 and 0.35.1 both refused to tokenize for a qwen35 model unless
+`regex` happened to be installed alongside reminis, because the qwen35
+pre-tokenizer needs Unicode general categories that Python's `re` does not
+have and the dependency was left out of `dependencies`. Anyone serving a
+Qwen3.5/3.8 model from a clean `pip install reminis` hit it on the first
+prompt; the development environment only passes because it shares an
+environment with transformers. `regex` is now a hard dependency. The
+version skew that motivated 0.35.1 is unchanged and guarded by a gate test.
+
 ## 0.35.1 -- report the version that actually shipped
 
 0.35.0 shipped reporting itself as 0.34.0: `pyproject.toml` was bumped and
