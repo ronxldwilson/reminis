@@ -9,6 +9,29 @@ rather than compared against a number from earlier in the day.
 `bench.py` produces these figures; `tests/test_prerelease.py` is the gate every
 release below had to pass.
 
+## 0.36.0 -- Qwen3 MoE is a first-class citizen
+
+`qwen3moe` runs: the Qwen3-Coder-30B-A3B-Instruct checkpoint
+(UD-Q4_K_XL GGUF, 128 experts per layer, eight per token, no shared
+expert) is supported by the same code that runs everything else, and
+its greedy continuation matches llama.cpp's on the same prompt. The
+architecture adds one thing nothing else in the registry has -- a
+learned RMS norm on the query and the key, applied per head before the
+rotary -- and reuses everything else: the stacked-expert tensors are
+sliced per selected expert, routed weights renormalise to sum to one,
+and the output is the dense residual plus the mixture, exactly as the
+checkpoint trains it.
+
+Verified end to end on a 17.6 GB UD-Q4_K_XL checkpoint: converts, loads
+with `--pack`, and matches llama.cpp token for token on a greedy
+completion; runs at ~87 tok/s decode on an M5 Max with the MLX backend.
+`--pack` is the difference between fitting and not fitting: the default
+unpack path wants ~60 GB of float16 for this checkpoint, which exceeds
+what a 64 GB machine owes another resident model; `--pack` keeps the
+four- and five-bit blocks packed bit-exactly and the rest near file
+size. First cold forward reads the whole database once (~70 s); after
+that the OS page cache serves it.
+
 ## 0.35.3 -- the MLX backend is installed where it can run
 
 0.35.2 installed on Apple silicon with no mlx, so `select_backend` fell

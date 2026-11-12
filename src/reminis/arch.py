@@ -622,6 +622,72 @@ class Gemma4(Arch):
 
 
 @register
+class Qwen3Moe(Arch):
+    """Qwen3 MoE: 128 experts per layer, eight of them per token, no dense
+    branch and no shared expert. Attention is the llama family with one
+    addition Qwen3 always has: a learned RMS norm on the query and the
+    key, applied per head before the rotary is laid down. Feed-forward is
+    the shared mixture path (`_moe_ffn`), which reads the router, gathers
+    the stacked experts, and renormalises the winners to sum to one, so
+    this supplies only the block.
+    """
+
+    name = "qwen3moe"
+    rope_style = "neox"
+    pretokenizer = "qwen2"
+    hf_names = (
+        "Qwen3MoeForCausalLM",
+        "qwen3_moe",
+        "qwen3moe",
+    )
+
+    def block(self, model, x, layer: int, cache, offset: int):
+        cfg = model.cfg
+        b = model.backend
+        p = f"blk.{layer}."
+        n_tokens = x.shape[0]
+
+        attn_norm, ffn_norm, _ = model._layer_weights(layer)
+
+        h = b.rms_norm(x, attn_norm, cfg.rms_eps)
+
+        q, k, v = model._qkv(h, layer, p)
+        q = q.reshape(n_tokens, cfg.n_heads, cfg.head_dim)
+        k = k.reshape(n_tokens, cfg.n_kv_heads, cfg.head_dim)
+        v = v.reshape(n_tokens, cfg.n_kv_heads, cfg.head_dim)
+
+        # The Qwen3 norms, on each head, before the rotary. Skipping them
+        # produces fluent text that is measurably off -- the model attends
+        # to the wrong positions but confidently.
+        q = b.rms_norm(q, model.store.get(p + "attn_q_norm.weight").reshape(-1),
+                       cfg.rms_eps)
+        k = b.rms_norm(k, model.store.get(p + "attn_k_norm.weight").reshape(-1),
+                       cfg.rms_eps)
+
+        q = q.transpose(1, 0, 2)[None]
+        k = k.transpose(1, 0, 2)[None]
+        v = v.transpose(1, 0, 2)[None]
+
+        q = b.rope(q, cfg.rope_dim, False, cfg.rope_base, offset, cfg.rope_freqs)
+        k = b.rope(k, cfg.rope_dim, False, cfg.rope_base, offset, cfg.rope_freqs)
+
+        k_all, v_all = cache.append(layer, k, v)
+
+        mask = None
+        if n_tokens > 1:
+            mask = model._causal_mask(n_tokens, offset, k_all.shape[-2], 0)
+
+        out = b.attention(q, k_all, v_all, cfg.attn_scale, mask, None)
+        out = out[0].transpose(1, 0, 2).reshape(n_tokens, cfg.n_heads * cfg.head_dim)
+        attn_out = model._linear(out, p + "attn_output.weight",
+                                 p + "attn_output.bias")
+        x = x + cfg.residual_scale * attn_out
+
+        h = b.rms_norm(x, ffn_norm, cfg.rms_eps)
+        return x + cfg.residual_scale * model._moe_ffn(h, p)
+
+
+@register
 class Qwen35(Arch):
     """Qwen 3.5 / 3.8: hybrid DeltaNet-attention with gated outputs.
 
