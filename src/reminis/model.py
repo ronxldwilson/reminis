@@ -75,6 +75,12 @@ class Model:
         self.tokenizer = build_tokenizer(meta)
         self._layer_cache: dict[int, tuple] = {}
         self._mask_cache: dict = {}
+        # End-of-forward flush list. A lazy backend needs the recurrent
+        # state materialised once per token or the graph grows without
+        # bound; collecting the arrays and handing them to one `eval`
+        # at the end gets the same release with one barrier instead of
+        # one per recurrent layer.
+        self._flush: list = []
         self._fused_cache: dict[tuple[int, str], tuple] = {}
         # LoRA adapters, set by the fine-tuning path: {base tensor name:
         # (A, B)}. A is (rank, in), B is (out, rank), and the update a linear
@@ -203,6 +209,17 @@ class Model:
 
     def restore_state(self, snapshot) -> None:
         self.cfg.spec.restore_state(self, snapshot)
+
+    def reset_sequence_state(self) -> None:
+        """Drop the sequence state a new generation must not inherit.
+
+        Attention-only models keep everything in a KV cache the caller
+        recreates, so this is a no-op for them. Recurrent and hybrid
+        models carry state on the model itself; one left over from a
+        previous sequence makes every following generation read as if it
+        were a continuation of it.
+        """
+        self.cfg.spec.reset_state(self)
 
     # -- resident experts --------------------------------------------------
 
@@ -771,14 +788,15 @@ class Model:
                 "forward(grad=True) is the teacher-forcing path and needs "
                 "logits at every position; pass all_positions=True"
             )
+        self._flush = []
         chunk = self.PREFILL_CHUNK
         if n > chunk and not all_positions:
             for start in range(0, n - chunk, chunk):
                 self._forward_chunk(tokens[start:start + chunk], cache,
                                     offset + start)
-            return self.forward(tokens[-(n % chunk or chunk):], cache,
-                                offset + n - (n % chunk or chunk),
-                                all_positions=False)
+            offset = offset + n - (n % chunk or chunk)
+            tokens = tokens[-(n % chunk or chunk):]
+            n = len(tokens)
 
         b = self.backend
         use_fast = (n == 1 and not all_positions
@@ -812,7 +830,8 @@ class Model:
                 # this. Nothing has been evaluated, so the array returned is
                 # a promise rather than a value.
                 return logits
-            b.eval(logits)
+            flush = getattr(self, "_flush", ())
+            b.eval(logits, *flush)
 
         # Sampling happens in numpy whatever the backend: the vocabulary-sized
         # vector is small, the operations on it are sequential, and keeping

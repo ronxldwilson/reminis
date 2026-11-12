@@ -314,6 +314,7 @@ def generate(
                 print(f"drafting {draft_tokens} tokens a round from "
                       f"{drafter.description}")
 
+        model.reset_sequence_state()
         t0 = time.time()
         logits = model.forward(tokens, cache, offset=0)
         prefill_seconds = time.time() - t0

@@ -232,6 +232,13 @@ class Arch:
     def restore_state(self, model, snapshot) -> None:
         """Put back what `snapshot_state` returned."""
 
+    def reset_state(self, model) -> None:
+        """Drop whatever sequence state this architecture keeps between
+        calls. Attention-only models keep it in the KV cache, which callers
+        recreate per sequence; recurrent ones carry it on the model and
+        must reset it explicitly -- serving reusing a model across requests
+        would otherwise keep the last conversation's state."""
+
 
 # The llama family and its near neighbours: one shared block, distinguished
 # only by how rotary embedding is laid out.
@@ -1076,8 +1083,27 @@ class Qwen35(Arch):
         beta_val = b.sigmoid(model._linear(h, p + "ssm_beta.weight"))
 
         scan_state = ssm_states.get_ssm(layer)
-        scan_out, new_state = self._deltanet_scan(
-            model, q_part, k_part, v_part, gate, beta_val, scan_state)
+        compiled = getattr(model, "_gdn_scan_compiled", None)
+        if compiled is None:
+            try:
+                import mlx.core as mx
+                compiled = mx.compile(
+                    lambda q, k, v, gate_, beta_, s: self._deltanet_scan(
+                        model, q, k, v, gate_, beta_, s))
+            except Exception:
+                compiled = False
+            model._gdn_scan_compiled = compiled
+        if compiled:
+            try:
+                scan_out, new_state = compiled(
+                    q_part, k_part, v_part, gate, beta_val, scan_state)
+            except Exception:
+                model._gdn_scan_compiled = False
+                scan_out, new_state = self._deltanet_scan(
+                    model, q_part, k_part, v_part, gate, beta_val, scan_state)
+        else:
+            scan_out, new_state = self._deltanet_scan(
+                model, q_part, k_part, v_part, gate, beta_val, scan_state)
         ssm_states.set_ssm(layer, new_state)
 
         # Collapse both carried states, once for the layer.
@@ -1098,7 +1124,12 @@ class Qwen35(Arch):
         # larger model, purely to learn something no one is asking. The
         # graph is released either way; the forward pass's own eval of the
         # logits is the one place a barrier is actually wanted.
-        b.eval_async(scan_out, new_state, new_conv)
+        if getattr(model, "_flush", None) is not None:
+            model._flush.append(scan_out)
+            model._flush.append(new_state)
+            model._flush.append(new_conv)
+        else:
+            b.eval_async(scan_out, new_state, new_conv)
 
         ssm_norm = model.store.get(p + "ssm_norm.weight").reshape(-1)
         # Gated RMS norm: normalise per head, then scale by the gate. The
@@ -1187,6 +1218,12 @@ class Qwen35(Arch):
 
     def restore_state(self, model, snapshot) -> None:
         self._states(model).restore(snapshot)
+
+    def reset_state(self, model) -> None:
+        states = getattr(model, "_ssm_states", None)
+        if states is not None:
+            states._conv = [None] * len(states._conv)
+            states._ssm = [None] * len(states._ssm)
 
     def block(self, model, x, layer: int, cache, offset: int):
         cfg = model.cfg
@@ -1499,6 +1536,11 @@ class Lfm2(Arch):
 
     def restore_state(self, model, snapshot) -> None:
         self._states(model).restore(snapshot)
+
+    def reset_state(self, model) -> None:
+        states = getattr(model, "_lfm2_conv_states", None)
+        if states is not None:
+            states._conv = [None] * len(states._conv)
 
     def _ffn_norm(self, model, layer):
         cache = getattr(model, "_lfm2_ffn_cache", None)

@@ -334,11 +334,18 @@ class Speculator:
         pending = [first]
         produced = []
 
+        if isinstance(eos_id, int):
+            stop_ids = {eos_id}
+        elif eos_id is None:
+            stop_ids = set()
+        else:
+            stop_ids = set(eos_id)
+
         def keep(tokens) -> bool:
             """Emit tokens until one of the two stopping conditions. False
             means the run is over and the caches no longer matter."""
             for token in tokens:
-                if stop_at_eos and eos_id is not None and token == eos_id:
+                if stop_at_eos and token in stop_ids:
                     return False
                 produced.append(token)
                 if on_token:

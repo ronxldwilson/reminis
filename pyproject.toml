@@ -35,6 +35,12 @@ dependencies = [
 # three suites that check reminis against a reference implementation
 # degraded to skips and went on reporting PASS, which is the worst way for a
 # test to fail. `uv sync` and `uv run` install this group by default.
+# `reminis serve` renders a model's own Jinja chat template when it is
+# importable; without it a plain ChatML wrap is used. Kept optional so the
+# base install stays three packages.
+[project.optional-dependencies]
+serve = ["jinja2>=3.1"]
+
 [dependency-groups]
 dev = [
     # The references the suites check against: transformers for logits,

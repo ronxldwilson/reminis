@@ -1,5 +1,5 @@
 version = 1
-revision = 3
+revision = 5
 requires-python = ">=3.10"
 resolution-markers = [
     "python_full_version >= '3.12'",
@@ -1189,6 +1189,11 @@ dependencies = [
     { name = "zstandard" },
 ]
 
+[package.optional-dependencies]
+serve = [
+    { name = "jinja2" },
+]
+
 [package.dev-dependencies]
 dev = [
     { name = "mlx", marker = "platform_machine == 'arm64' and sys_platform == 'darwin'" },
@@ -1202,9 +1207,11 @@ dev = [
 [package.metadata]
 requires-dist = [
     { name = "gguf", specifier = ">=0.16.0" },
+    { name = "jinja2", marker = "extra == 'serve'", specifier = ">=3.1" },
     { name = "numpy", specifier = ">=1.24.0" },
     { name = "zstandard", specifier = ">=0.22.0" },
 ]
+provides-extras = ["serve"]
 
 [package.metadata.requires-dev]
 dev = [

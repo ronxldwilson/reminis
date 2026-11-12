@@ -91,6 +91,31 @@ def cmd_run(args, parser):
     run_cli(args)
 
 
+def cmd_serve(args, parser):
+    _reject_registry(args.input, "serve")
+    if args.pack is not None and args.pack != "native":
+        if args.pack == "compact":
+            pass
+        elif args.pack in ("2", "3", "4", "5", "6", "8"):
+            args.pack = int(args.pack)
+        else:
+            parser.error(
+                "--pack takes no value (bit-exact), 'compact', or a width: "
+                "2, 3, 4, 5, 6 or 8"
+            )
+    if args.draft_tokens < 1:
+        parser.error("--draft-tokens must be at least 1")
+    from reminis.serve import run_server
+    run_server(
+        args.input, host=args.host, port=args.port,
+        backend=None if args.backend == "auto" else args.backend,
+        pack_bits=args.pack, pack_group=args.pack_group,
+        kv_bits=args.kv_bits,
+        draft=args.draft, draft_tokens=args.draft_tokens,
+        name=args.name, warmup=not args.no_warmup,
+    )
+
+
 def cmd_transcribe(args, parser):
     import os
 
@@ -462,6 +487,54 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_run.add_argument("-q", "--quiet", action="store_true", help="Suppress progress output")
     p_run.set_defaults(func=cmd_run)
+
+    p_serve = sub.add_parser(
+        "serve",
+        help="Serve a model over an OpenAI-compatible HTTP API",
+        description="Expose a model stored in a reminis database on an "
+                    "OpenAI-compatible endpoint, so anything that can talk "
+                    "to a chat completions API -- openai, langchain, a "
+                    "frontend, curl -- can talk to the database. The model "
+                    "loads once at startup; requests are forward passes "
+                    "against it, not re-reads of the file. Streaming is "
+                    "server-sent events. One generation runs at a time.",
+    )
+    p_serve.add_argument("input", help="Path to the model database")
+    p_serve.add_argument("--host", default="127.0.0.1",
+                         help="Interface to bind (default 127.0.0.1)")
+    p_serve.add_argument("--port", type=int, default=8080,
+                         help="Port to listen on (default 8080)")
+    p_serve.add_argument("--name", default=None,
+                         help="Model id reported by /v1/models (default: the "
+                              "database filename without .db)")
+    p_serve.add_argument(
+        "--backend", choices=("auto", "numpy", "mlx", "cupy"), default="auto",
+        help="Which array library to compute with. auto picks the fastest "
+             "one this machine has: mlx on Apple silicon, cupy on NVIDIA, "
+             "numpy otherwise.",
+    )
+    p_serve.add_argument(
+        "--pack", nargs="?", const="native", metavar="BITS",
+        help="Keep weights compressed in memory instead of expanding them "
+             "to float16 (mlx only). No value: bit-exact for models stored "
+             "with GGML quantization. A width (2-8): re-quantize.",
+    )
+    p_serve.add_argument("--pack-group", type=int, default=128, metavar="N",
+                         help="Weights per scale group for --pack (default 128)")
+    p_serve.add_argument("--kv-bits", type=int, choices=(4, 8), metavar="BITS",
+                         help="Compress the key/value cache to this many bits")
+    p_serve.add_argument(
+        "--draft", metavar="SOURCE",
+        help="Speculative decoding while serving: 'ngram', the path to a "
+             "smaller model sharing this one's tokenizer, or "
+             "'registry.db#name' to take the draft out of a registry.",
+    )
+    p_serve.add_argument("--draft-tokens", type=int, default=4, metavar="K",
+                         help="Tokens to propose per round (default 4)")
+    p_serve.add_argument("--no-warmup", action="store_true",
+                         help="Skip touching every weight at startup; the "
+                              "first request pays the load instead")
+    p_serve.set_defaults(func=cmd_serve)
 
     # merge: combine several models into one
     p_hear = sub.add_parser(
