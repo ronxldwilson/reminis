@@ -1,6 +1,6 @@
 [project]
 name = "reminis"
-version = "0.35.2"
+version = "0.35.3"
 description = "Store LLM weights in a SQLite database. Convert GGUF and safetensors losslessly, query, diff, and package fine-tunes as delta packs."
 readme = "README.md"
 requires-python = ">=3.10"
@@ -23,6 +23,11 @@ dependencies = [
     "numpy>=1.24.0",
     "regex>=2024.0",
     "zstandard>=0.22.0",
+    # The MLX backend is what runs MLX-packed models (Qwen3.5/3.8) without
+    # a conversion; out of the box those models crash on the base backend's
+    # different packed-weight signature. macOS arm64 only -- mlx has no
+    # wheels elsewhere and the marker keeps every other platform lean.
+    "mlx>=0.29.0; sys_platform == 'darwin' and platform_machine == 'arm64'",
 ]
 
 # Everything the test suite needs and reminis itself does not. None of these

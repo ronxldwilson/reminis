@@ -9,6 +9,18 @@ rather than compared against a number from earlier in the day.
 `bench.py` produces these figures; `tests/test_prerelease.py` is the gate every
 release below had to pass.
 
+## 0.35.3 -- the MLX backend is installed where it can run
+
+0.35.2 installed on Apple silicon with no mlx, so `select_backend` fell
+back to numpy and an MLX-packed model (any qwen35 checkpoint) died inside
+`_adopt_mlx_affine` with `TypeError: Backend.adopt_packed() takes 7
+positional arguments but 8 were given` -- the base class and the MLX
+override take different arguments, and the mismatch surfaced as a raw
+TypeError instead of a refused model. mlx is now a dependency, gated to
+macOS arm64 like the dev environment already did, and the packed-weight
+adoption path raises a legible `UnsupportedModel` instead of a TypeError
+on any backend that cannot keep MLX's four-bit layout packed.
+
 ## 0.35.2 -- a qwen35 tokenizer that works out of the box
 
 0.35.0 and 0.35.1 both refused to tokenize for a qwen35 model unless

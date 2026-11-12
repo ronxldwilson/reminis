@@ -250,10 +250,19 @@ class WeightStore:
         self.packed += 1
         self.packed_native += 1
 
-        return self.backend.adopt_packed(
-            words, scales, biases, bits, self._mlx_group,
-            logical, self.pack_compact,
-        )
+        try:
+            return self.backend.adopt_packed(
+                words, scales, biases, bits, self._mlx_group,
+                logical, self.pack_compact,
+            )
+        except TypeError as exc:
+            raise UnsupportedModel(
+                "This model's weights are packed in MLX's four-bit affine "
+                "format, and this backend cannot adopt them without "
+                f"widening them to float32 ({exc}).\n"
+                "Install the mlx backend (pip install mlx) -- Apple silicon "
+                "only -- or convert the model to unpacked weights first."
+            ) from exc
 
     def has(self, name: str) -> bool:
         return name in self._shapes
