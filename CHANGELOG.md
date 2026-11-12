@@ -9,7 +9,55 @@ rather than compared against a number from earlier in the day.
 `bench.py` produces these figures; `tests/test_prerelease.py` is the gate every
 release below had to pass.
 
-## Unreleased
+## 0.35.0 -- serve it, and a prefill that is not the bottleneck
+
+### Serving: `reminis serve`
+
+The database is the model, and now it is a model somebody else can talk to.
+`reminis serve <db>` exposes it on an OpenAI-compatible HTTP endpoint --
+`GET /health`, `GET /v1/models`, `POST /v1/chat/completions`,
+`POST /v1/completions` -- so anything that can point at a chat completions
+API (openai, langchain, a frontend, curl) can point at a database. The model
+loads once at startup and every request is a forward pass against it, not a
+re-read of the file; one generation runs at a time; streaming is
+server-sent events with `data: [DONE]` to terminate.
+
+Chat prompts render through the Jinja template the model itself carries in
+its metadata, when `jinja2` is importable (`pip install reminis[serve]`);
+without it, a plain ChatML wrap is used instead, which keeps the base
+install three packages. Requested `max_tokens` truncates or stops at either
+`tokenizer.ggml.eos_token_id` or any id in `config.eos_token_id`, so a chat
+turn ends on `<|im_end|>` rather than running into the next one, and
+`temperature`, `top_p`, `seed`, `stop`, and `chat_template_kwargs` are all
+honoured. Greedy output from the server for the same prompt is identical to
+`reminis run --temp 0` for the same weights.
+
+One correctness fix came with it: a recurrent hybrid model carried sequence
+state on the `Model` object between calls, and a server reusing one `Model`
+for many requests served every request as a continuation of the previous
+one -- greedy answers differed from request to request, and every one was
+wrong. Sequence state now resets per sequence (`Model.reset_sequence_state`);
+`reminis run` and `reminis serve` both start from a fresh state.
+
+### The GDN prefill was 90% of the forward pass; now it is not
+
+Profiling a chunked prefill showed the recurrent gate/delta-net blocks
+at 4.33s of 4.33s on a 441-token prompt. Two changes, measured on this
+machine (Qwen3.8-27B-4bit, M5 Max):
+
+| Prompt | Before | After |
+|---|---|---|
+| 441 tok | 4.33s | 1.45s |
+| 1024 tok | 3.94s | 2.16s |
+| 2048 tok | 7.89s | 2.09s |
+
+`_deltanet_scan` goes through `mx.compile` -- about 2x on the scan itself
+with the same floating-point semantics, falling back to eager if the
+compiled call raises. The recurrent layers also batched their state
+evaluations: instead of one barrier per layer per token, the state arrays
+are collected and handed to a single `eval` per forward pass. Decode is
+unchanged at ~26 tok/s, which is the 4-bit weight-read bound and not a
+code-layout question.
 
 ### Training inside the database: `reminis finetune`
 
